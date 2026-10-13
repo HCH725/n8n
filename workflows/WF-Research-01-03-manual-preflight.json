@@ -1,0 +1,152 @@
+{
+  "name": "Quant WF-Research · manual source preflight (01–03 only, HOLD)",
+  "nodes": [
+    {
+      "id": "manual-preflight",
+      "name": "01 · Manual preflight",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        240,
+        260
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "candidate-selector",
+      "name": "01 · Select candidate",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        450,
+        260
+      ],
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            {
+              "id": "candidate-path",
+              "name": "candidate_path",
+              "type": "string",
+              "value": "1-3-1-red-green-candle-reversal-fixed-rr-long-btcusdt-1h-2026-10-13.md"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "pin-head",
+      "name": "02 · Pin Alpha main",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        680,
+        260
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.github.com/repos/HCH725/alpha-strategy-research/commits/main",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "read-record",
+      "name": "02 · Read pinned record",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        920,
+        260
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'https://raw.githubusercontent.com/HCH725/alpha-strategy-research/' + $('02 · Pin Alpha main').first().json.sha + '/' + $('01 · Select candidate').first().json.candidate_path }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text",
+              "outputPropertyName": "strategy_text"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "read-only-gate",
+      "name": "03 · Source-only HOLD gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1160,
+        260
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const record=$input.first().json.strategy_text;\nconst sourceCommit=$('02 · Pin Alpha main').first().json.sha;\nconst candidatePath=$('01 · Select candidate').first().json.candidate_path;\nconst base={origin:'manual',source_commit:sourceCommit,candidate_path:candidatePath,source_ref:'HCH725/alpha-strategy-research@'+sourceCommit+'/'+candidatePath,qlib_run_id:null,run_state:'NOT_SUBMITTED'};\nif(typeof record!=='string'||!record.startsWith('---\\n')) return [{json:{...base,route:'NEEDS_REVIEW',reason:'GitHub record has no readable YAML frontmatter'}}];\nconst end=record.indexOf('\\n---',4);\nif(end<0) return [{json:{...base,route:'NEEDS_REVIEW',reason:'Unterminated YAML frontmatter'}}];\nconst fm=record.slice(4,end);\nconst field=k=>{const m=fm.match(new RegExp('^'+k+':\\\\s*(.*?)\\\\s*$','m'));return m?m[1].trim().replace(/^[\"']|[\"']$/g,''):null;};\nconst schema=field('schema'),hb=field('hb_ready_status'),implementation=field('implementation_status'),adoption=field('adoption');\nlet reason='';\nif(schema!=='strategy-research-record-v1'||hb!=='PASS') reason='Invalid schema or HB_READY not PASS';\nelse if(implementation!=='implemented') reason='HB_READY admission is not executable implementation';\nelse reason='No verified Qlib executable config, data snapshot, parity or native run ID attached';\nreturn [{json:{...base,schema,hb_ready_status:hb,implementation_status:implementation,adoption,route:reason==='Invalid schema or HB_READY not PASS'?'NEEDS_REVIEW':'HOLD',reason,market_data_ready:null,execution_path_supported:null}}];"
+      }
+    }
+  ],
+  "connections": {
+    "01 · Manual preflight": {
+      "main": [
+        [
+          {
+            "node": "01 · Select candidate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "01 · Select candidate": {
+      "main": [
+        [
+          {
+            "node": "02 · Pin Alpha main",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "02 · Pin Alpha main": {
+      "main": [
+        [
+          {
+            "node": "02 · Read pinned record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "02 · Read pinned record": {
+      "main": [
+        [
+          {
+            "node": "03 · Source-only HOLD gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "pinData": {},
+  "tags": []
+}
