@@ -1,6 +1,6 @@
 {
   "id": "OhSN7BCpOVLMcUMQ",
-  "name": "Quant WF-Research · manual engineering preflight (01–03)",
+  "name": "Quant WF-Research · manual representative proof (01–04)",
   "nodes": [
     {
       "id": "manual-preflight",
@@ -98,6 +98,57 @@
         "mode": "runOnceForAllItems",
         "jsCode": "const file=$input.first().json;\nconst sourceCommit=$('02 · Pin Alpha main').first().json.sha;\nconst candidatePath=$('01 · Select candidate').first().json.candidate_path;\nconst base={\n  origin:'manual',\n  source_commit:sourceCommit,\n  candidate_path:candidatePath,\n  source_ref:'HCH725/alpha-strategy-research@'+sourceCommit+'/'+candidatePath,\n  source_blob_sha:file.sha||null,\n  qlib_run_id:null,\n  run_state:'NOT_SUBMITTED'\n};\nif(file.type!=='file'||typeof file.content!=='string')\n  return [{json:{...base,route:'NEEDS_REVIEW',reason:'GitHub record content is not readable',market_data_ready:null,execution_path_supported:null}}];\nconst record=Buffer.from(file.content.replace(/\\s/g,''),'base64').toString('utf8');\nif(!record.startsWith('---\\n'))\n  return [{json:{...base,route:'NEEDS_REVIEW',reason:'GitHub record has no readable YAML frontmatter',market_data_ready:null,execution_path_supported:null}}];\nconst end=record.indexOf('\\n---',4);\nif(end<0)\n  return [{json:{...base,route:'NEEDS_REVIEW',reason:'Unterminated YAML frontmatter',market_data_ready:null,execution_path_supported:null}}];\nconst fm=record.slice(4,end);\nconst field=k=>{const m=fm.match(new RegExp('^'+k+':\\\\s*(.*?)\\\\s*$','m'));return m?m[1].trim().replace(/^[\\\"']|[\\\"']$/g,''):null;};\nconst schema=field('schema'),hb=field('hb_ready_status');\nif(schema!=='strategy-research-record-v1'||hb!=='PASS')\n  return [{json:{...base,schema,hb_ready_status:hb,route:'NEEDS_REVIEW',reason:'Invalid schema or HB_READY not PASS',market_data_ready:null,execution_path_supported:null}}];\n\n// ponytail: Keep two exact proofs; add entries only after candidate-specific evidence is verified.\nconst provenCandidates=[{\n  candidate_path:'three-down-three-up-consec-close-long-btcusdt-1h-2026-10-07.md',\n  source_blob_sha:'4445ce0754ec4ec47ebfe7a5245e23381dc0941b',\n  execution_link_ref:'/results/_validation/alpha-three-down-three-up-fullhistory-20261014/candidate-execution-link.json',\n  qlib_entrypoint_ref:'/results/_validation/alpha-three-down-three-up-fullhistory-20261014/run_backtest.entrypoint.py',\n  effective_config_ref:'/results/_validation/alpha-three-down-three-up-fullhistory-20261014/effective_config.json',\n  qlib_runtime_commit:'bee09f23d938b96c2c1ef82d891aa0abfa171cd0'\n},{\n  candidate_path:'donchian-20-10-breakout-btcusdt-1h-2026-10-06.md',\n  source_blob_sha:'8a09f6e642261714ef72872b601b8f679e1f0d30',\n  execution_link_ref:'/results/_validation/donchian-s01509-native-20261014/candidate-execution-link.json',\n  qlib_entrypoint_ref:'/results/_validation/donchian-s01509-native-20261014/run_backtest.entrypoint.py',\n  effective_config_ref:'/results/_validation/donchian-s01509-native-20261014/effective_config.json',\n  qlib_runtime_commit:'bee09f23d938b96c2c1ef82d891aa0abfa171cd0'\n}];\nconst proven=provenCandidates.find(p=>candidatePath===p.candidate_path && file.sha===p.source_blob_sha);\nif(proven)\n  return [{json:{\n    ...base,\n    schema,\n    hb_ready_status:hb,\n    route:'READY',\n    reason:'Exact candidate has verified market data and candidate-specific Qlib research execution evidence',\n    market_data_ready:true,\n    execution_path_supported:true,\n    execution_link_ref:proven.execution_link_ref,\n    qlib_entrypoint_ref:proven.qlib_entrypoint_ref,\n    effective_config_ref:proven.effective_config_ref,\n    qlib_runtime_commit:proven.qlib_runtime_commit,\n    mapping_scope:'exact-proven-candidates-only',\n    performance_claimable:false\n  }}];\n\nreturn [{json:{\n  ...base,\n  schema,\n  hb_ready_status:hb,\n  route:'HOLD',\n  reason:'HB_READY admission accepted; no exact verified candidate-specific Qlib execution link exists yet',\n  market_data_ready:null,\n  execution_path_supported:null\n}}];"
       }
+    },
+    {
+      "id": "ready-only",
+      "name": "03b · Representative READY only",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1390,
+        260
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const x=$input.first().json;\nreturn x.route==='READY' &&\n  x.candidate_path==='donchian-20-10-breakout-btcusdt-1h-2026-10-06.md' &&\n  x.source_blob_sha==='8a09f6e642261714ef72872b601b8f679e1f0d30'\n  ? [{json:x}] : [];"
+      }
+    },
+    {
+      "id": "node04-ssh",
+      "name": "04 · Submit representative Qlib",
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        1620,
+        260
+      ],
+      "parameters": {
+        "authentication": "privateKey",
+        "resource": "command",
+        "operation": "execute",
+        "command": "NODE04_REPRESENTATIVE_RUN",
+        "cwd": "/"
+      },
+      "credentials": {
+        "sshPrivateKey": {
+          "id": "v87SSHca9d1549MAC",
+          "name": "v8.7 n8n-Mac restricted auth (t_ca9d1549)"
+        }
+      }
+    },
+    {
+      "id": "node04-receipt",
+      "name": "04 · Verify submit receipt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1850,
+        260
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const ssh=$input.first().json;\nconst upstream=$('03 · Engineering readiness').first().json;\nif(ssh.code!==0) throw new Error('Node04 SSH command failed');\nlet receipt;\ntry { receipt=JSON.parse(String(ssh.stdout||'').trim()); } catch { throw new Error('Node04 receipt is not JSON'); }\nif(receipt.node04!=='PASS') throw new Error('Node04 receipt is not PASS');\nif(receipt.candidate_blob_sha!==upstream.source_blob_sha) throw new Error('Node04 candidate identity mismatch');\nif(!/^[a-f0-9]{32}$/.test(String(receipt.run_id||''))) throw new Error('Node04 run_id missing/invalid');\nreturn [{json:{...upstream,qlib_run_id:receipt.run_id,run_state:'FINISHED',node04_receipt:receipt}}];"
+      }
     }
   ],
   "connections": {
@@ -139,6 +190,39 @@
         [
           {
             "node": "03 · Engineering readiness",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "03 · Engineering readiness": {
+      "main": [
+        [
+          {
+            "node": "03b · Representative READY only",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "03b · Representative READY only": {
+      "main": [
+        [
+          {
+            "node": "04 · Submit representative Qlib",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "04 · Submit representative Qlib": {
+      "main": [
+        [
+          {
+            "node": "04 · Verify submit receipt",
             "type": "main",
             "index": 0
           }
