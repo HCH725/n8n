@@ -1,6 +1,6 @@
 {
   "id": "OhSN7BCpOVLMcUMQ",
-  "name": "Quant WF-Research · manual representative proof (01–04)",
+  "name": "Quant WF-Research · manual representative proof (01–05)",
   "nodes": [
     {
       "id": "manual-preflight",
@@ -149,6 +149,43 @@
         "mode": "runOnceForAllItems",
         "jsCode": "const ssh=$input.first().json;\nconst upstream=$('03 · Engineering readiness').first().json;\nif(ssh.code!==0) throw new Error('Node04 SSH command failed');\nlet receipt;\ntry { receipt=JSON.parse(String(ssh.stdout||'').trim()); } catch { throw new Error('Node04 receipt is not JSON'); }\nif(receipt.node04!=='PASS') throw new Error('Node04 receipt is not PASS');\nif(receipt.candidate_blob_sha!==upstream.source_blob_sha) throw new Error('Node04 candidate identity mismatch');\nif(!/^[a-f0-9]{32}$/.test(String(receipt.run_id||''))) throw new Error('Node04 run_id missing/invalid');\nreturn [{json:{...upstream,qlib_run_id:receipt.run_id,run_state:'FINISHED',node04_receipt:receipt}}];"
       }
+    },
+    {
+      "id": "node05-ssh",
+      "name": "05 · Read representative artifacts",
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        2080,
+        260
+      ],
+      "parameters": {
+        "authentication": "privateKey",
+        "resource": "command",
+        "operation": "execute",
+        "command": "NODE05_REPRESENTATIVE_READBACK",
+        "cwd": "/"
+      },
+      "credentials": {
+        "sshPrivateKey": {
+          "id": "v87SSHca9d1549MAC",
+          "name": "v8.7 n8n-Mac restricted auth (t_ca9d1549)"
+        }
+      }
+    },
+    {
+      "id": "node05-receipt",
+      "name": "05 · Verify artifact completeness",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2310,
+        260
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ponytail: Verify one fixed Donchian proof. A host handler reads native files; other candidates need separate proof.\nconst ssh=$input.first().json;\nconst upstream=$('04 · Verify submit receipt').first().json;\nif(ssh.code!==0) throw new Error('Node05 HOLD: SSH command failed');\nlet receipt;\ntry { receipt=JSON.parse(ssh.stdout); } catch { throw new Error('Node05 HOLD: receipt is not JSON'); }\nif(!receipt || typeof receipt!=='object' || Array.isArray(receipt) || receipt.node05!=='PASS')\n  throw new Error('Node05 HOLD: receipt is not PASS');\nif(!/^[a-f0-9]{32}$/.test(receipt.run_id) || receipt.run_id!==upstream.qlib_run_id)\n  throw new Error('Node05 HOLD: run identity mismatch');\nif(receipt.candidate_path!==upstream.candidate_path || receipt.candidate_blob_sha!==upstream.source_blob_sha)\n  throw new Error('Node05 HOLD: candidate identity mismatch');\nif(receipt.status!=='FINISHED' || upstream.run_state!=='FINISHED')\n  throw new Error('Node05 HOLD: run is not FINISHED');\nfor(const key of ['params_count','metrics_count','artifacts_count'])\n  if(!Number.isSafeInteger(receipt[key]) || receipt[key]<=0)\n    throw new Error('Node05 HOLD: missing or empty '+key);\nconst out='/results/_validation/n8n-node04-donchian-e2e-20261014';\nif(receipt.out_dir!==out || upstream.node04_receipt?.out_dir!==out ||\n   typeof receipt.experiment_id!=='string' || !/^[0-9]+$/.test(receipt.experiment_id))\n  throw new Error('Node05 HOLD: native run location mismatch');\nconst runRef=out+'/mlruns/'+receipt.experiment_id+'/'+receipt.run_id;\nconst dataRoot='/results/_validation/alpha-three-down-three-up-fullhistory-20261014';\nconst refs={\n  candidate:'https://api.github.com/repos/HCH725/alpha-strategy-research/git/blobs/'+upstream.source_blob_sha,\n  provider_manifest:runRef+'/artifacts/repro/provider-manifest.json',\n  provider:dataRoot+'/qlib/provider',\n  data_provenance:dataRoot+'/inputs/qlib_input_manifest.json',\n  effective_config:runRef+'/artifacts/repro/effective_config.json',\n  entrypoint:runRef+'/artifacts/repro/run_backtest.entrypoint.py',\n  mlflow_run:runRef,\n  mlflow_readback:out+'/mlflow_readback.json',\n  manifest:out+'/manifest.json'\n};\nfor(const [key,ref] of Object.entries(refs))\n  if(receipt.refs?.[key]!==ref) throw new Error('Node05 HOLD: evidence reference mismatch '+key);\n// Each true flag covers file content, not just file existence. Execution includes the cost and period recipe.\nfor(const key of ['candidate','data','execution','runtime','evidence'])\n  if(receipt.readable?.[key]!==true) throw new Error('Node05 HOLD: unreadable '+key+' evidence');\n// The existing manifest hashes mlflow_readback.json. That readback must identify the same native run.\nif(receipt.manifest_verified!==true || receipt.manifest_readback_run_id!==upstream.qlib_run_id ||\n   typeof receipt.manifest_sha256!=='string' || !/^[a-f0-9]{64}$/.test(receipt.manifest_sha256))\n  throw new Error('Node05 HOLD: manifest/run identity mismatch');\nif(receipt.performance_claimable!==false || upstream.performance_claimable!==false)\n  throw new Error('Node05 HOLD: performance claim is not allowed');\nreturn [{json:{...upstream,node05_receipt:receipt}}];\n"
+      }
     }
   ],
   "connections": {
@@ -223,6 +260,28 @@
         [
           {
             "node": "04 · Verify submit receipt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "04 · Verify submit receipt": {
+      "main": [
+        [
+          {
+            "node": "05 · Read representative artifacts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "05 · Read representative artifacts": {
+      "main": [
+        [
+          {
+            "node": "05 · Verify artifact completeness",
             "type": "main",
             "index": 0
           }
