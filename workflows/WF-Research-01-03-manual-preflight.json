@@ -1,6 +1,6 @@
 {
   "id": "OhSN7BCpOVLMcUMQ",
-  "name": "Quant WF-Research · manual source preflight (01–03 only, HOLD)",
+  "name": "Quant WF-Research · manual engineering preflight (01–03 only, HOLD)",
   "nodes": [
     {
       "id": "manual-preflight",
@@ -85,7 +85,7 @@
     },
     {
       "id": "read-only-gate",
-      "name": "03 · Source-only HOLD gate",
+      "name": "03 · Engineering readiness HOLD",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
@@ -94,7 +94,7 @@
       ],
       "parameters": {
         "mode": "runOnceForAllItems",
-        "jsCode": "const record=$input.first().json.strategy_text;\nconst sourceCommit=$('02 · Pin Alpha main').first().json.sha;\nconst candidatePath=$('01 · Select candidate').first().json.candidate_path;\nconst base={origin:'manual',source_commit:sourceCommit,candidate_path:candidatePath,source_ref:'HCH725/alpha-strategy-research@'+sourceCommit+'/'+candidatePath,qlib_run_id:null,run_state:'NOT_SUBMITTED'};\nif(typeof record!=='string'||!record.startsWith('---\\n')) return [{json:{...base,route:'NEEDS_REVIEW',reason:'GitHub record has no readable YAML frontmatter'}}];\nconst end=record.indexOf('\\n---',4);\nif(end<0) return [{json:{...base,route:'NEEDS_REVIEW',reason:'Unterminated YAML frontmatter'}}];\nconst fm=record.slice(4,end);\nconst field=k=>{const m=fm.match(new RegExp('^'+k+':\\\\s*(.*?)\\\\s*$','m'));return m?m[1].trim().replace(/^[\"']|[\"']$/g,''):null;};\nconst schema=field('schema'),hb=field('hb_ready_status'),implementation=field('implementation_status'),adoption=field('adoption');\nlet reason='';\nif(schema!=='strategy-research-record-v1'||hb!=='PASS') reason='Invalid schema or HB_READY not PASS';\nelse if(implementation!=='implemented') reason='HB_READY admission is not executable implementation';\nelse reason='No verified Qlib executable config, data snapshot, parity or native run ID attached';\nreturn [{json:{...base,schema,hb_ready_status:hb,implementation_status:implementation,adoption,route:reason==='Invalid schema or HB_READY not PASS'?'NEEDS_REVIEW':'HOLD',reason,market_data_ready:null,execution_path_supported:null}}];"
+        "jsCode": "const record=$input.first().json.strategy_text;\nconst sourceCommit=$('02 · Pin Alpha main').first().json.sha;\nconst candidatePath=$('01 · Select candidate').first().json.candidate_path;\nconst base={origin:'manual',source_commit:sourceCommit,candidate_path:candidatePath,source_ref:'HCH725/alpha-strategy-research@'+sourceCommit+'/'+candidatePath,qlib_run_id:null,run_state:'NOT_SUBMITTED'};\nif(typeof record!=='string'||!record.startsWith('---\\n')) return [{json:{...base,route:'NEEDS_REVIEW',reason:'GitHub record has no readable YAML frontmatter'}}];\nconst end=record.indexOf('\\n---',4);\nif(end<0) return [{json:{...base,route:'NEEDS_REVIEW',reason:'Unterminated YAML frontmatter'}}];\nconst fm=record.slice(4,end);\nconst field=k=>{const m=fm.match(new RegExp('^'+k+':\\\\s*(.*?)\\\\s*$','m'));return m?m[1].trim().replace(/^[\\\"']|[\\\"']$/g,''):null;};\nconst schema=field('schema'),hb=field('hb_ready_status');\nif(schema!=='strategy-research-record-v1'||hb!=='PASS') return [{json:{...base,schema,hb_ready_status:hb,route:'NEEDS_REVIEW',reason:'Invalid schema or HB_READY not PASS',market_data_ready:null,execution_path_supported:null}}];\nreturn [{json:{...base,schema,hb_ready_status:hb,route:'HOLD',reason:'HB_READY admission accepted; market data and Qlib research execution readiness are not yet wired',market_data_ready:null,execution_path_supported:null}}];"
       }
     }
   ],
@@ -136,7 +136,7 @@
       "main": [
         [
           {
-            "node": "03 · Source-only HOLD gate",
+            "node": "03 · Engineering readiness HOLD",
             "type": "main",
             "index": 0
           }
