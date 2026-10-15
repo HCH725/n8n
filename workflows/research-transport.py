@@ -23,6 +23,7 @@ the frozen entrypoint.
 """
 
 import argparse
+import ast
 import base64
 import binascii
 import hashlib
@@ -88,6 +89,7 @@ FIXED_CONTAINER = "qlib-run"
 FIXED_GUEST_PYTHON = "/opt/venv/bin/python"
 FIXED_IMAGE = "qlib:main-bee09f23-arm64"
 FIXED_IMAGE_DIGEST = "sha256:8bee2a8beed672b17096ad44db5064dbaadcafe124c2ee989cd03b47683355b9"
+FIXED_RUNTIME_COMMIT = "bee09f23d938b96c2c1ef82d891aa0abfa171cd0"
 HOST_RESULTS_SOURCE = "/Volumes/ExpansionDrive/qlib-results"
 
 # ponytail: native backtest copies must equal the verified root evidence
@@ -285,6 +287,40 @@ def decode_handoff(payload_b64):
     return obj, None
 
 
+def _code_literals(source_text):
+    """Collect string literals from code, ignoring comments. None on syntax error."""
+    try:
+        tree = ast.parse(source_text)
+    except (SyntaxError, ValueError):
+        return None
+    out = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            out.append(node.value)
+    return out
+
+
+def _root_literal(source_text):
+    """Return a pinned ROOT absolute path when the entry declares one, else None."""
+    match = re.search(
+        r"^\s*ROOT\s*=\s*Path\(\s*[\"'](/[^\"']+)[\"']\s*\)", source_text, re.MULTILINE
+    )
+    if match:
+        return match.group(1)
+    match = re.search(r"^\s*ROOT\s*=\s*[\"'](/[^\"']+)[\"']", source_text, re.MULTILINE)
+    if match:
+        return match.group(1)
+    return None
+
+
+def is_fixed_runtime():
+    """True when this process runs as the fixed Qlib runtime python."""
+    try:
+        return os.path.realpath(sys.executable) == os.path.realpath(FIXED_GUEST_PYTHON)
+    except (OSError, ValueError):
+        return False
+
+
 def check_frozen_binding(obj):
     """Prove the verified config is the frozen config the entrypoint uses.
 
@@ -338,14 +374,61 @@ def check_frozen_binding(obj):
     if want != got:
         return "config/execution identity mismatch"
     # ponytail: a matching declaration must not authorize a program that
-    # never consumes the config. Require the entry to reference the frozen
-    # config contract and the fixed out dir before any execution.
+    # never consumes the config. Require code literals for the frozen config
+    # contract and the fixed out dir. Comments never count, so a marker that
+    # only mentions the tokens in a comment fails before any execution.
     try:
         entry_bytes = Path(obj["entrypoint_ref"]).read_bytes()
     except OSError:
         return "entrypoint is not readable"
-    if b"effective_config.json" not in entry_bytes or b"QLIB_OUT_DIR" not in entry_bytes:
+    try:
+        entry_text = entry_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return "entrypoint is not readable"
+    literals = _code_literals(entry_text)
+    if literals is None:
         return "config/execution identity mismatch"
+    if not any("effective_config.json" in lit for lit in literals):
+        return "config/execution identity mismatch"
+    if not any("QLIB_OUT_DIR" in lit for lit in literals):
+        return "config/execution identity mismatch"
+    # ponytail: the entry must not read another root's consumed config. Any
+    # absolute effective_config.json literal must equal the declared file.
+    try:
+        declared_real = os.path.realpath(obj["effective_config_ref"])
+    except (OSError, ValueError):
+        return "config/execution identity is not resolvable"
+    for lit in literals:
+        if "effective_config.json" in lit and lit.startswith("/"):
+            try:
+                if os.path.realpath(lit) != declared_real:
+                    return "config/execution identity mismatch"
+            except (OSError, ValueError):
+                return "config/execution identity mismatch"
+    # ponytail: bind a pinned ROOT literal to the declared config parent.
+    # The production entry pins ROOT at its top; an entry that pins another
+    # root but declares this sibling is a different consumed config.
+    pinned = _root_literal(entry_text)
+    if pinned is not None:
+        try:
+            if os.path.realpath(pinned) != os.path.realpath(str(Path(declared_real).parent)):
+                return "config/execution identity mismatch"
+        except (OSError, ValueError):
+            return "config/execution identity mismatch"
+    # ponytail: bind the declared runtime to the fixed runtime that executes
+    # it. Local stub pythons skip this; the fixed runtime python enforces the
+    # frozen commit and, when declared, the fixed image digest.
+    if is_fixed_runtime():
+        if obj.get("qlib_runtime_commit") != FIXED_RUNTIME_COMMIT:
+            return "config/runtime identity mismatch"
+        if runtime.get("commit") != FIXED_RUNTIME_COMMIT:
+            return "config/runtime identity mismatch"
+        declared_image = runtime.get("image")
+        if declared_image is not None and declared_image != FIXED_IMAGE:
+            return "config/runtime identity mismatch"
+        declared_digest = runtime.get("image_digest")
+        if declared_digest is not None and declared_digest != FIXED_IMAGE_DIGEST:
+            return "config/runtime identity mismatch"
     return None
 
 
@@ -393,6 +476,88 @@ def check_submit_native(out_dir, run_id, experiment_id, disk):
         return "native artifact inventory mismatch"
     if set(disk_artifacts) != set(inventory):
         return "native artifact inventory mismatch"
+    return None
+
+
+def check_submit_evidence(out_dir, run_id, experiment_id, obj, disk):
+    """Verify complete evidence before submit reports PASS.
+
+    Mirrors the readback manifest/evidence/repro identity checks. Return None
+    when clean, else a reason. No PASS or success receipt before this.
+    """
+    try:
+        manifest_bytes = (out_dir / "manifest.json").read_bytes()
+    except OSError:
+        return "required evidence is missing from the manifest: manifest.json"
+    try:
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return "run evidence is not readable"
+    if not isinstance(manifest, dict):
+        return "run evidence is not readable"
+    for name in REQUIRED_MANIFEST:
+        if name not in manifest:
+            return "required evidence is missing from the manifest: " + name
+    for name, entry in manifest.items():
+        if not safe_rel(name):
+            return "manifest entry escapes the run: " + str(name)
+        if not isinstance(entry, dict):
+            return "manifest/content mismatch: " + str(name)
+        claimed_bytes = entry.get("bytes")
+        claimed_sha = entry.get("sha256")
+        if not isinstance(claimed_bytes, int) or claimed_bytes < 0:
+            return "manifest/content mismatch: " + str(name)
+        if not isinstance(claimed_sha, str) or not HEX64.match(claimed_sha):
+            return "manifest/content mismatch: " + str(name)
+        actual = read_contained(out_dir, name)
+        if actual is None or len(actual) != claimed_bytes:
+            return "manifest/content mismatch: " + str(name)
+        if hashlib.sha256(actual).hexdigest() != claimed_sha:
+            return "manifest/content mismatch: " + str(name)
+    try:
+        disk_bytes = (out_dir / "mlflow_readback.json").read_bytes()
+    except OSError:
+        return "native readback file is missing"
+    manifest_entry = manifest.get("mlflow_readback.json") or {}
+    if manifest_entry.get("sha256") != hashlib.sha256(disk_bytes).hexdigest():
+        return "manifest/readback identity mismatch"
+    artifacts = disk.get("artifact_names") or []
+    if not isinstance(artifacts, list):
+        return "repro/candidate identity mismatch"
+    repro = [a for a in artifacts if isinstance(a, str) and a.startswith("repro/")]
+    configs = [a for a in repro if a.endswith("/effective_config.json")]
+    entries = [a for a in repro if a.endswith(".py")]
+    if len(configs) != 1 or len(entries) != 1:
+        return "repro/candidate identity mismatch"
+    run_ref = out_dir / "mlruns" / experiment_id / run_id
+    repro_cfg_bytes = read_contained(run_ref / "artifacts", configs[0])
+    if repro_cfg_bytes is None:
+        return "repro/config identity mismatch"
+    try:
+        repro_cfg = json.loads(repro_cfg_bytes.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return "repro/config identity mismatch"
+    if not isinstance(repro_cfg, dict):
+        return "repro/config identity mismatch"
+    repro_cand = repro_cfg.get("candidate")
+    if not isinstance(repro_cand, dict):
+        return "repro/candidate identity mismatch"
+    if repro_cand.get("path") != obj.get("candidate_path"):
+        return "repro/candidate identity mismatch"
+    if repro_cand.get("git_blob_sha") != obj.get("source_blob_sha"):
+        return "repro/candidate identity mismatch"
+    repro_entry = run_ref / "artifacts" / entries[0]
+    if not contained(str(run_ref / "artifacts"), str(repro_entry)):
+        return "repro/executable identity mismatch"
+    entry_digest = file_sha256(str(repro_entry))
+    if entry_digest is None or entry_digest != obj.get("entrypoint_sha256"):
+        return "repro/executable identity mismatch"
+    repro_cfg_path = run_ref / "artifacts" / configs[0]
+    if not contained(str(run_ref / "artifacts"), str(repro_cfg_path)):
+        return "repro/config identity mismatch"
+    cfg_digest = file_sha256(str(repro_cfg_path))
+    if cfg_digest is None or cfg_digest != obj.get("effective_config_sha256"):
+        return "repro/config identity mismatch"
     return None
 
 
@@ -460,7 +625,12 @@ def cmd_submit(payload_b64):
         return fail("native run identity mismatch")
     if str(disk.get("experiment_id")) != experiment_id:
         return fail("native experiment identity mismatch")
+    if disk.get("status") != "FINISHED":
+        return fail("native run is not FINISHED")
     reason = check_submit_native(out_dir, run_id, experiment_id, disk)
+    if reason is not None:
+        return fail(reason)
+    reason = check_submit_evidence(out_dir, run_id, experiment_id, obj, disk)
     if reason is not None:
         return fail(reason)
     native_hashes = native_artifact_hashes(out_dir / "mlruns" / experiment_id / run_id)
@@ -689,6 +859,14 @@ def cmd_readback(run_id):
         return fail("run evidence is not readable")
     if not isinstance(submit, dict):
         return fail("run evidence is not readable")
+    # ponytail: legacy receipts predate the runtime field and stay verifiable
+    # via repro hashes; only enforce the fixed binding when declared.
+    if (
+        is_fixed_runtime()
+        and "qlib_runtime_commit" in submit
+        and submit.get("qlib_runtime_commit") != FIXED_RUNTIME_COMMIT
+    ):
+        return fail("config/runtime identity mismatch")
     if readback.get("run_id") != run_id or readback.get("status") != "FINISHED":
         return fail("run is not FINISHED")
     experiment_id = str(readback.get("experiment_id") or "")

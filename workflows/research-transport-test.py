@@ -443,6 +443,123 @@ def main():
     check("T19f forwarded readback is PASS",
           back.get("node05") == "PASS" and back.get("run_id") == RUN_ID, proc.stdout)
 
+    # ponytail: B1 comment-only tokens never execute. Code literals required.
+    croot = Path(tempfile.mkdtemp(prefix="transport-neg-"))
+    centry, ccfg = write_stub_files(croot)
+    seen_marker = croot / "execution-marker.txt"
+    centry.write_text(
+        "# effective_config.json QLIB_OUT_DIR\nfrom pathlib import Path\n"
+        "Path(" + repr(str(seen_marker)) + ").write_text(\"executed\")\n"
+    )
+    rc, out = run("submit", b64(make_handoff(croot, centry, ccfg)), root=croot)
+    check("T20a comment-token marker never executes",
+          rc == 2 and "identity" in out and not seen_marker.exists()
+          and not list(croot.glob("n8n-live-*")), out)
+
+    # ponytail: B1 same-basename sibling must not mask another consumed root.
+    sroot = Path(tempfile.mkdtemp(prefix="transport-neg-"))
+    sentry, scfg = write_stub_files(sroot)
+    actual_root = sroot / "actual-native-root"
+    actual_root.mkdir()
+    wrong_cfg = json.loads(scfg.read_text())
+    wrong_cfg["candidate"] = {"path": "wrong-consumed.md", "git_blob_sha": "d" * 40}
+    (actual_root / "effective_config.json").write_text(json.dumps(wrong_cfg, sort_keys=True))
+    scode = sentry.read_text()
+    start = scode.index("frozen_cfg = {")
+    end = scode.index("(out / \"mlruns\"", start)
+    scode = (
+        scode[:start]
+        + "frozen_cfg = json.loads(Path("
+        + repr(str(actual_root / "effective_config.json"))
+        + ").read_text())\n"
+        + scode[end:]
+    )
+    smarker = sroot / "execution-marker.txt"
+    scode = (
+        "from pathlib import Path\nPath(" + repr(str(smarker)) + ").write_text(\"executed\")\n" + scode
+    )
+    sentry.write_text(scode)
+    rc, out = run("submit", b64(make_handoff(sroot, sentry, scfg)), root=sroot)
+    check("T20b same-basename wrong consumed config fails before executing",
+          rc == 2 and "identity mismatch" in out and not smarker.exists()
+          and not list(sroot.glob("n8n-live-*/submit-receipt.json")), out)
+
+    # ponytail: B1 fixed runtime binds the declared commit/digest. Local
+    # stubs skip this; the fixed python enforces the frozen values.
+    check("T21a fixed runtime constants are frozen",
+          _t.FIXED_RUNTIME_COMMIT == "bee09f23d938b96c2c1ef82d891aa0abfa171cd0"
+          and _t.FIXED_IMAGE_DIGEST
+          == "sha256:8bee2a8beed672b17096ad44db5064dbaadcafe124c2ee989cd03b47683355b9"
+          and _t.FIXED_IMAGE == "qlib:main-bee09f23-arm64", "")
+    rroot = Path(tempfile.mkdtemp(prefix="transport-neg-"))
+    rentry, rcfg = write_stub_files(rroot)
+    rh = make_handoff(rroot, rentry, rcfg)
+    check("T21b local stub passes frozen binding", _t.check_frozen_binding(rh) is None)
+    orig_fixed = _t.is_fixed_runtime
+    try:
+        setattr(_t, "is_fixed_runtime", lambda: True)
+        wrong_cfg = json.loads(rcfg.read_text())
+        wrong_cfg["runtime"] = {"commit": "d" * 40}
+        rcfg.write_text(json.dumps(wrong_cfg, sort_keys=True))
+        wrong_h = make_handoff(rroot, rentry, rcfg)
+        wrong_h["qlib_runtime_commit"] = "d" * 40
+        check("T21c wrong runtime commit fails in fixed runtime",
+              _t.check_frozen_binding(wrong_h) is not None
+              and "runtime" in str(_t.check_frozen_binding(wrong_h)), "")
+        good_cfg = json.loads(rcfg.read_text())
+        good_cfg["runtime"] = {
+            "commit": _t.FIXED_RUNTIME_COMMIT,
+            "image": _t.FIXED_IMAGE,
+            "image_digest": "sha256:" + "0" * 64,
+        }
+        rcfg.write_text(json.dumps(good_cfg, sort_keys=True))
+        good_h = make_handoff(rroot, rentry, rcfg)
+        good_h["qlib_runtime_commit"] = _t.FIXED_RUNTIME_COMMIT
+        check("T21d wrong runtime digest fails in fixed runtime",
+              _t.check_frozen_binding(good_h) is not None
+              and "runtime" in str(_t.check_frozen_binding(good_h)), "")
+        fixed_cfg = {
+            "candidate": {"path": "demo-candidate.md", "git_blob_sha": "a" * 40},
+            "execution": {"entrypoint": str(rentry)},
+            "runtime": {
+                "commit": _t.FIXED_RUNTIME_COMMIT,
+                "image": _t.FIXED_IMAGE,
+                "image_digest": _t.FIXED_IMAGE_DIGEST,
+            },
+        }
+        rcfg.write_text(json.dumps(fixed_cfg, sort_keys=True))
+        fixed_h = make_handoff(rroot, rentry, rcfg)
+        fixed_h["qlib_runtime_commit"] = _t.FIXED_RUNTIME_COMMIT
+        check("T21e correct fixed runtime passes frozen binding",
+              _t.check_frozen_binding(fixed_h) is None,
+              str(_t.check_frozen_binding(fixed_h)))
+    finally:
+        setattr(_t, "is_fixed_runtime", orig_fixed)
+
+    # ponytail: B2 submit verifies complete evidence before Node04 PASS.
+    tail = "print(json.dumps({\"summary\": {\"ok\": True}, \"mlflow\": readback, \"manifest\": manifest}))"
+    for name, action in [
+        ("T22a submit without manifest fails before PASS", "(out / \"manifest.json\").unlink()"),
+        ("T22b submit without root events fails before PASS", "(out / \"events.csv\").unlink()"),
+        (
+            "T22c submit with stale summary fails before PASS",
+            "(out / \"summary.json\").write_text(\"{\\\"evaluation_rows_including_force_flat\\\": 999}\")",
+        ),
+        (
+            "T22d submit with wrong repro candidate fails before PASS",
+            "p=out / \"mlruns\" / \"%s\" / \"%s\" / \"artifacts/repro/effective_config.json\"\n"
+            "x=json.loads(p.read_text())\nx[\"candidate\"][\"path\"]=\"different.md\"\n"
+            "p.write_text(json.dumps(x))" % (EXP_ID, RUN_ID),
+        ),
+    ]:
+        eroot = Path(tempfile.mkdtemp(prefix="transport-neg-"))
+        eentry, ecfg = write_stub_files(eroot)
+        ecode = eentry.read_text()
+        assert ecode.count(tail) == 1
+        eentry.write_text(ecode.replace(tail, action + "\n" + tail))
+        rc, out = run("submit", b64(make_handoff(eroot, eentry, ecfg)), root=eroot)
+        check(name, rc == 2 and not list(eroot.glob("n8n-live-*/submit-receipt.json")), out)
+
     print("ALL DETERMINISTIC CHECKS PASSED")
 
 
