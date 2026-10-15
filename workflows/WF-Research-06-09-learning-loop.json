@@ -1,0 +1,304 @@
+{
+  "id": "WF0609LearnLoop",
+  "name": "Quant WF-Research · learning loop (06–09)",
+  "nodes": [
+    {
+      "id": "r0609-manual",
+      "name": "06 · Manual trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        240,
+        320
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "r0609-fixture",
+      "name": "06 · IS_READY fixture",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        460,
+        320
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// FROZEN fixture. It represents the Node05 IS_READY output.\n// It is not a live run. It holds IS data only. It has no OOS columns.\nconst runKey = 'b7c1e0d4a9f24c8fb3e6d5a10c72f984';\nconst runId = '3ad9f0c4b1e2487fa5c6d87013be92f4';\n// The Hermes boundary supplies this analysis identity. A live channel replaces it.\nconst analysis = {\n  source_run_key: runKey,\n  source_run_id: runId,\n  period_basis: 'IS',\n  previous_hypothesis_ref: null,\n  expectation_vs_actual: [\n    { condition: 'drawdown band', expectation: 'max_drawdown <= 0.20', actual: 0.18, verdict: 'MET' },\n    { condition: 'trade floor', expectation: 'trades >= 150', actual: 214, verdict: 'MET' }\n  ],\n  lessons: [\n    'The 20/10 breakout keeps the drawdown inside the declared band.',\n    'The exit window is the next candidate for one bounded retest.'\n  ],\n  worth_retesting: true,\n  analysis_ref: 'hermes-analysis://research-loop/' + runKey + '/round-0',\n  analysis_hash: 'a7d2f6b8c4e0193d5a6f7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e',\n  proposal: {\n    source_run_key: runKey,\n    change_set: { hypothesis_group: 'donchian', params: { 'donchian.exit_window': 15 } }\n  }\n};\nreturn [{\n  json: {\n    run_key: runKey,\n    run_id: runId,\n    round_index: 0,\n    period_basis: 'IS',\n    metrics_summary: { sharpe: 1.12, max_drawdown: 0.18, trades: 214, turnover: 3.4 },\n    metrics_ref: 'mlflow://qlib/runs/' + runKey + '/metrics',\n    evidence_refs: {\n      run_manifest: 'mlflow://qlib/runs/' + runKey + '/manifest.json',\n      analysis_source: 'hermes-analysis://research-loop/' + runKey + '/round-0'\n    },\n    applied_change_set: null,\n    prior_hypothesis_ref: null,\n    allowed_override_params: ['donchian.entry_window', 'donchian.exit_window', 'donchian.atr_stop_mult'],\n    completed_runs: [{ round_index: 0, run_key: runKey, status: 'IS_SUCCESS' }],\n    wiki_state: [],\n    hermes_status: 'ok',\n    hermes_raw: JSON.stringify(analysis)\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "r0609-hermes",
+      "name": "06 · Hermes boundary fixture",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        680,
+        320
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Node06 is the only reasoning point in this workflow. It holds the Hermes\n// result. Nodes 07, 08 and 09 must not reason again.\n// Boundary fixture for the Node06 Hermes task interface.\n// The n8n container has no channel to the Hermes CLI, so the frozen fixture\n// carries the Hermes answer as raw text. A live channel replaces this node.\nconst run = $input.first().json;\nconst state = {\n  run_key: run.run_key,\n  run_id: run.run_id,\n  round_index: run.round_index,\n  period_basis: run.period_basis,\n  metrics_summary: run.metrics_summary,\n  metrics_ref: run.metrics_ref,\n  evidence_refs: run.evidence_refs,\n  applied_change_set: run.applied_change_set,\n  prior_hypothesis_ref: run.prior_hypothesis_ref,\n  allowed_override_params: run.allowed_override_params,\n  completed_runs: run.completed_runs,\n  wiki_state: run.wiki_state\n};\n// A timeout or a transport error from the Hermes task is a review item.\n// The workflow must not invent a prediction.\nif (run.hermes_status !== 'ok') {\n  return [{ json: Object.assign({}, state, { route: 'NEEDS_REVIEW', reason: 'hermes_' + run.hermes_status }) }];\n}\nlet analysis = null;\ntry {\n  analysis = JSON.parse(run.hermes_raw);\n} catch (error) {\n  analysis = null;\n}\nif (analysis === null || typeof analysis !== 'object' || Array.isArray(analysis)) {\n  return [{ json: Object.assign({}, state, { route: 'NEEDS_REVIEW', reason: 'hermes_format_error' }) }];\n}\nreturn [{ json: Object.assign({}, state, { analysis: analysis, route: 'ANALYSIS_PENDING' }) }];\n"
+      }
+    },
+    {
+      "id": "r0609-gate06",
+      "name": "06 · Analysis contract gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        900,
+        320
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Check the Node06 analysis contract. No LLM runs here.\nconst x = $input.first().json;\nif (x.route === 'NEEDS_REVIEW') {\n  return [{ json: x }];\n}\nconst a = x.analysis;\nconst stop = (reason) => [{ json: Object.assign({}, x, { route: 'NEEDS_REVIEW', reason: reason }) }];\nconst isText = (v) => typeof v === 'string' && v.length > 0;\nconst isHash = (v) => typeof v === 'string' && /^[a-f0-9]{64}$/.test(v);\nconst missing = [];\nif (!isText(a.analysis_ref)) { missing.push('analysis_ref'); }\nif (!isHash(a.analysis_hash)) { missing.push('analysis_hash'); }\nif (!isText(a.source_run_key)) { missing.push('source_run_key'); }\nif (!isText(a.source_run_id)) { missing.push('source_run_id'); }\nif (!Array.isArray(a.lessons) || a.lessons.length === 0) { missing.push('lessons'); }\nif (!Array.isArray(a.expectation_vs_actual) || a.expectation_vs_actual.length === 0) { missing.push('expectation_vs_actual'); }\nif (typeof a.worth_retesting !== 'boolean') { missing.push('worth_retesting'); }\nif (!a.proposal || typeof a.proposal !== 'object' || Array.isArray(a.proposal)) { missing.push('proposal'); }\nif (missing.length > 0) {\n  return stop('hermes_contract_incomplete:' + missing.join(','));\n}\nif (a.source_run_key !== x.run_key || a.source_run_id !== x.run_id) {\n  return stop('analysis_source_run_mismatch');\n}\nif (a.period_basis !== 'IS' || x.period_basis !== 'IS') {\n  return stop('period_basis_not_is');\n}\nif (x.round_index === 0) {\n  // The baseline has no previous hypothesis.\n  if (a.previous_hypothesis_ref !== null && a.previous_hypothesis_ref !== undefined) {\n    return stop('baseline_has_prior_hypothesis');\n  }\n} else {\n  if (!isText(a.previous_hypothesis_ref)) {\n    return stop('missing_prior_hypothesis');\n  }\n  if (a.previous_hypothesis_ref !== x.prior_hypothesis_ref) {\n    return stop('prior_hypothesis_ref_mismatch');\n  }\n}\nreturn [{ json: Object.assign({}, x, { route: 'ANALYSIS_OK' }) }];\n"
+      }
+    },
+    {
+      "id": "r0709-wiki",
+      "name": "07 · Wiki ACK fixture",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        320
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Node07 is memory persistence only. It stores the Node06 analysis.\n// It must not reason again and it must not rewrite the analysis.\n// Boundary fixture for the Node07 Wiki Brain upsert.\n// The Wiki Brain server is a local stdio MCP server. The n8n container cannot\n// reach it, so the fixture applies the upsert contract on the frozen state.\n// Contract: same run_key and same analysis_hash gives the same note_ref.\n//           same run_key and a different analysis_hash gives a conflict.\nconst x = $input.first().json;\nif (x.route === 'NEEDS_REVIEW') {\n  return [{ json: x }];\n}\nconst a = x.analysis;\nconst derivedRef = 'quant/research-loop/' + x.run_key + '.md';\nconst state = Array.isArray(x.wiki_state) ? x.wiki_state : [];\nconst existing = state.filter((row) => row && row.run_key === x.run_key)[0] || null;\nlet ack;\nif (existing === null) {\n  ack = { status: 'ACK', action: 'CREATED', note_ref: derivedRef, run_key: x.run_key, analysis_hash: a.analysis_hash };\n} else if (existing.analysis_hash === a.analysis_hash) {\n  ack = { status: 'ACK', action: 'IDEMPOTENT', note_ref: existing.note_ref, run_key: x.run_key, analysis_hash: a.analysis_hash };\n} else {\n  ack = {\n    status: 'CONFLICT',\n    action: 'REJECTED',\n    note_ref: existing.note_ref,\n    run_key: x.run_key,\n    analysis_hash: a.analysis_hash,\n    existing_analysis_hash: existing.analysis_hash\n  };\n}\n// Only the ACK is added. The analysis object passes through unchanged.\nreturn [{ json: Object.assign({}, x, { wiki_ack: ack }) }];\n"
+      }
+    },
+    {
+      "id": "r0809-validate",
+      "name": "08 · Deterministic validation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1340,
+        320
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Node08 is deterministic validation only. No LLM runs here.\n// No second opinion, no model review layer.\nconst x = $input.first().json;\nconst stop = (reason) => [{ json: Object.assign({}, x, { route: 'NEEDS_REVIEW', reason: reason }) }];\nif (x.route === 'NEEDS_REVIEW') {\n  return [{ json: x }];\n}\nconst a = x.analysis;\nconst ack = x.wiki_ack;\nif (!ack || typeof ack !== 'object') { return stop('wiki_ack_missing'); }\nif (ack.status !== 'ACK') { return stop('wiki_ack_' + ack.status); }\nif (ack.run_key !== x.run_key) { return stop('wiki_ack_run_key_mismatch'); }\nif (ack.analysis_hash !== a.analysis_hash) { return stop('analysis_hash_mismatch'); }\nif (typeof ack.note_ref !== 'string' || ack.note_ref.length === 0) { return stop('wiki_note_ref_missing'); }\nif (x.period_basis !== 'IS' || a.period_basis !== 'IS') { return stop('period_basis_not_is'); }\nif (!a.proposal || a.proposal.source_run_key !== x.run_key) { return stop('proposal_source_run_mismatch'); }\n\n// The IS-only allowlist is the primary OOS gate. A key outside the list is\n// unexpected material.\nconst allowedTop = [\n  'analysis_ref', 'analysis_hash', 'expectation_vs_actual', 'lessons',\n  'period_basis', 'previous_hypothesis_ref', 'proposal', 'source_run_id',\n  'source_run_key', 'worth_retesting'\n];\nconst topKeys = Object.keys(a);\nfor (const key of topKeys) {\n  if (allowedTop.indexOf(key) === -1) { return stop('unexpected_analysis_field:' + key); }\n}\n// A conservative regex is the second line of defence.\nif (/(^|[^a-z])(oos|holdout|out_of_sample|out-of-sample)([^a-z]|$)/i.test(JSON.stringify(a))) {\n  return stop('oos_material_in_analysis');\n}\n// The Wiki note holds lessons and references only. It must not copy raw orders.\nconst rawKeys = [];\nconst walk = (node) => {\n  if (Array.isArray(node)) {\n    node.forEach(walk);\n    return;\n  }\n  if (node && typeof node === 'object') {\n    Object.keys(node).forEach((key) => {\n      rawKeys.push(key);\n      walk(node[key]);\n    });\n  }\n};\nwalk(a);\nconst rawHit = rawKeys.filter((key) => /(trades|equity|orders|fills|positions)/i.test(key));\nif (rawHit.length > 0) { return stop('raw_result_material:' + rawHit.join(',')); }\n\n// One change set only. Each parameter must be allowed upstream.\nlet changeSet = null;\nif (a.worth_retesting === true) {\n  const candidate = a.proposal.change_set;\n  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {\n    return stop('change_set_must_be_one_group');\n  }\n  if (a.proposal.change_sets !== undefined) { return stop('multiple_change_sets'); }\n  if (candidate.hypothesis_groups !== undefined) { return stop('multiple_change_groups'); }\n  const params = candidate.params;\n  if (!params || typeof params !== 'object' || Array.isArray(params) || Object.keys(params).length === 0) {\n    return stop('empty_change_set');\n  }\n  const allowed = Array.isArray(x.allowed_override_params) ? x.allowed_override_params : [];\n  const names = Object.keys(params);\n  for (const name of names) {\n    if (allowed.indexOf(name) === -1) { return stop('override_param_not_allowed:' + name); }\n  }\n  const group = candidate.hypothesis_group;\n  if (typeof group !== 'string' || group.length === 0 || Array.isArray(group)) {\n    return stop('change_group_missing');\n  }\n  const families = names.map((name) => name.split('.')[0]).filter((f, i, arr) => arr.indexOf(f) === i);\n  if (families.length !== 1) { return stop('params_span_multiple_groups:' + families.join(',')); }\n  if (families[0] !== group) { return stop('change_group_mismatch'); }\n  changeSet = candidate;\n}\nreturn [{ json: Object.assign({}, x, { change_set: changeSet, route: 'VALID' }) }];\n"
+      }
+    },
+    {
+      "id": "r0909-decision",
+      "name": "09 · Decision",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1560,
+        320
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Node09 is deterministic routing only. It emits RETEST or FINALIZE.\n// No LLM runs here.\nconst x = $input.first().json;\nconst stop = (reason) => [{ json: Object.assign({}, x, { route: 'NEEDS_REVIEW', reason: reason }) }];\nif (x.route === 'NEEDS_REVIEW') {\n  return [{ json: x }];\n}\nif (x.route !== 'VALID') { return stop('upstream_route_not_valid:' + x.route); }\nconst rounds = Array.isArray(x.completed_runs) ? x.completed_runs : [];\nif (rounds.length === 0) { return stop('completed_runs_empty'); }\nif (rounds.length > 4) { return stop('completed_runs_above_cap'); }\nconst usedKeys = [];\nfor (let i = 0; i < rounds.length; i += 1) {\n  const row = rounds[i];\n  if (!row || row.round_index !== i) { return stop('round_series_not_contiguous'); }\n  if (row.status !== 'IS_SUCCESS') { return stop('round_not_successful_is'); }\n  if (typeof row.run_key !== 'string' || !/^[a-f0-9]{32}$/.test(row.run_key)) { return stop('run_key_bad_shape'); }\n  if (usedKeys.indexOf(row.run_key) !== -1) { return stop('duplicate_run_key'); }\n  usedKeys.push(row.run_key);\n}\nconst head = rounds[rounds.length - 1];\nif (head.run_key !== x.run_key) { return stop('current_run_not_canonical_head'); }\nif (head.round_index !== x.round_index) { return stop('current_round_mismatch'); }\n\nconst a = x.analysis;\nif (a.worth_retesting === true && rounds.length < 4) {\n  return [{\n    json: Object.assign({}, x, {\n      route: 'RETEST',\n      decision: {\n        next_round_index: x.round_index + 1,\n        next_parent_run_key: x.run_key,\n        next_prior_hypothesis_ref: x.wiki_ack.note_ref,\n        next_change_set: x.change_set,\n        next_analysis_hash: x.wiki_ack.analysis_hash\n      }\n    })\n  }];\n}\nconst finalizeReason = a.worth_retesting === true ? 'ROUND_CAP_REACHED' : 'WORTH_RETESTING_FALSE';\nreturn [{\n  json: Object.assign({}, x, {\n    route: 'FINALIZE',\n    decision: {\n      selected_run_key: x.run_key,\n      selected_run_id: x.run_id,\n      selected_round_index: x.round_index,\n      selected_analysis_ref: a.analysis_ref,\n      selected_analysis_hash: a.analysis_hash,\n      selected_wiki_note_ref: x.wiki_ack.note_ref,\n      period_basis: 'IS',\n      finalize_reason: finalizeReason\n    }\n  })\n}];\n"
+      }
+    },
+    {
+      "id": "r0909-gate-retest",
+      "name": "09 · RETEST gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1780,
+        180
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $input.first().json.route === 'RETEST' ? $input.all() : [];\n"
+      }
+    },
+    {
+      "id": "r0909-retest-boundary",
+      "name": "09 · RETEST_TO_04 boundary",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        2000,
+        180
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "r0909-gate-finalize",
+      "name": "09 · FINALIZE gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1780,
+        320
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $input.first().json.route === 'FINALIZE' ? $input.all() : [];\n"
+      }
+    },
+    {
+      "id": "r0909-finalize-boundary",
+      "name": "09 · FINALIZE to Node10 boundary",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        2000,
+        320
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "r0909-gate-review",
+      "name": "09 · NEEDS_REVIEW gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1780,
+        460
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $input.first().json.route === 'NEEDS_REVIEW' ? $input.all() : [];\n"
+      }
+    },
+    {
+      "id": "r0909-review-endpoint",
+      "name": "09 · NEEDS_REVIEW endpoint",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        2000,
+        460
+      ],
+      "parameters": {}
+    }
+  ],
+  "connections": {
+    "06 · Manual trigger": {
+      "main": [
+        [
+          {
+            "node": "06 · IS_READY fixture",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "06 · IS_READY fixture": {
+      "main": [
+        [
+          {
+            "node": "06 · Hermes boundary fixture",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "06 · Hermes boundary fixture": {
+      "main": [
+        [
+          {
+            "node": "06 · Analysis contract gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "06 · Analysis contract gate": {
+      "main": [
+        [
+          {
+            "node": "07 · Wiki ACK fixture",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "07 · Wiki ACK fixture": {
+      "main": [
+        [
+          {
+            "node": "08 · Deterministic validation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "08 · Deterministic validation": {
+      "main": [
+        [
+          {
+            "node": "09 · Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "09 · Decision": {
+      "main": [
+        [
+          {
+            "node": "09 · RETEST gate",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "09 · FINALIZE gate",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "09 · NEEDS_REVIEW gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "09 · RETEST gate": {
+      "main": [
+        [
+          {
+            "node": "09 · RETEST_TO_04 boundary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "09 · FINALIZE gate": {
+      "main": [
+        [
+          {
+            "node": "09 · FINALIZE to Node10 boundary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "09 · NEEDS_REVIEW gate": {
+      "main": [
+        [
+          {
+            "node": "09 · NEEDS_REVIEW endpoint",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "pinData": {},
+  "tags": []
+}
