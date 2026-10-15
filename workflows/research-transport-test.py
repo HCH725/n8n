@@ -259,6 +259,39 @@ def main():
     check("T13d forced verbs are research-only",
           set(_t.FORCED_VERBS) == {"research-submit", "research-readback"}, str(_t.FORCED_VERBS))
 
+    from unittest.mock import patch
+
+    task = "Read the IS evidence. Return one research result.\n$(not-a-command); 'quoted'"
+    encoded = base64.b64encode(task.encode()).decode()
+    command = "cd / ; research-hermes " + encoded
+    check("T14a Hermes key accepts its fixed verb",
+          _t.parse_forced_command(command, hermes=True) == ((_t.HERMES_VERB, encoded), None))
+    check("T14b Qlib key does not accept the Hermes verb",
+          _t.parse_forced_command(command)[0] is None)
+    for text in ("research-submit " + encoded, "research-readback " + RUN_ID,
+                 command + "; true", command + " extra", "hermes chat", "cd ~ ; " + command,
+                 "research-hermes " + "A" * (_t.HERMES_PAYLOAD_LIMIT + 1)):
+        check("T14c Hermes key rejects other input", _t.parse_forced_command(text, hermes=True)[0] is None)
+    with patch.object(_t, "should_forward_host", side_effect=AssertionError("host only")), \
+         patch.object(_t.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as child, \
+         patch.dict(os.environ, {"SSH_ORIGINAL_COMMAND": command}):
+        check("T14d Hermes forced mode completes", _t.main(["hermes-forced"]) == 0)
+        child.assert_called_once_with(
+            ["hermes", "chat", "--query-file", "-", "--oneshot", "-Q",
+             "--format", "stream-json", "-t", "wiki_brain"],
+            input=task, cwd="/", capture_output=True, text=True, timeout=_t.SUBMIT_TIMEOUT)
+        check("T14e fixed argv and stdin match", True)
+    with patch.object(_t.subprocess, "run") as child:
+        for payload in ("!!!!", "/w==", "IA==", "A"):
+            check("T14f invalid task does not start Hermes", _t.cmd_hermes(payload) == 2)
+        check("T14g invalid tasks start no child", child.call_count == 0)
+    for code in (0, 1):
+        with patch.object(_t.subprocess, "run", return_value=subprocess.CompletedProcess([], code, "", "")):
+            check("T14h child exit status is kept", _t.cmd_hermes(encoded) == code)
+    with patch.object(_t.subprocess, "run", side_effect=subprocess.TimeoutExpired("hermes", 1800)):
+        check("T14i timeout fails closed", _t.cmd_hermes(encoded) == 2)
+    check("T14j Hermes verb is never forwarded", _t.build_forward_command(_t.HERMES_VERB, encoded) is None)
+
     print("ALL THIN CHECKS PASSED")
 
 

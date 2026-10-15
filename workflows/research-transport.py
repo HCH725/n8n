@@ -7,6 +7,9 @@ results root, verify its manifest, print one Node05 receipt. Exit 0 means valid,
 exit 2 means invalid. This file never fabricates a PASS receipt: every receipt
 field comes from hashes checked here or files the native run wrote.
 
+hermes-forced: a separate restricted key sends one base64 UTF-8 task to the
+fixed host Hermes argv. This mode accepts no Qlib verb and starts no shell.
+
 ponytail: single-file bridge on purpose. Synchronous subprocess only, one fixed
 results root, one out_dir per frozen executable (a re-submit refuses instead of
 clobbering evidence), single-candidate coverage only. Deliberate simplifications
@@ -82,6 +85,8 @@ MAX_SCAN_DIRS = 500
 # Node04/Node05 already use the research- prefix, and one spelling keeps the
 # SSH trust boundary auditable.
 FORCED_VERBS = ("research-submit", "research-readback")
+HERMES_VERB = "research-hermes"
+HERMES_PAYLOAD_LIMIT = 65536
 
 # ponytail: readback actually reads these four files, so the manifest must
 # cover them. Only existence plus the readback sha correspondence is checked;
@@ -719,15 +724,37 @@ def cmd_readback(run_id):
     return 0
 
 
-def parse_forced_command(value):
+def cmd_hermes(payload_b64):
+    """Send one UTF-8 task to the fixed host Hermes command. Do not use a shell."""
+    try:
+        task = base64.b64decode(payload_b64, validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError, ValueError):
+        return fail("Hermes task is not base64 UTF-8")
+    if not task.strip():
+        return fail("Hermes task is empty")
+    try:
+        proc = subprocess.run(
+            ["hermes", "chat", "--query-file", "-", "--oneshot", "-Q",
+             "--format", "stream-json", "-t", "wiki_brain"],
+            input=task, cwd="/", capture_output=True, text=True, timeout=SUBMIT_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return fail("Hermes research turn did not complete")
+    sys.stdout.write(proc.stdout)
+    sys.stderr.write(proc.stderr)
+    return proc.returncode
+
+
+def parse_forced_command(value, hermes=False):
     """Parse SSH_ORIGINAL_COMMAND for the fixed launch shape.
 
-    The restricted key runs this file with no argv; the only command text
-    lives in SSH_ORIGINAL_COMMAND. Accept exactly one known verb plus one
+    The Qlib key runs this file with no argv. The Hermes key uses hermes-forced.
+    The command text lives in SSH_ORIGINAL_COMMAND. Accept one allowed verb plus one
     argument, with one optional leading "cd / ;". Anything else fails
     closed. Return (verb, arg) or (None, reason). Never launches a shell.
     """
-    if not isinstance(value, str) or not value.strip() or len(value) > 8192:
+    limit = HERMES_PAYLOAD_LIMIT + 128 if hermes else 8192
+    if not isinstance(value, str) or not value.strip() or len(value) > limit:
         return None, "forced-command input is missing or invalid"
     text = value.strip()
     if ";" in text:
@@ -739,13 +766,13 @@ def parse_forced_command(value):
     if len(tokens) != 2:
         return None, "forced-command input is missing or invalid"
     verb, arg = tokens
-    if verb not in FORCED_VERBS:
+    if verb not in ((HERMES_VERB,) if hermes else FORCED_VERBS):
         return None, "forced-command input is missing or invalid"
     if verb == "research-readback":
         if not RUNID.match(arg):
             return None, "forced-command input is missing or invalid"
     else:
-        if len(arg) > 65536 or re.fullmatch(r"[A-Za-z0-9+/=]+", arg) is None:
+        if len(arg) > HERMES_PAYLOAD_LIMIT or re.fullmatch(r"[A-Za-z0-9+/=]+", arg) is None:
             return None, "forced-command input is missing or invalid"
     return (verb, arg), None
 
@@ -870,12 +897,16 @@ def forward_via_container(verb, arg):
 
 def main(argv):
     """Parse args and dispatch to one subcommand."""
-    if not argv:
+    if not argv or argv == ["hermes-forced"]:
         forced = os.environ.get("SSH_ORIGINAL_COMMAND")
-        parsed, reason = parse_forced_command(forced)
+        parsed, reason = parse_forced_command(forced, hermes=bool(argv))
         if parsed is None:
             return fail(reason or "forced-command input is missing or invalid")
         verb, arg = parsed
+        # ponytail: a separate restricted key enables only this host verb.
+        # Keep the Qlib key and container forwarding unchanged.
+        if argv:
+            return cmd_hermes(arg)
         # ponytail: host launches with no /results use the fixed runtime.
         if should_forward_host():
             return forward_via_container(verb, arg)

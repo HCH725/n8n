@@ -1,0 +1,2299 @@
+{
+  "id": "OhSN7BCpOVLMcUMQ",
+  "name": "Quant WF-Research 01–12 · single integrated workflow",
+  "nodes": [
+    {
+      "id": "manual-preflight",
+      "name": "01 · Manual preflight",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        240,
+        260
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "candidate-selector",
+      "name": "01 · Select candidate",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        470,
+        260
+      ],
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            {
+              "id": "candidate-path",
+              "name": "candidate_path",
+              "type": "string",
+              "value": "donchian-20-10-breakout-btcusdt-1h-2026-10-06.md"
+            },
+            {
+              "id": "executable-handoff",
+              "name": "executable_handoff",
+              "type": "string",
+              "value": ""
+            },
+            {
+              "id": "handoff-ref",
+              "name": "handoff_ref",
+              "type": "string",
+              "value": ""
+            },
+            {
+              "id": "market-data-ready",
+              "name": "market_data_ready",
+              "type": "boolean",
+              "value": true
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "pin-head",
+      "name": "02 · Pin Alpha main",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        700,
+        260
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.github.com/repos/HCH725/alpha-strategy-research/commits/main",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "read-record",
+      "name": "02 · Read pinned record",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        930,
+        260
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'https://api.github.com/repos/HCH725/alpha-strategy-research/contents/' + $('01 · Select candidate').first().json.candidate_path + '?ref=' + $('02 · Pin Alpha main').first().json.sha }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "read-only-gate",
+      "name": "03 · Engineering readiness",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1160,
+        260
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const file = $input.first().json;\nconst pin = $('02 · Pin Alpha main').first().json;\nconst sel = $('01 · Select candidate').first().json;\nconst sourceCommit = pin.sha;\nconst candidatePath = sel.candidate_path;\nconst base = {\n  origin: 'manual',\n  source_commit: sourceCommit,\n  candidate_path: candidatePath,\n  source_ref: 'HCH725/alpha-strategy-research@' + sourceCommit + '/' + candidatePath,\n  source_blob_sha: file.sha || null,\n  qlib_run_id: null,\n  run_state: 'NOT_SUBMITTED'\n};\nconst readField = (fm, k) => {\n  const m = fm.match(new RegExp('^' + k + ':\\\\s*(.*?)\\\\s*$', 'm'));\n  return m ? m[1].trim().replace(/^[\"']|[\"']$/g, '') : null;\n};\nif (file.type !== 'file' || typeof file.content !== 'string')\n  return [{ json: { ...base, route: 'NEEDS_REVIEW', reason: 'GitHub record content is not readable' } }];\nlet record;\ntry {\n  record = Buffer.from(file.content.replace(/\\s/g, ''), 'base64').toString('utf8');\n} catch {\n  return [{ json: { ...base, route: 'NEEDS_REVIEW', reason: 'GitHub record content is not decodable' } }];\n}\nif (!record.startsWith('---\\n'))\n  return [{ json: { ...base, route: 'NEEDS_REVIEW', reason: 'GitHub record has no readable YAML frontmatter' } }];\nconst end = record.indexOf('\\n---', 4);\nif (end < 0)\n  return [{ json: { ...base, route: 'NEEDS_REVIEW', reason: 'Unterminated YAML frontmatter' } }];\nconst fm = record.slice(4, end);\nconst schema = readField(fm, 'schema');\nconst hb = readField(fm, 'hb_ready_status');\nconst impl = readField(fm, 'implementation_status');\n// ponytail: admission checks schema + HB_READY PASS only. implementation_status stays informational.\nif (schema !== 'strategy-research-record-v1' || hb !== 'PASS')\n  return [{ json: { ...base, schema, hb_ready_status: hb, implementation_status: impl, route: 'NEEDS_REVIEW', reason: 'Invalid schema or HB_READY not PASS' } }];\n// A. Market data is not ready for this run.\nconst fmData = readField(fm, 'market_data_ready') || readField(fm, 'data_ready');\nconst dataFalse = (v) => v === false || v === 'false' || v === 'no' || v === '0';\nif (dataFalse(sel.market_data_ready) || dataFalse(fmData))\n  return [{ json: { ...base, schema, hb_ready_status: hb, implementation_status: impl, route: 'WAITING_DATA', reason: 'Market data is not ready for this run', market_data_ready: false } }];\n// B. Load the per-run executable handoff. It lives in this run input only.\nconst loadHandoff = (v) => {\n  if (v == null || v === '') return null;\n  if (typeof v === 'object' && !Array.isArray(v)) return v;\n  if (typeof v === 'string') {\n    try {\n      const o = JSON.parse(v);\n      return (o && typeof o === 'object' && !Array.isArray(o)) ? o : null;\n    } catch { return null; }\n  }\n  return null;\n};\nlet handoff = loadHandoff(sel.executable_handoff);\nlet refOnly = false;\nif (!handoff && typeof sel.handoff_ref === 'string' && sel.handoff_ref.trim() !== '') {\n  handoff = loadHandoff(sel.handoff_ref.trim());\n  if (!handoff) refOnly = true;\n}\nif (!handoff)\n  return [{ json: { ...base, schema, hb_ready_status: hb, implementation_status: impl, route: 'IMPLEMENTATION_NEEDED', reason: refOnly ? 'IMPLEMENTATION_NEEDED: admitted strategy lacks executable materialization for this run (handoff_ref pointer only, no materialized handoff content)' : 'IMPLEMENTATION_NEEDED: admitted strategy lacks executable materialization for this run', market_data_ready: null } }];\n// C. Verify frozen identity, refs, and hashes.\nconst isHex = (v, n) => typeof v === 'string' && new RegExp('^[a-f0-9]{' + n + '}$').test(v);\nconst isAbsPath = (v) => typeof v === 'string' && /^\\/[A-Za-z0-9_@+./-]{1,511}$/.test(v) && !v.includes('..');\nconst bad = (d) => ({ json: { ...base, schema, hb_ready_status: hb, implementation_status: impl, route: 'NEEDS_REVIEW', reason: 'Handoff identity check failed: ' + d } });\nif (handoff.source_commit !== sourceCommit) return [bad('source_commit does not match pinned Alpha main')];\nif (handoff.candidate_path !== candidatePath) return [bad('candidate_path does not match selected candidate')];\nif (handoff.source_blob_sha !== file.sha) return [bad('source_blob_sha does not match pinned blob')];\nif (!isAbsPath(handoff.entrypoint_ref) || !isHex(handoff.entrypoint_sha256, 64)) return [bad('entrypoint ref or hash is invalid')];\nif (!isAbsPath(handoff.effective_config_ref) || !isHex(handoff.effective_config_sha256, 64)) return [bad('effective_config ref or hash is invalid')];\nif (!isHex(handoff.qlib_runtime_commit, 40)) return [bad('qlib_runtime_commit is invalid')];\nif (handoff.research_cost_model == null && handoff.run_inputs == null) return [bad('declared cost or run inputs are missing')];\nif (!handoff.evidence_refs || typeof handoff.evidence_refs !== 'object' || Array.isArray(handoff.evidence_refs) || Object.keys(handoff.evidence_refs).length === 0) return [bad('evidence refs are missing')];\n// D/E. Capability check passes only on verified primitives.\nconst VERIFIED = {\n  execution: ['qlib-native-backtest'],\n  data: ['btcusdt-1h'],\n  timing: ['bar-close-1h']\n};\nconst gap = [];\nconst bucketed = (handoff.capabilities && typeof handoff.capabilities === 'object' && !Array.isArray(handoff.capabilities)) ? handoff.capabilities : null;\nlet declaredCount = 0;\nif (bucketed) {\n  for (const k of Object.keys(VERIFIED)) {\n    const v = bucketed[k];\n    const vals = Array.isArray(v) ? v : (typeof v === 'string' ? [v] : []);\n    for (const x of vals) {\n      if (typeof x !== 'string') { gap.push(k + ':non-string'); continue; }\n      declaredCount += 1;\n      if (!VERIFIED[k].includes(x)) gap.push(k + ':' + x);\n    }\n  }\n  for (const k of Object.keys(bucketed)) {\n    if (!(k in VERIFIED)) {\n      const v = bucketed[k];\n      const vals = Array.isArray(v) ? v : [v];\n      for (const x of vals) { declaredCount += 1; gap.push(k + ':' + String(x)); }\n    }\n  }\n}\nif (Array.isArray(handoff.capability_declaration)) {\n  for (const c of handoff.capability_declaration) {\n    if (typeof c !== 'string' || c.indexOf(':') < 0) { gap.push('malformed:' + String(c)); continue; }\n    const i = c.indexOf(':');\n    const bucket = c.slice(0, i);\n    const val = c.slice(i + 1);\n    declaredCount += 1;\n    if (!(bucket in VERIFIED) || !VERIFIED[bucket].includes(val)) gap.push(c);\n  }\n}\nif (declaredCount === 0) return [bad('capability declaration is missing')];\nif (gap.length > 0)\n  return [{ json: { ...base, schema, hb_ready_status: hb, implementation_status: impl, route: 'ENGINEERING_HOLD', reason: 'New unverified capability: ' + gap.join(', '), capability_gap: gap, executable_handoff: handoff } }];\nconst transport_payload_b64 = Buffer.from(JSON.stringify(handoff), 'utf8').toString('base64');\nreturn [{ json: { ...base, schema, hb_ready_status: hb, implementation_status: impl, route: 'READY', reason: 'HB_READY admission with verified executable handoff and verified capabilities', market_data_ready: true, executable_handoff: handoff, capability_gap: [], transport_payload_b64 } }];\n"
+      }
+    },
+    {
+      "id": "ready-only",
+      "name": "03b · READY gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1390,
+        260
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const x = $input.first().json;\nreturn x.route === 'READY' ? [{ json: x }] : [];\n"
+      }
+    },
+    {
+      "id": "node04-ssh",
+      "name": "04 · Submit representative Qlib",
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        1620,
+        260
+      ],
+      "parameters": {
+        "authentication": "privateKey",
+        "resource": "command",
+        "operation": "execute",
+        "command": "={{ 'research-submit ' + $('03 · Engineering readiness').first().json.transport_payload_b64 }}",
+        "cwd": "/"
+      },
+      "credentials": {
+        "sshPrivateKey": {
+          "id": "v87SSHca9d1549MAC",
+          "name": "v8.7 n8n-Mac restricted auth (t_ca9d1549)"
+        }
+      }
+    },
+    {
+      "id": "node04-receipt",
+      "name": "04 · Verify submit receipt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1850,
+        260
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const ssh = $input.first().json;\nconst upstream = $('03 · Engineering readiness').first().json;\nif (upstream.route !== 'READY') throw new Error('Node04 HOLD: upstream is not READY');\nconst h = upstream.executable_handoff;\nif (!h || typeof h !== 'object' || Array.isArray(h)) throw new Error('Node04 HOLD: validated executable handoff is missing');\nif (ssh.code !== 0) throw new Error('Node04 SSH command failed');\nlet receipt;\ntry { receipt = JSON.parse(String(ssh.stdout || '').trim()); } catch { throw new Error('Node04 receipt is not JSON'); }\nif (!receipt || typeof receipt !== 'object' || Array.isArray(receipt) || receipt.node04 !== 'PASS') throw new Error('Node04 receipt is not PASS');\nif (receipt.candidate_blob_sha !== upstream.source_blob_sha) throw new Error('Node04 candidate identity mismatch');\nif (receipt.candidate_blob_sha !== h.source_blob_sha) throw new Error('Node04 handoff identity mismatch');\nif (receipt.entrypoint_sha256 !== h.entrypoint_sha256) throw new Error('Node04 entrypoint binding mismatch');\nif (receipt.effective_config_sha256 !== h.effective_config_sha256) throw new Error('Node04 effective_config binding mismatch');\nif (!/^[a-f0-9]{32}$/.test(String(receipt.run_id || ''))) throw new Error('Node04 run_id is missing or invalid');\nreturn [{ json: { ...upstream, qlib_run_id: receipt.run_id, run_state: 'FINISHED', node04_receipt: receipt } }];\n"
+      }
+    },
+    {
+      "id": "node05-ssh",
+      "name": "05 · Read representative artifacts",
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        2080,
+        260
+      ],
+      "parameters": {
+        "authentication": "privateKey",
+        "resource": "command",
+        "operation": "execute",
+        "command": "={{ 'research-readback ' + $('04 · Verify submit receipt').first().json.qlib_run_id }}",
+        "cwd": "/"
+      },
+      "credentials": {
+        "sshPrivateKey": {
+          "id": "v87SSHca9d1549MAC",
+          "name": "v8.7 n8n-Mac restricted auth (t_ca9d1549)"
+        }
+      }
+    },
+    {
+      "id": "node05-receipt",
+      "name": "05 · Verify artifact completeness",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2310,
+        260
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const ssh = $input.first().json;\nconst upstream = $('04 · Verify submit receipt').first().json;\nconst h = upstream.executable_handoff;\nif (!h || typeof h !== 'object' || Array.isArray(h)) throw new Error('Node05 HOLD: validated executable handoff is missing');\nif (ssh.code !== 0) throw new Error('Node05 HOLD: SSH command failed');\nlet receipt;\ntry { receipt = JSON.parse(String(ssh.stdout || '').trim()); } catch { throw new Error('Node05 HOLD: receipt is not JSON'); }\nif (!receipt || typeof receipt !== 'object' || Array.isArray(receipt) || receipt.node05 !== 'PASS') throw new Error('Node05 HOLD: receipt is not PASS');\nif (!/^[a-f0-9]{32}$/.test(String(receipt.run_id || '')) || receipt.run_id !== upstream.qlib_run_id) throw new Error('Node05 HOLD: run identity mismatch');\nif (receipt.candidate_path !== upstream.candidate_path || receipt.candidate_blob_sha !== upstream.source_blob_sha) throw new Error('Node05 HOLD: candidate identity mismatch');\nif (receipt.status !== 'FINISHED' || upstream.run_state !== 'FINISHED') throw new Error('Node05 HOLD: run is not FINISHED');\nfor (const key of ['params_count', 'metrics_count', 'artifacts_count'])\n  if (!Number.isSafeInteger(receipt[key]) || receipt[key] <= 0) throw new Error('Node05 HOLD: missing or empty ' + key);\n// ponytail: bind the readback to the Node04 receipt. No fixed paths live here.\nconst submitted = upstream.node04_receipt || {};\nif (typeof receipt.out_dir !== 'string' || receipt.out_dir !== submitted.out_dir) throw new Error('Node05 HOLD: run location does not match submit receipt');\nif (typeof receipt.experiment_id !== 'string' || !/^[0-9]+$/.test(receipt.experiment_id)) throw new Error('Node05 HOLD: experiment reference is invalid');\nif (typeof submitted.experiment_id !== 'string' || receipt.experiment_id !== submitted.experiment_id) throw new Error('Node05 HOLD: experiment identity mismatch');\nconst runRef = receipt.out_dir + '/mlruns/' + receipt.experiment_id + '/' + receipt.run_id;\nif (!receipt.refs || receipt.refs.mlflow_run !== runRef) throw new Error('Node05 HOLD: run reference mismatch');\nif (receipt.refs.candidate !== 'https://api.github.com/repos/HCH725/alpha-strategy-research/git/blobs/' + upstream.source_blob_sha) throw new Error('Node05 HOLD: candidate reference mismatch');\nif (h.evidence_refs && typeof h.evidence_refs === 'object' && !Array.isArray(h.evidence_refs)) {\n  for (const [key, ref] of Object.entries(h.evidence_refs)) {\n    if (key === 'candidate') continue;\n    if (!receipt.refs || receipt.refs[key] !== ref) throw new Error('Node05 HOLD: evidence reference mismatch ' + key);\n  }\n}\nfor (const key of ['candidate', 'data', 'execution', 'runtime', 'evidence'])\n  if (!receipt.readable || receipt.readable[key] !== true) throw new Error('Node05 HOLD: unreadable ' + key + ' evidence');\nif (receipt.manifest_verified !== true || receipt.manifest_readback_run_id !== upstream.qlib_run_id ||\n  typeof receipt.manifest_sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(receipt.manifest_sha256)) throw new Error('Node05 HOLD: manifest or run identity mismatch');\n// Derive claimability from run facts. A single proof stays false through coverage_complete=false.\nconst coverageComplete = receipt.coverage_complete === true;\nconst evidenceComplete = receipt.manifest_verified === true;\nconst costDeclared = h.research_cost_model != null || h.run_inputs != null;\nconst derived = coverageComplete && evidenceComplete && costDeclared;\nif (receipt.performance_claimable !== derived) throw new Error('Node05 HOLD: performance_claimable is not derived');\nreturn [{ json: { ...upstream, performance_claimable: derived, node05_receipt: receipt } }];\n"
+      }
+    },
+    {
+      "id": "is-ready-gate",
+      "name": "06 · IS_READY campaign gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2540,
+        260
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Node05 -> Node06 gate. It accepts the campaign-level IS_READY contract only.\n// A representative single-cell receipt stays false (coverage_complete=false,\n// performance_claimable=false) and holds here. No LLM and no MoA run here.\nconst x = $input.first().json;\nconst s = x.node05_receipt || {};\nconst h = x.executable_handoff || {};\nconst hold = (reason) => [{ json: {\n  payload_kind: 'is_ready_hold', stage: '05b', route: 'HOLD', reason: reason,\n  run_key: x.qlib_run_id || null, candidate_path: x.candidate_path || null\n} }];\n// An OOS round re-enters the same 04/05 path. It is handled by the OOS lane,\n// never by this IS lane.\nif ($('10 · OOS re-entry (04/05 contract)').isExecuted) { return []; }\nif (x.run_state !== 'FINISHED') { return hold('run_not_finished'); }\nif (x.performance_claimable !== true) { return hold('performance_not_claimable'); }\nif (s.coverage_complete !== true) { return hold('coverage_incomplete'); }\nif (s.manifest_verified !== true || !/^[a-f0-9]{64}$/.test(String(s.manifest_sha256 || ''))) { return hold('evidence_incomplete'); }\nconst runId = String(x.qlib_run_id || '');\nif (!/^[a-f0-9]{32}$/.test(runId) || s.run_id !== runId || s.manifest_readback_run_id !== runId) { return hold('identity_incomplete'); }\nif (!h || typeof h !== 'object' || Array.isArray(h)) { return hold('handoff_missing'); }\nif (h.source_blob_sha !== x.source_blob_sha || h.candidate_path !== x.candidate_path) { return hold('handoff_identity_mismatch'); }\nif (String(s.candidate_blob_sha) !== String(x.source_blob_sha)) { return hold('candidate_identity_mismatch'); }\nif (h.research_cost_model == null && h.run_inputs == null) { return hold('cost_not_declared'); }\nconst refs = (s.refs && typeof s.refs === 'object' && !Array.isArray(s.refs)) ? s.refs : {};\nif (typeof refs.mlflow_run !== 'string' || refs.mlflow_run.length === 0) { return hold('evidence_refs_missing'); }\n// The retest lane re-enters through 09 with its own round contract.\nconst reentry = $('09 · RETEST re-entry (04 contract)');\nlet round = null;\nif (reentry.isExecuted) {\n  round = (reentry.first().json || {}).round_contract || null;\n  if (!round || typeof round !== 'object' || Array.isArray(round)) { return hold('retest_round_contract_missing'); }\n}\nconst completed = round\n  ? (Array.isArray(round.completed_runs) ? round.completed_runs.slice() : null)\n  : [];\nif (round && completed === null) { return hold('retest_round_series_missing'); }\nconst roundIndex = round ? round.round_index : 0;\nif (round) {\n  if (!Number.isSafeInteger(roundIndex) || roundIndex !== completed.length || roundIndex > 3) { return hold('retest_round_index_invalid'); }\n  const head = completed.length > 0 ? completed[completed.length - 1] : null;\n  if (!head || head.run_key !== round.parent_run_key) { return hold('retest_parent_not_canonical_head'); }\n  // The round only exists if its own handoff was materialised.\n  if (!/^[a-f0-9]{64}$/.test(String(h.effective_config_sha256 || ''))) { return hold('retest_config_missing'); }\n  if (h.effective_config_sha256 === round.parent_effective_config_sha256) { return hold('retest_config_not_materialised'); }\n}\nconst rounds = completed.concat([{ round_index: roundIndex, run_key: runId, status: 'IS_SUCCESS' }]);\nconst isReady = {\n  payload_kind: 'is_ready',\n  run_key: runId,\n  run_id: runId,\n  round_index: roundIndex,\n  period_basis: 'IS',\n  metrics_summary: { params_count: s.params_count, metrics_count: s.metrics_count, artifacts_count: s.artifacts_count },\n  metrics_ref: refs.mlflow_run,\n  evidence_refs: (h.evidence_refs && typeof h.evidence_refs === 'object' && !Array.isArray(h.evidence_refs))\n    ? h.evidence_refs\n    : { run_manifest: String(refs.manifest || ''), metrics: refs.mlflow_run },\n  applied_change_set: round ? round.change_set : null,\n  prior_hypothesis_ref: round ? round.prior_hypothesis_ref : null,\n  // ponytail: the allowlist is the handoff's declared allowlist. An undeclared\n  // allowlist is empty, so Node08 forbids every override instead of guessing.\n  allowed_override_params: Array.isArray(h.allowed_override_params) ? h.allowed_override_params : [],\n  completed_runs: rounds,\n  wiki_state: [],\n  route: 'IS_READY'\n};\nreturn [{ json: isReady }];\n"
+      }
+    },
+    {
+      "id": "is-ready-lane",
+      "name": "06 · IS_READY lane gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2770,
+        260
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $input.all().filter((entry) => entry.json.route === 'IS_READY');\n"
+      }
+    },
+    {
+      "id": "is-ready-hold-endpoint",
+      "name": "06 · IS_READY HOLD endpoint",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        2770,
+        460
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "hermes-task",
+      "name": "06 · Hermes task payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3000,
+        260
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// The payload of the single Hermes invocation. Node06 is the only reasoning\n// point of this workflow. Nodes 07, 08 and 09 never reason again.\nconst x = $input.first().json;\nconst noteRef = 'quant/research-loop/' + x.run_key + '.md';\nconst state = {\n  run_key: x.run_key,\n  run_id: x.run_id,\n  round_index: x.round_index,\n  period_basis: x.period_basis,\n  metrics_summary: x.metrics_summary,\n  metrics_ref: x.metrics_ref,\n  evidence_refs: x.evidence_refs,\n  applied_change_set: x.applied_change_set,\n  prior_hypothesis_ref: x.prior_hypothesis_ref,\n  allowed_override_params: x.allowed_override_params,\n  completed_runs: x.completed_runs,\n  wiki_state: x.wiki_state\n};\nconst task = [\n  'You are the single research turn of the Quant WF-Research 01-12 workflow.',\n  'Do both jobs below in this one turn. Do not ask questions. Do not call another agent.',\n  '',\n  'JOB A (research, in-sample only):',\n  '- Use only the in-sample evidence of this run and the prior immutable Wiki note.',\n  '- When prior_hypothesis_ref is set, read that Wiki note first (Wiki Brain tools).',\n  '- Run your Mixture-of-Agents research over that evidence: several internal',\n  '  passes that disagree where the evidence is thin, then one resolved analysis.',\n  '- Produce ONE analysis object with EXACTLY these keys: analysis_ref,',\n  '  analysis_hash, expectation_vs_actual, lessons, period_basis,',\n  '  previous_hypothesis_ref, proposal, source_run_id, source_run_key,',\n  '  worth_retesting.',\n  '- period_basis must be \"IS\". source_run_key and source_run_id must equal the',\n  '  state below. Round 0 carries previous_hypothesis_ref=null; a later round must',\n  '  repeat state.prior_hypothesis_ref exactly.',\n  '- analysis_ref must be \"hermes-analysis://research-loop/<run_key>/round-<round_index>\".',\n  '- proposal.source_run_key must equal state.run_key.',\n  '- A retest proposal is {\"hypothesis_group\": \"<one group>\", \"params\": {...}}:',\n  '  exactly one parameter family, and every parameter name must appear in',\n  '  state.allowed_override_params. worth_retesting=true requires a non-empty',\n  '  change set; otherwise set proposal.change_set to null.',\n  '- expectation_vs_actual and lessons must be non-empty arrays.',\n  '- Never put out-of-sample, holdout or forward material in the analysis, and',\n  '  never copy raw orders, fills, positions or equity series into it.',\n  '- analysis_hash is the lowercase sha256 hex of the exact analysis JSON object',\n  '  you persist in JOB B.',\n  '',\n  'JOB B (persistence, no new reasoning):',\n  '- The note path is ' + noteRef + '.',\n  '- Read it first (read-before-write). Do not skip this read.',\n  '- Absent: write the analysis you just produced to that exact path.',\n  '  Reply wiki_ack {\"status\":\"ACK\",\"action\":\"CREATED\",...}.',\n  '- Present with the same analysis_hash: write nothing.',\n  '  Reply wiki_ack {\"status\":\"ACK\",\"action\":\"IDEMPOTENT\",...}.',\n  '- Present with a different analysis_hash: NEVER overwrite.',\n  '  Reply wiki_ack {\"status\":\"CONFLICT\",\"action\":\"REJECTED\",',\n  '  \"existing_analysis_hash\":\"<the one on disk>\"}.',\n  '- wiki_ack carries note_ref (= ' + noteRef + '), run_key and analysis_hash.',\n  '',\n  'STATE (single in-sample run):',\n  JSON.stringify(state, null, 2),\n  '',\n  'FINAL RESPONSE: reply with exactly one JSON object and nothing else:',\n  '{\"analysis\": {...}, \"wiki_ack\": {\"status\": \"...\", \"action\": \"...\",',\n  ' \"note_ref\": \"...\", \"run_key\": \"...\", \"analysis_hash\": \"...\"}}'\n].join('\\n');\nconst b64 = Buffer.from(task, 'utf8').toString('base64');\nif (b64.length > 65536 || !/^[A-Za-z0-9+/=]+$/.test(b64)) { throw new Error('Hermes task payload is invalid or too large'); }\n// Send data only. The restricted host key owns the fixed Hermes argv.\nreturn [{ json: Object.assign({}, state, {\n  payload_kind: 'hermes_task',\n  note_ref: noteRef,\n  hermes_task_b64: b64\n}) }];\n"
+      }
+    },
+    {
+      "id": "hermes-ssh",
+      "name": "06 · Hermes research (SSH)",
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        3230,
+        260
+      ],
+      "parameters": {
+        "authentication": "privateKey",
+        "resource": "command",
+        "operation": "execute",
+        "command": "={{ 'research-hermes ' + $json.hermes_task_b64 }}",
+        "cwd": "/"
+      },
+      "credentials": {
+        "sshPrivateKey": {
+          "id": "hermes-host-ssh",
+          "name": "Hermes Host SSH"
+        }
+      }
+    },
+    {
+      "id": "hermes-reader",
+      "name": "06 · Hermes reply reader",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3460,
+        260
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Reads the single Hermes turn. It does not reason: it only parses the result\n// event of the stream-json output and validates its shape.\nconst ssh = $input.first().json;\nconst taskRef = $('06 · Hermes task payload');\nconst task = taskRef.first() ? taskRef.first().json : {};\nconst stop = (reason) => [{ json: Object.assign({}, task, { route: 'NEEDS_REVIEW', reason: reason }) }];\nif (!taskRef.isExecuted || task.payload_kind !== 'hermes_task') { return stop('hermes_task_payload_missing'); }\nif (ssh.code !== 0) { return stop('hermes_exit_' + ssh.code); }\nlet result = null;\nfor (const line of String(ssh.stdout || '').split('\\n')) {\n  const text = line.trim();\n  if (!text || text.charAt(0) !== '{') { continue; }\n  let event = null;\n  try { event = JSON.parse(text); } catch (error) { continue; }\n  if (event && event.type === 'result' && typeof event.text === 'string') { result = event; }\n}\nif (result === null) { return stop('hermes_result_event_missing'); }\nif (Number(result.exit_code) !== 0) { return stop('hermes_exit_' + result.exit_code); }\nlet raw = String(result.text).trim();\nif (raw.slice(0, 3) === '```') { raw = raw.replace(/^```[a-zA-Z]*\\n/, '').replace(/\\n?```$/, '').trim(); }\nlet reply = null;\ntry { reply = JSON.parse(raw); } catch (error) { reply = null; }\nif (reply === null || typeof reply !== 'object' || Array.isArray(reply)) { return stop('hermes_reply_not_json'); }\nconst analysis = reply.analysis;\nif (analysis === null || typeof analysis !== 'object' || Array.isArray(analysis)) { return stop('hermes_format_error'); }\nconst out = Object.assign({}, task, { analysis: analysis, route: 'ANALYSIS_PENDING' });\nif (reply.wiki_ack && typeof reply.wiki_ack === 'object' && !Array.isArray(reply.wiki_ack)) { out.wiki_ack = reply.wiki_ack; }\nreturn [{ json: out }];\n"
+      }
+    },
+    {
+      "id": "analysis-gate",
+      "name": "06 · Analysis contract gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3690,
+        260
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Check the Node06 analysis contract. No LLM runs here.\nconst x = $input.first().json;\nif (x.route === 'NEEDS_REVIEW') {\n  return [{ json: x }];\n}\nconst a = x.analysis;\nconst stop = (reason) => [{ json: Object.assign({}, x, { route: 'NEEDS_REVIEW', reason: reason }) }];\nconst isText = (v) => typeof v === 'string' && v.length > 0;\nconst isHash = (v) => typeof v === 'string' && /^[a-f0-9]{64}$/.test(v);\nconst missing = [];\nif (!isText(a.analysis_ref)) { missing.push('analysis_ref'); }\nif (!isHash(a.analysis_hash)) { missing.push('analysis_hash'); }\nif (!isText(a.source_run_key)) { missing.push('source_run_key'); }\nif (!isText(a.source_run_id)) { missing.push('source_run_id'); }\nif (!Array.isArray(a.lessons) || a.lessons.length === 0) { missing.push('lessons'); }\nif (!Array.isArray(a.expectation_vs_actual) || a.expectation_vs_actual.length === 0) { missing.push('expectation_vs_actual'); }\nif (typeof a.worth_retesting !== 'boolean') { missing.push('worth_retesting'); }\nif (!a.proposal || typeof a.proposal !== 'object' || Array.isArray(a.proposal)) { missing.push('proposal'); }\nif (missing.length > 0) {\n  return stop('hermes_contract_incomplete:' + missing.join(','));\n}\nif (a.source_run_key !== x.run_key || a.source_run_id !== x.run_id) {\n  return stop('analysis_source_run_mismatch');\n}\nif (a.period_basis !== 'IS' || x.period_basis !== 'IS') {\n  return stop('period_basis_not_is');\n}\nif (x.round_index === 0) {\n  // The baseline has no previous hypothesis.\n  if (a.previous_hypothesis_ref !== null && a.previous_hypothesis_ref !== undefined) {\n    return stop('baseline_has_prior_hypothesis');\n  }\n} else {\n  if (!isText(a.previous_hypothesis_ref)) {\n    return stop('missing_prior_hypothesis');\n  }\n  if (a.previous_hypothesis_ref !== x.prior_hypothesis_ref) {\n    return stop('prior_hypothesis_ref_mismatch');\n  }\n}\nreturn [{ json: Object.assign({}, x, { route: 'ANALYSIS_OK' }) }];\n"
+      }
+    },
+    {
+      "id": "wiki-gate",
+      "name": "07 · Wiki persistence gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3920,
+        260
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Node07 is memory persistence only. The single Hermes turn did the\n// read-before-write; this node is the deterministic ACK gate. It never reasons\n// and it never rewrites the analysis.\nconst x = $input.first().json;\nif (x.route === 'NEEDS_REVIEW') { return [{ json: x }]; }\nconst a = x.analysis || {};\nconst ack = x.wiki_ack;\nconst stop = (reason) => [{ json: Object.assign({}, x, { route: 'NEEDS_REVIEW', reason: reason }) }];\nif (!ack || typeof ack !== 'object' || Array.isArray(ack)) { return stop('wiki_ack_missing'); }\nif (ack.status === 'CONFLICT') { return stop('wiki_ack_conflict_no_overwrite'); }\nif (ack.status !== 'ACK') { return stop('wiki_ack_' + String(ack.status)); }\nconst noteRef = 'quant/research-loop/' + x.run_key + '.md';\nif (ack.note_ref !== noteRef) { return stop('wiki_note_ref_not_canonical'); }\nif (ack.run_key !== x.run_key) { return stop('wiki_ack_run_key_mismatch'); }\nif (typeof ack.analysis_hash !== 'string' || !/^[a-f0-9]{64}$/.test(ack.analysis_hash)) { return stop('wiki_ack_hash_bad_shape'); }\nif (ack.analysis_hash !== a.analysis_hash) { return stop('wiki_ack_analysis_hash_mismatch'); }\nreturn [{ json: Object.assign({}, x, { route: 'WIKI_PERSISTED' }) }];\n"
+      }
+    },
+    {
+      "id": "node08",
+      "name": "08 · Deterministic validation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4150,
+        260
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Node08 is deterministic validation only. No LLM runs here.\n// No second opinion, no model review layer.\nconst x = $input.first().json;\nconst stop = (reason) => [{ json: Object.assign({}, x, { route: 'NEEDS_REVIEW', reason: reason }) }];\nif (x.route === 'NEEDS_REVIEW') {\n  return [{ json: x }];\n}\nconst a = x.analysis;\nconst ack = x.wiki_ack;\nif (!ack || typeof ack !== 'object') { return stop('wiki_ack_missing'); }\nif (ack.status !== 'ACK') { return stop('wiki_ack_' + ack.status); }\nif (ack.run_key !== x.run_key) { return stop('wiki_ack_run_key_mismatch'); }\nif (ack.analysis_hash !== a.analysis_hash) { return stop('analysis_hash_mismatch'); }\nif (typeof ack.note_ref !== 'string' || ack.note_ref.length === 0) { return stop('wiki_note_ref_missing'); }\nif (x.period_basis !== 'IS' || a.period_basis !== 'IS') { return stop('period_basis_not_is'); }\nif (!a.proposal || a.proposal.source_run_key !== x.run_key) { return stop('proposal_source_run_mismatch'); }\n\n// The IS-only allowlist is the primary OOS gate. A key outside the list is\n// unexpected material.\nconst allowedTop = [\n  'analysis_ref', 'analysis_hash', 'expectation_vs_actual', 'lessons',\n  'period_basis', 'previous_hypothesis_ref', 'proposal', 'source_run_id',\n  'source_run_key', 'worth_retesting'\n];\nconst topKeys = Object.keys(a);\nfor (const key of topKeys) {\n  if (allowedTop.indexOf(key) === -1) { return stop('unexpected_analysis_field:' + key); }\n}\n// A conservative regex is the second line of defence.\nif (/(^|[^a-z])(oos|holdout|out_of_sample|out-of-sample)([^a-z]|$)/i.test(JSON.stringify(a))) {\n  return stop('oos_material_in_analysis');\n}\n// The Wiki note holds lessons and references only. It must not copy raw orders.\nconst rawKeys = [];\nconst walk = (node) => {\n  if (Array.isArray(node)) {\n    node.forEach(walk);\n    return;\n  }\n  if (node && typeof node === 'object') {\n    Object.keys(node).forEach((key) => {\n      rawKeys.push(key);\n      walk(node[key]);\n    });\n  }\n};\nwalk(a);\nconst rawHit = rawKeys.filter((key) => /(trades|equity|orders|fills|positions)/i.test(key));\nif (rawHit.length > 0) { return stop('raw_result_material:' + rawHit.join(',')); }\n\n// One change set only. Each parameter must be allowed upstream.\nlet changeSet = null;\nif (a.worth_retesting === true) {\n  const candidate = a.proposal.change_set;\n  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {\n    return stop('change_set_must_be_one_group');\n  }\n  if (a.proposal.change_sets !== undefined) { return stop('multiple_change_sets'); }\n  if (candidate.hypothesis_groups !== undefined) { return stop('multiple_change_groups'); }\n  const params = candidate.params;\n  if (!params || typeof params !== 'object' || Array.isArray(params) || Object.keys(params).length === 0) {\n    return stop('empty_change_set');\n  }\n  const allowed = Array.isArray(x.allowed_override_params) ? x.allowed_override_params : [];\n  const names = Object.keys(params);\n  for (const name of names) {\n    if (allowed.indexOf(name) === -1) { return stop('override_param_not_allowed:' + name); }\n  }\n  const group = candidate.hypothesis_group;\n  if (typeof group !== 'string' || group.length === 0 || Array.isArray(group)) {\n    return stop('change_group_missing');\n  }\n  const families = names.map((name) => name.split('.')[0]).filter((f, i, arr) => arr.indexOf(f) === i);\n  // The group label is free text. The parameter family binds the change to one\n  // hypothesis group. Two families in one change set are two groups.\n  if (families.length !== 1) { return stop('params_span_multiple_groups:' + families.join(',')); }\n  changeSet = candidate;\n}\nreturn [{ json: Object.assign({}, x, { change_set: changeSet, route: 'VALID' }) }];\n"
+      }
+    },
+    {
+      "id": "node09",
+      "name": "09 · Decision",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4380,
+        260
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Node09 is deterministic routing only. It emits RETEST or FINALIZE.\n// No LLM runs here.\nconst x = $input.first().json;\nconst stop = (reason) => [{ json: Object.assign({}, x, { route: 'NEEDS_REVIEW', reason: reason }) }];\nif (x.route === 'NEEDS_REVIEW') {\n  return [{ json: x }];\n}\nif (x.route !== 'VALID') { return stop('upstream_route_not_valid:' + x.route); }\nconst rounds = Array.isArray(x.completed_runs) ? x.completed_runs : [];\nif (rounds.length === 0) { return stop('completed_runs_empty'); }\nif (rounds.length > 4) { return stop('completed_runs_above_cap'); }\nconst usedKeys = [];\nfor (let i = 0; i < rounds.length; i += 1) {\n  const row = rounds[i];\n  if (!row || row.round_index !== i) { return stop('round_series_not_contiguous'); }\n  if (row.status !== 'IS_SUCCESS') { return stop('round_not_successful_is'); }\n  if (typeof row.run_key !== 'string' || !/^[a-f0-9]{32}$/.test(row.run_key)) { return stop('run_key_bad_shape'); }\n  if (usedKeys.indexOf(row.run_key) !== -1) { return stop('duplicate_run_key'); }\n  usedKeys.push(row.run_key);\n}\nconst head = rounds[rounds.length - 1];\nif (head.run_key !== x.run_key) { return stop('current_run_not_canonical_head'); }\nif (head.round_index !== x.round_index) { return stop('current_round_mismatch'); }\n\nconst a = x.analysis;\nif (a.worth_retesting === true && rounds.length < 4) {\n  return [{\n    json: Object.assign({}, x, {\n      route: 'RETEST',\n      decision: {\n        next_round_index: x.round_index + 1,\n        next_parent_run_key: x.run_key,\n        next_prior_hypothesis_ref: x.wiki_ack.note_ref,\n        next_change_set: x.change_set,\n        next_analysis_hash: x.wiki_ack.analysis_hash\n      }\n    })\n  }];\n}\nconst finalizeReason = a.worth_retesting === true ? 'ROUND_CAP_REACHED' : 'WORTH_RETESTING_FALSE';\nreturn [{\n  json: Object.assign({}, x, {\n    route: 'FINALIZE',\n    decision: {\n      selected_run_key: x.run_key,\n      selected_run_id: x.run_id,\n      selected_round_index: x.round_index,\n      selected_analysis_ref: a.analysis_ref,\n      selected_analysis_hash: a.analysis_hash,\n      selected_wiki_note_ref: x.wiki_ack.note_ref,\n      period_basis: 'IS',\n      finalize_reason: finalizeReason\n    }\n  })\n}];\n"
+      }
+    },
+    {
+      "id": "retest-gate",
+      "name": "09 · RETEST gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4610,
+        60
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $input.first().json.route === 'RETEST' ? $input.all() : [];\n"
+      }
+    },
+    {
+      "id": "finalize-gate",
+      "name": "09 · FINALIZE gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4610,
+        260
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $input.first().json.route === 'FINALIZE' ? $input.all() : [];\n"
+      }
+    },
+    {
+      "id": "review-gate-09",
+      "name": "09 · NEEDS_REVIEW gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4610,
+        460
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $input.first().json.route === 'NEEDS_REVIEW' ? $input.all() : [];\n"
+      }
+    },
+    {
+      "id": "review-endpoint-09",
+      "name": "09 · NEEDS_REVIEW endpoint",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        5070,
+        460
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "retest-reentry",
+      "name": "09 · RETEST re-entry (04 contract)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4840,
+        60
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Node09 RETEST re-enters this same workflow's 04 input contract. It never calls\n// another workflow and it never re-runs a model.\n//\n// ponytail: the frozen 01-05 submission is the only payload node 04 can send.\n// A retest round needs its own materialised handoff, so this gate refuses to\n// submit stale bytes when the round was not materialised.\nconst x = $input.first().json;\nconst d = x.decision || {};\nconst stop = (reason) => [{ json: Object.assign({}, x, { route: 'NEEDS_REVIEW', reason: reason }) }];\nconst submission = $('03 · Engineering readiness').isExecuted ? $('03 · Engineering readiness').last().json : null;\nconst parent = $('05 · Verify artifact completeness').isExecuted ? $('05 · Verify artifact completeness').last().json : null;\nif (!submission || submission.route !== 'READY') { return stop('retest_submission_contract_missing'); }\nif (!parent || !parent.executable_handoff) { return stop('retest_parent_round_missing'); }\nif (!Number.isSafeInteger(d.next_round_index) || d.next_round_index !== x.round_index + 1 || d.next_round_index > 3) { return stop('retest_round_index_invalid'); }\nif (!d.next_change_set || typeof d.next_change_set !== 'object' || Array.isArray(d.next_change_set)) { return stop('retest_change_set_missing'); }\nif (typeof d.next_prior_hypothesis_ref !== 'string' || d.next_prior_hypothesis_ref.length === 0) { return stop('retest_prior_hypothesis_missing'); }\nif (d.next_parent_run_key !== x.run_key) { return stop('retest_parent_run_mismatch'); }\nconst next = submission.executable_handoff || {};\nconst previous = parent.executable_handoff || {};\nif (!/^[a-f0-9]{64}$/.test(String(next.effective_config_sha256 || ''))) { return stop('retest_config_missing'); }\nconst completed = Array.isArray(x.completed_runs) ? x.completed_runs.slice() : [];\nif (completed.length !== x.round_index + 1) { return stop('retest_round_series_missing'); }\nconst round = {\n  round_index: d.next_round_index,\n  parent_run_key: d.next_parent_run_key,\n  prior_hypothesis_ref: d.next_prior_hypothesis_ref,\n  change_set: d.next_change_set,\n  analysis_hash: d.next_analysis_hash,\n  parent_effective_config_sha256: previous.effective_config_sha256,\n  completed_runs: completed\n};\nif (next.effective_config_sha256 === previous.effective_config_sha256) {\n  return [{ json: {\n    payload_kind: 'retest_hold',\n    stage: '09',\n    route: 'NEEDS_REVIEW',\n    reason: 'retest_handoff_not_materialised',\n    round_contract: round,\n    blocked_by: {\n      code: 'retest_materialisation_required',\n      evidence: 'The frozen 01-05 submission still carries the parent round handoff (same effective_config_sha256). Node04 would re-submit the parent payload.',\n      operator_action: 'Materialise this round handoff (updated executable_handoff input with the retest change set applied) before the round is submitted.'\n    }\n  } }];\n}\n// The item that node 04 consumes. Node04 builds its command from the frozen 03\n// output, so the round contract travels with the item for the downstream gates.\nreturn [{ json: Object.assign({}, submission, { payload_kind: 'retest_round', round_contract: round, route: 'RETEST_ROUND' }) }];\n"
+      }
+    },
+    {
+      "id": "retest-lane",
+      "name": "09 · RETEST lane gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5070,
+        60
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $input.all().filter((entry) => entry.json.route === 'RETEST_ROUND');\n"
+      }
+    },
+    {
+      "id": "finalize-payload",
+      "name": "10 · FINALIZE payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4300,
+        160
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Projects the Node09 FINALIZE output into the Node10 input contract. No\n// business logic is added here: this is the live replacement for the fixture.\nconst x = $input.first().json;\nif (x.route !== 'FINALIZE') { return []; }\nconst f = {\n  run_key: x.run_key,\n  run_id: x.run_id,\n  round_index: x.round_index,\n  period_basis: 'IS',\n  metrics_summary: x.metrics_summary,\n  metrics_ref: x.metrics_ref,\n  evidence_refs: x.evidence_refs,\n  completed_runs: x.completed_runs,\n  analysis: x.analysis,\n  wiki_ack: x.wiki_ack,\n  change_set: x.change_set,\n  route: 'FINALIZE',\n  decision: x.decision\n};\nreturn [{ json: { payload_kind: 'node09_finalize', payload_from: '09 · Decision (live)', finalize: f } }];\n"
+      }
+    },
+    {
+      "id": "is-snapshot",
+      "name": "10 · frozen IS snapshot (05 readback)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4530,
+        160
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// The frozen IS snapshot, read back from this run's own verified state.\n//\n// ponytail: the 01-05 path exposes the run identity, the frozen config, the\n// strategy entrypoint, the runtime, the cost declaration and the evidence refs.\n// It does not expose the campaign-level freeze facts (frozen version sha, IS/OOS\n// windows, data snapshot hash, family/coverage refs). Those stay null and are\n// reported in missing_facts: the Node10 gate fails closed and names the first\n// one. No fact is invented here.\nconst fin = $input.first().json;\nif (fin.payload_kind !== 'node09_finalize') { return []; }\nconst state = $('05 · Verify artifact completeness').isExecuted ? $('05 · Verify artifact completeness').last().json : null;\nif (!state) { throw new Error('Node10 snapshot: the verified IS readback is missing'); }\nconst h = state.executable_handoff || {};\nconst receipt = state.node05_receipt || {};\nconst refs = (receipt.refs && typeof receipt.refs === 'object' && !Array.isArray(receipt.refs)) ? receipt.refs : {};\nconst cost = (h.research_cost_model && typeof h.research_cost_model === 'object') ? h.research_cost_model : null;\nconst runId = String(state.qlib_run_id || '');\nconst snapshot = {\n  readback_ref: String(refs.manifest || receipt.out_dir || ''),\n  run_key: runId,\n  run_id: runId,\n  source: {\n    family_id: null,\n    family_name: null,\n    source_strategy_id: null,\n    source_strategy_version: null,\n    source_repository_url: null,\n    source_strategy_path: state.candidate_path || null,\n    source_git_commit: state.source_commit || null,\n    change_note: null\n  },\n  strategy_sha: h.entrypoint_sha256 || null,\n  frozen_version_sha: null,\n  effective_config_hash: h.effective_config_sha256 || null,\n  config_snapshot: { uri: h.effective_config_ref || null, sha256: h.effective_config_sha256 || null },\n  data_snapshot: { uri: String(refs.data || ''), sha256: null, dataset_version: null },\n  is_window: null,\n  oos_plan: null,\n  cost_model: cost\n    ? { uri: cost.uri || null, sha256: cost.sha256 || null, fee_rate_bps: cost.fee_rate_bps, slippage_bps: cost.slippage_bps, funding_model: cost.funding_model || null }\n    : null,\n  runtime: { qlib_engine_version: h.qlib_runtime_commit || null, runtime_git_commit_or_image: null },\n  research_refs: { coverage_42cell: { planned_ref: null, tested_ref: null, excluded_ref: null }, wiki_refs: [] },\n  limitations: []\n};\nconst missing = Object.keys({\n  frozen_version_sha: snapshot.frozen_version_sha,\n  is_window: snapshot.is_window,\n  oos_plan: snapshot.oos_plan,\n  data_snapshot_sha256: snapshot.data_snapshot.sha256,\n  cost_model: snapshot.cost_model,\n  source_provenance: snapshot.source.source_strategy_id && snapshot.source.family_id,\n  coverage_42cell: snapshot.research_refs.coverage_42cell.tested_ref\n}).filter((key) => {\n  if (key === 'source_provenance') { return !snapshot.source.source_strategy_id || !snapshot.source.family_id; }\n  if (key === 'data_snapshot_sha256') { return !snapshot.data_snapshot.sha256; }\n  if (key === 'coverage_42cell') { return !snapshot.research_refs.coverage_42cell.tested_ref; }\n  return snapshot[key] === null || snapshot[key] === undefined;\n});\nreturn [{ json: {\n  payload_kind: 'frozen_is_snapshot',\n  snapshot: snapshot,\n  missing_facts: missing,\n  blocked_by: missing.length > 0 ? {\n    code: 'campaign_freeze_facts_missing',\n    evidence: 'The 01-05 readback does not carry the campaign-level freeze facts. Node10 fails closed instead of inventing them.',\n    operator_action: 'Supply the campaign freeze declaration for this selected run: ' + missing.join(', ')\n  } : null\n} }];\n"
+      }
+    },
+    {
+      "id": "freeze-oos",
+      "name": "10 · Freeze & OOS request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4760,
+        260
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Node10 freezes the IS-selected identity, config, data, window and cost\n// snapshots. It emits the single one-time OOS request. No LLM runs here. No OOS\n// result is read. The version decision uses the IS round series only.\nconst inItems = $input.all().map((entry) => entry.json);\nconst isText = (v) => typeof v === 'string' && v.length > 0;\nconst isHex = (v, n) => typeof v === 'string' && v.length === n && /^[a-f0-9]+$/.test(v);\nconst stop = (reason) => [{ json: { payload_kind: 'node10_review', stage: '10', route: 'NEEDS_REVIEW', reason: reason } }];\nconst finalizeItem = inItems.filter((row) => row && row.payload_kind === 'node09_finalize')[0];\nconst snapshotItem = inItems.filter((row) => row && row.payload_kind === 'frozen_is_snapshot')[0];\nif (!finalizeItem) { return stop('finalize_input_missing'); }\nif (!snapshotItem) { return stop('frozen_snapshot_input_missing'); }\nconst f = finalizeItem.finalize;\nconst s = snapshotItem.snapshot;\nif (!f || typeof f !== 'object') { return stop('finalize_payload_missing'); }\nif (!s || typeof s !== 'object') { return stop('snapshot_payload_missing'); }\nif (f.route !== 'FINALIZE') { return stop('finalize_route_not_finalize'); }\nconst d = f.decision || {};\nif (d.period_basis !== 'IS') { return stop('selection_basis_not_is'); }\nif (!isHex(d.selected_run_key, 32)) { return stop('selected_run_key_bad_shape'); }\nif (!isHex(d.selected_run_id, 32)) { return stop('selected_run_id_bad_shape'); }\nif (!isHex(d.selected_analysis_hash, 64)) { return stop('selected_analysis_hash_bad_shape'); }\nif (!isText(d.selected_analysis_ref) || !isText(d.selected_wiki_note_ref)) { return stop('selected_refs_missing'); }\nconst rounds = Array.isArray(f.completed_runs) ? f.completed_runs : [];\nif (rounds.length === 0) { return stop('completed_runs_empty'); }\nfor (let i = 0; i < rounds.length; i += 1) {\n  const row = rounds[i];\n  if (!row || row.round_index !== i) { return stop('round_series_not_contiguous'); }\n  if (row.status !== 'IS_SUCCESS') { return stop('round_series_not_is_success'); }\n  if (!isHex(row.run_key, 32)) { return stop('round_run_key_bad_shape'); }\n}\nconst head = rounds[rounds.length - 1];\nif (head.run_key !== d.selected_run_key) { return stop('selected_run_not_is_head'); }\nif (head.round_index !== d.selected_round_index) { return stop('selected_round_mismatch'); }\nif (f.analysis && f.analysis.analysis_hash !== d.selected_analysis_hash) { return stop('selected_analysis_hash_mismatch'); }\nif (f.wiki_ack && f.wiki_ack.note_ref !== d.selected_wiki_note_ref) { return stop('selected_wiki_note_mismatch'); }\n\n// The frozen snapshot must describe the same selected IS run.\nif (s.run_key !== d.selected_run_key || s.run_id !== d.selected_run_id) { return stop('snapshot_identity_mismatch'); }\nif (!isHex(s.strategy_sha, 64)) { return stop('strategy_sha_bad_shape'); }\nif (!isHex(s.frozen_version_sha, 64)) { return stop('frozen_version_sha_bad_shape'); }\nif (!isHex(s.effective_config_hash, 64)) { return stop('effective_config_hash_bad_shape'); }\nif (!s.config_snapshot || !isHex(s.config_snapshot.sha256, 64) || !isText(s.config_snapshot.uri)) { return stop('config_snapshot_incomplete'); }\nif (!s.data_snapshot || !isHex(s.data_snapshot.sha256, 64) || !isText(s.data_snapshot.uri)) { return stop('data_snapshot_incomplete'); }\nif (!s.cost_model || !isHex(s.cost_model.sha256, 64) || !isText(s.cost_model.uri)) { return stop('cost_model_incomplete'); }\nif (!s.runtime || !isText(s.runtime.qlib_engine_version)) { return stop('runtime_snapshot_incomplete'); }\nif (!s.source || !isText(s.source.source_strategy_id) || !/^[a-f0-9]{40}$/.test(String(s.source.source_git_commit || ''))) { return stop('source_provenance_incomplete'); }\nconst windowOk = (w) => w && isText(w.start_utc) && isText(w.end_utc) && isHex(w.window_hash, 64);\nif (!windowOk(s.is_window)) { return stop('is_window_snapshot_incomplete'); }\nif (!windowOk(s.oos_plan)) { return stop('oos_window_not_predefined'); }\nif (!isHex(s.oos_plan.oos_run_key, 32)) { return stop('oos_run_key_bad_shape'); }\nconst stamp = (v) => Date.parse(v);\nif (!(stamp(s.is_window.start_utc) < stamp(s.is_window.end_utc))) { return stop('is_window_bad_period'); }\nif (!(stamp(s.oos_plan.start_utc) > stamp(s.is_window.end_utc))) { return stop('oos_window_overlaps_is'); }\nif (s.oos_plan.window_hash === s.is_window.window_hash) { return stop('oos_window_hash_reused'); }\nif (s.oos_plan.oos_run_key === d.selected_run_key) { return stop('oos_run_key_not_unique'); }\nfor (const row of rounds) {\n  if (row.run_key === s.oos_plan.oos_run_key) { return stop('oos_run_key_not_unique'); }\n}\n// No OOS result may influence the selection.\nconst blob = JSON.stringify(f) + JSON.stringify(s);\nif (/\"(oos_metrics|oos_result|oos_equity|oos_trades|oos_returns|oos_fills)\"/.test(blob)) { return stop('oos_result_material_in_input'); }\n\nconst identity = {\n  best_is_run_key: d.selected_run_key,\n  best_is_run_id: d.selected_run_id,\n  round_index: d.selected_round_index,\n  analysis_ref: d.selected_analysis_ref,\n  analysis_hash: d.selected_analysis_hash,\n  wiki_note_ref: d.selected_wiki_note_ref,\n  finalize_reason: d.finalize_reason\n};\nconst freeze = {\n  frozen_version_sha: s.frozen_version_sha,\n  effective_config_hash: s.effective_config_hash,\n  strategy_sha: s.strategy_sha,\n  source: s.source,\n  config_snapshot: s.config_snapshot,\n  data_snapshot: s.data_snapshot,\n  is_window: s.is_window,\n  oos_plan: s.oos_plan,\n  cost_model: s.cost_model,\n  runtime: s.runtime,\n  research_refs: s.research_refs,\n  limitations: s.limitations\n};\nconst oos_request = {\n  best_is_run_key: d.selected_run_key,\n  frozen_version_sha: s.frozen_version_sha,\n  effective_config_hash: s.effective_config_hash,\n  period_basis: 'OOS',\n  window_hash: s.oos_plan.window_hash,\n  parent_is_run_key: d.selected_run_key,\n  oos_run_key: s.oos_plan.oos_run_key,\n  holdout_policy: 'ONE_TIME_NO_RETUNE'\n};\nreturn [{ json: {\n  payload_kind: 'oos_request',\n  stage: '10',\n  identity: identity,\n  freeze: freeze,\n  oos_request: oos_request,\n  route: 'OOS_REQUEST'\n} }];\n"
+      }
+    },
+    {
+      "id": "oos-request-gate",
+      "name": "10 · OOS_REQUEST gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4990,
+        260
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $input.all().filter((entry) => entry.json.route === 'OOS_REQUEST');\n"
+      }
+    },
+    {
+      "id": "review-gate-10",
+      "name": "10 · NEEDS_REVIEW gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4990,
+        560
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $input.all().filter((entry) => entry.json.route === 'NEEDS_REVIEW');\n"
+      }
+    },
+    {
+      "id": "review-endpoint-10",
+      "name": "10 · NEEDS_REVIEW endpoint",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        5220,
+        560
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "oos-reentry",
+      "name": "10 · OOS re-entry (04/05 contract)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5220,
+        260
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Node10 hands the one-time OOS request back into this same workflow's existing\n// 04/05 path. It never calls another workflow.\n//\n// ponytail: node 04 can only send the frozen 01-05 submission, so an OOS round\n// needs its own materialised handoff (OOS period marker + the frozen config).\n// A round that was not materialised is refused here instead of re-submitting\n// the in-sample payload.\nconst x = $input.first().json;\nif (x.route !== 'OOS_REQUEST') { return []; }\nconst r = x.oos_request || {};\nconst hold = (reason) => [{ json: Object.assign({}, x, { route: 'NEEDS_REVIEW', reason: reason, blocked_by: {\n  code: 'oos_materialisation_required',\n  evidence: 'The frozen 01-05 submission is the in-sample handoff. Node04 would re-submit it for the OOS window.',\n  operator_action: 'Materialise the OOS round handoff (frozen config + period_basis=OOS + the OOS window_hash) before the OOS submission.'\n} }) }];\nconst submission = $('03 · Engineering readiness').isExecuted ? $('03 · Engineering readiness').last().json : null;\nif (!submission || submission.route !== 'READY') { return hold('oos_submission_contract_missing'); }\nconst h = submission.executable_handoff || {};\nif (h.period_basis !== 'OOS' || h.window_hash !== r.window_hash) { return hold('oos_handoff_not_materialised'); }\nif (h.effective_config_sha256 !== r.effective_config_hash) { return hold('oos_config_not_frozen'); }\nreturn [{ json: Object.assign({}, submission, {\n  payload_kind: 'oos_request',\n  identity: x.identity,\n  freeze: x.freeze,\n  oos_request: r,\n  route: 'OOS_ROUND'\n}) }];\n"
+      }
+    },
+    {
+      "id": "oos-lane",
+      "name": "10 · OOS lane gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5450,
+        260
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $input.all().filter((entry) => entry.json.route === 'OOS_ROUND');\n"
+      }
+    },
+    {
+      "id": "oos-bridge",
+      "name": "10 · OOS_READY from 05 readback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5450,
+        460
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// The OOS lane re-entered the existing 04/05 path. This node turns the readback\n// of that round into the OOS_READY reply of the existing 05 contract. It never\n// invents an OOS fact: a missing one fails closed as a review item.\nconst x = $input.first().json;\nconst request = $('10 · OOS re-entry (04/05 contract)');\nif (!request.isExecuted) { return []; }\nconst req = request.first().json || {};\nif (req.route !== 'OOS_ROUND') { return []; }\nconst r = req.oos_request || {};\nconst freeze = req.freeze || {};\nconst receipt = x.node05_receipt || {};\nconst refs = (receipt.refs && typeof receipt.refs === 'object' && !Array.isArray(receipt.refs)) ? receipt.refs : {};\nconst stop = (reason) => [{ json: Object.assign({}, req, { route: 'NEEDS_REVIEW', reason: reason, blocked_by: {\n  code: 'oos_readback_incomplete',\n  evidence: 'The existing 05 readback does not carry this OOS fact.',\n  operator_action: 'Extend the existing readback for the OOS round; do not re-submit the in-sample payload.'\n} }) }];\nif (receipt.period_basis !== 'OOS') { return stop('oos_readback_not_oos'); }\nif (!Number.isSafeInteger(receipt.oos_attempt_index) || receipt.oos_attempt_index !== 1) { return stop('oos_attempt_index_missing'); }\nif (receipt.retune_performed !== false) { return stop('oos_retune_forbidden'); }\nconst metrics = receipt.metrics;\nif (!metrics || typeof metrics !== 'object' || Array.isArray(metrics)) { return stop('oos_metrics_not_in_readback'); }\nfor (const key of ['oos_manifest', 'metrics', 'portfolio_report', 'trades', 'equity']) {\n  if (typeof refs[key] !== 'string' || refs[key].length === 0) { return stop('oos_evidence_refs_unreadable:' + key); }\n}\nconst oosReady = {\n  oos_run_key: r.oos_run_key,\n  oos_run_id: String(receipt.run_id || ''),\n  period_basis: 'OOS',\n  window_hash: r.window_hash,\n  frozen_version_sha: r.frozen_version_sha,\n  effective_config_hash: r.effective_config_hash,\n  strategy_sha: (freeze || {}).strategy_sha,\n  data_snapshot_sha256: ((freeze || {}).data_snapshot || {}).sha256,\n  oos_attempt_index: 1,\n  retune_performed: false,\n  holdout_policy: r.holdout_policy,\n  manifest_complete: receipt.manifest_verified === true,\n  metrics: metrics,\n  evaluation_period: { start_utc: ((freeze || {}).oos_plan || {}).start_utc, end_utc: ((freeze || {}).oos_plan || {}).end_utc },\n  cost_model_applied: {\n    fee_rate_bps: ((freeze || {}).cost_model || {}).fee_rate_bps,\n    slippage_bps: ((freeze || {}).cost_model || {}).slippage_bps,\n    funding: 'modelled'\n  },\n  evidence_refs: {\n    oos_manifest: refs.oos_manifest,\n    metrics: refs.metrics,\n    portfolio_report: refs.portfolio_report,\n    trades: refs.trades,\n    equity: refs.equity\n  },\n  runtime: (freeze || {}).runtime || {}\n};\nreturn [{ json: Object.assign({}, req, { route: 'OOS_READY', oos_ready: oosReady }) }];\n"
+      }
+    },
+    {
+      "id": "oos-ready-gate",
+      "name": "10 · OOS_READY gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5680,
+        460
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Node10 re-entry gate. It validates the OOS_READY reply against the frozen\n// request before Node11 evaluates. An incomplete reply or one identity mismatch\n// is a review item. The workflow never sends this state back to Nodes 06-09.\nconst x = $input.first().json;\nconst isText = (v) => typeof v === 'string' && v.length > 0;\nconst isHex = (v, n) => typeof v === 'string' && v.length === n && /^[a-f0-9]+$/.test(v);\nconst stop = (reason) => [{ json: Object.assign({}, x, { route: 'NEEDS_REVIEW', reason: reason }) }];\nif (x.route === 'NEEDS_REVIEW') { return [{ json: x }]; }\nif (x.route !== 'OOS_READY') { return stop('oos_boundary_route_not_ready:' + x.route); }\nconst r = x.oos_request || {};\nconst o = x.oos_ready || {};\nconst freeze = x.freeze || {};\nconst missing = [];\nif (!isHex(o.oos_run_key, 32)) { missing.push('oos_run_key'); }\nif (!isHex(o.oos_run_id, 32)) { missing.push('oos_run_id'); }\nif (!isHex(o.window_hash, 64)) { missing.push('window_hash'); }\nif (!isHex(o.frozen_version_sha, 64)) { missing.push('frozen_version_sha'); }\nif (!isHex(o.effective_config_hash, 64)) { missing.push('effective_config_hash'); }\nif (!isHex(o.strategy_sha, 64)) { missing.push('strategy_sha'); }\nif (!isHex(o.data_snapshot_sha256, 64)) { missing.push('data_snapshot_sha256'); }\nif (!o.metrics || typeof o.metrics !== 'object') { missing.push('metrics'); }\nif (!o.evaluation_period || !isText(o.evaluation_period.start_utc) || !isText(o.evaluation_period.end_utc)) { missing.push('evaluation_period'); }\nif (!o.evidence_refs || typeof o.evidence_refs !== 'object') { missing.push('evidence_refs'); }\nif (!o.cost_model_applied || typeof o.cost_model_applied !== 'object') { missing.push('cost_model_applied'); }\nif (!o.runtime || typeof o.runtime !== 'object') { missing.push('runtime'); }\nif (missing.length > 0) { return stop('oos_ready_incomplete:' + missing.join(',')); }\nif (o.manifest_complete !== true) { return stop('oos_manifest_incomplete'); }\nif (o.period_basis !== 'OOS') { return stop('oos_period_basis_mismatch'); }\nif (o.oos_run_key !== r.oos_run_key) { return stop('oos_run_key_mismatch'); }\nif (o.window_hash !== r.window_hash) { return stop('oos_window_hash_mismatch'); }\nif (o.frozen_version_sha !== r.frozen_version_sha) { return stop('frozen_version_sha_mismatch'); }\nif (o.effective_config_hash !== r.effective_config_hash) { return stop('effective_config_hash_mismatch'); }\nif (o.strategy_sha !== freeze.strategy_sha) { return stop('strategy_sha_mismatch'); }\nif (o.data_snapshot_sha256 !== (freeze.data_snapshot || {}).sha256) { return stop('data_snapshot_mismatch'); }\nif (o.cost_model_applied.fee_rate_bps !== (freeze.cost_model || {}).fee_rate_bps) { return stop('cost_model_fee_mismatch'); }\nif (o.cost_model_applied.slippage_bps !== (freeze.cost_model || {}).slippage_bps) { return stop('cost_model_slippage_mismatch'); }\nif (o.oos_attempt_index !== 1) { return stop('oos_not_one_time_attempt_1'); }\nif (o.retune_performed !== false) { return stop('oos_retune_forbidden'); }\nif (o.holdout_policy !== 'ONE_TIME_NO_RETUNE') { return stop('oos_holdout_policy_mismatch'); }\nreturn [{ json: Object.assign({}, x, { route: 'OOS_READY_OK' }) }];\n"
+      }
+    },
+    {
+      "id": "oos-ready-lane",
+      "name": "10 · OOS_READY lane gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5910,
+        460
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $input.all().filter((entry) => entry.json.route === 'OOS_READY_OK');\n"
+      }
+    },
+    {
+      "id": "policy-read",
+      "name": "11 · Promotion policy (native read)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5910,
+        660
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// The authoritative promotion policy read. The policy and the promotion\n// identity are read from the HCH725/research-survivor README (the repository is\n// the authority), never guessed in code. The machine-readable block is the\n// declared interface of that file; a missing block is a HOLD, not a default.\nconst file = $input.first().json;\nconst stop = (reason) => [{ json: {\n  payload_kind: 'promotion_policy',\n  route: 'POLICY_UNREADABLE',\n  reason: reason,\n  policy: null\n} }];\nif (!file || file.type !== 'file' || typeof file.content !== 'string') { return stop('promotion_policy_not_readable'); }\nlet text = '';\ntry { text = Buffer.from(file.content.replace(/\\s/g, ''), 'base64').toString('utf8'); } catch (error) { return stop('promotion_policy_not_decodable'); }\nconst match = text.match(/```json promotion-policy\\s*\\n([\\s\\S]*?)\\n```/);\nif (!match) { return stop('promotion_policy_block_missing'); }\nlet block = null;\ntry { block = JSON.parse(match[1]); } catch (error) { return stop('promotion_policy_block_not_json'); }\nif (!block || typeof block !== 'object' || Array.isArray(block)) { return stop('promotion_policy_block_not_object'); }\nconst sha = String(file.sha || '');\nif (!/^[a-f0-9]{40}$/.test(sha)) { return stop('promotion_policy_identity_missing'); }\nconst policy = {\n  source_ref: 'https://github.com/HCH725/research-survivor/blob/' + sha + '/README.md',\n  policy_version: block.policy_version,\n  approved: block.approved,\n  thresholds: block.thresholds,\n  evaluation_period_defined: block.evaluation_period_defined,\n  cost_basis_defined: block.cost_basis_defined,\n  evaluation_unit: block.evaluation_unit,\n  draft_8pct_used: block.draft_8pct_used\n};\nconst promotion = block.promotion || {};\nreturn [{ json: { payload_kind: 'promotion_policy', policy: policy, promotion: promotion, route: 'POLICY_INPUT' } }];\n"
+      }
+    },
+    {
+      "id": "policy-github",
+      "name": "11 · Read survivor policy (GitHub)",
+      "type": "n8n-nodes-base.github",
+      "typeVersion": 1.1,
+      "position": [
+        5680,
+        660
+      ],
+      "parameters": {
+        "resource": "file",
+        "operation": "get",
+        "owner": {
+          "mode": "name",
+          "value": "HCH725"
+        },
+        "repository": {
+          "mode": "name",
+          "value": "research-survivor"
+        },
+        "filePath": "README.md"
+      },
+      "credentials": {
+        "githubApi": {
+          "id": "research-survivor-github",
+          "name": "GitHub (research-survivor)"
+        }
+      }
+    },
+    {
+      "id": "eval-11",
+      "name": "11 · Research Survivor evaluation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6140,
+        560
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Node11 is deterministic evaluation only. No LLM and no MoA run here. The\n// promotion policy is injected from the authoritative input. It is never\n// guessed in code. A performance shortfall is REJECT. A missing policy, cost,\n// period or reproducibility evidence is HOLD.\nconst inItems = $input.all().map((entry) => entry.json);\nconst isText = (v) => typeof v === 'string' && v.length > 0;\nconst state = inItems.filter((row) => row && row.payload_kind === 'oos_request')[0];\nconst policyItem = inItems.filter((row) => row && row.payload_kind === 'promotion_policy')[0];\nconst stop = (route, reason) => [{ json: Object.assign({}, state || {}, { route: route, reason: reason }) }];\n// No OOS state means the upstream gate already signalled a review item.\nif (!state) { return []; }\nif (!policyItem || !policyItem.policy) { return stop('HOLD', 'promotion_policy_input_missing'); }\nconst p = policyItem.policy;\nconst promotion = policyItem.promotion || {};\nif (p.approved !== true) { return stop('HOLD', 'promotion_policy_not_approved'); }\nif (!/^https:\\/\\/github\\.com\\/HCH725\\/research-survivor\\/blob\\/[a-f0-9]{40}\\/README\\.md$/.test(String(p.source_ref || ''))) { return stop('HOLD', 'promotion_policy_source_unreadable'); }\nif (p.draft_8pct_used === true) { return stop('HOLD', 'draft_8pct_policy_forbidden'); }\nif (!p.thresholds || p.thresholds.cagr_min_pct !== 10 || p.thresholds.sharpe_min !== 1.0) { return stop('HOLD', 'promotion_thresholds_not_authoritative'); }\nif (p.evaluation_period_defined !== true || p.cost_basis_defined !== true) { return stop('HOLD', 'evaluation_basis_undefined'); }\nif (!isText(p.evaluation_unit)) { return stop('HOLD', 'evaluation_unit_undefined'); }\nif (!isText(promotion.survivor_id) || !/^[a-z0-9][a-z0-9-]*$/.test(promotion.survivor_id)) { return stop('HOLD', 'promotion_identity_missing'); }\nif (!isText(promotion.survivor_version)) { return stop('HOLD', 'promotion_version_missing'); }\nconst o = state.oos_ready || {};\nconst m = o.metrics || {};\nconst refs = o.evidence_refs || {};\nconst unreadable = ['oos_manifest', 'metrics', 'portfolio_report', 'trades', 'equity'].filter((key) => !isText(refs[key]));\nif (unreadable.length > 0) { return stop('HOLD', 'oos_evidence_refs_unreadable:' + unreadable.join(',')); }\nif (typeof m.cagr_pct !== 'number' || typeof m.sharpe !== 'number') { return stop('HOLD', 'oos_metrics_not_numeric'); }\nif (!(m.trades > 0)) { return stop('HOLD', 'oos_trades_missing'); }\nconst evaluation = {\n  cagr_pct: m.cagr_pct,\n  sharpe: m.sharpe,\n  cagr_min_pct: p.thresholds.cagr_min_pct,\n  sharpe_min: p.thresholds.sharpe_min,\n  evaluation_unit: p.evaluation_unit,\n  evaluation_period: o.evaluation_period\n};\nconst carry = Object.assign({}, state, {\n  promotion: { survivor_id: promotion.survivor_id, survivor_version: promotion.survivor_version },\n  policy: p,\n  evaluation: evaluation\n});\nif (m.cagr_pct >= p.thresholds.cagr_min_pct && m.sharpe >= p.thresholds.sharpe_min) {\n  return [{ json: Object.assign({}, carry, { route: 'PERF_PASS' }) }];\n}\nreturn [{ json: Object.assign({}, carry, { route: 'REJECT', reason: 'performance_below_policy' }) }];\n"
+      }
+    },
+    {
+      "id": "hold-gate",
+      "name": "11 · HOLD gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6370,
+        260
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $input.all().filter((entry) => entry.json.route === 'HOLD');\n"
+      }
+    },
+    {
+      "id": "hold-endpoint",
+      "name": "11 · HOLD endpoint",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        6600,
+        260
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "reject-gate",
+      "name": "11 · REJECT gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6370,
+        460
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $input.all().filter((entry) => entry.json.route === 'REJECT');\n"
+      }
+    },
+    {
+      "id": "reject-endpoint",
+      "name": "11 · REJECT endpoint",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        6600,
+        460
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "perf-lane",
+      "name": "11 · PERF_PASS lane gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6370,
+        560
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $input.all().filter((entry) => entry.json.route === 'PERF_PASS');\n"
+      }
+    },
+    {
+      "id": "pass-assembly",
+      "name": "11 · Replay & PASS assembly",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6600,
+        660
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// The PASS gate. Replay evidence must confirm the same frozen identity, the\n// same OOS window and the same config. This workflow does not build a Qlib\n// runner; the replay readback is a boundary. The PASS output is the complete\n// survivor-record payload contract for Node12. Large artifacts stay as URI and\n// hash references.\nconst inItems = $input.all().map((entry) => entry.json);\nconst isText = (v) => typeof v === 'string' && v.length > 0;\nconst state = inItems.filter((row) => row && row.payload_kind === 'oos_request')[0];\nconst replayItem = inItems.filter((row) => row && row.payload_kind === 'qlib_replay')[0];\nconst stop = (reason) => [{ json: Object.assign({}, state || {}, { route: 'HOLD', reason: reason }) }];\n// No PERF_PASS state means the performance gate already routed HOLD or REJECT.\nif (!state || state.route !== 'PERF_PASS') { return []; }\nif (!replayItem || !replayItem.replay) { return stop('qlib_replay_evidence_missing'); }\nconst r = replayItem.replay;\nconst f = state.freeze;\nif (r.status !== 'QLIB_REPLAY_PASS') { return stop('qlib_replay_not_pass'); }\nif (!isText(r.evidence_uri)) { return stop('qlib_replay_evidence_uri_missing'); }\nif (r.run_key !== state.identity.best_is_run_key) { return stop('qlib_replay_run_mismatch'); }\nif (r.oos_run_key !== state.oos_request.oos_run_key) { return stop('qlib_replay_oos_mismatch'); }\nif (r.frozen_version_sha !== f.frozen_version_sha) { return stop('qlib_replay_frozen_version_mismatch'); }\nif (r.effective_config_hash !== f.effective_config_hash) { return stop('qlib_replay_config_mismatch'); }\nif (r.strategy_sha !== f.strategy_sha) { return stop('qlib_replay_strategy_mismatch'); }\nif (r.window_hash !== state.oos_request.window_hash) { return stop('qlib_replay_window_mismatch'); }\nconst o = state.oos_ready;\nconst contract = {\n  schema: 'research-survivor-record-v1',\n  survivor_id: state.promotion.survivor_id,\n  survivor_version: state.promotion.survivor_version,\n  family_id: f.source.family_id,\n  family_name: f.source.family_name,\n  source_strategy_id: f.source.source_strategy_id,\n  source_strategy_version: f.source.source_strategy_version,\n  source_repository_url: f.source.source_repository_url,\n  source_strategy_path: f.source.source_strategy_path,\n  source_git_commit: f.source.source_git_commit,\n  change_note: f.source.change_note,\n  strategy_sha: f.strategy_sha,\n  frozen_version_sha: f.frozen_version_sha,\n  effective_config_hash: f.effective_config_hash,\n  config_snapshot: f.config_snapshot,\n  data_snapshot: f.data_snapshot,\n  is_window: f.is_window,\n  oos_window: { start_utc: f.oos_plan.start_utc, end_utc: f.oos_plan.end_utc, window_hash: f.oos_plan.window_hash },\n  is_run_key: state.identity.best_is_run_key,\n  is_run_id: state.identity.best_is_run_id,\n  is_note_ref: state.identity.wiki_note_ref,\n  oos_run_key: state.oos_request.oos_run_key,\n  oos_run_id: o.oos_run_id,\n  runtime: f.runtime,\n  cost_model: f.cost_model,\n  metrics: o.metrics,\n  evaluation_period: o.evaluation_period,\n  evidence_refs: o.evidence_refs,\n  coverage_42cell: f.research_refs.coverage_42cell,\n  wiki_refs: f.research_refs.wiki_refs,\n  qlib_replay: { status: r.status, evidence_uri: r.evidence_uri, replayed_at_utc: r.replayed_at_utc },\n  promotion: { policy_version: state.policy.policy_version, policy_source_ref: state.policy.source_ref, decided_basis: 'OOS', decision: 'PASS' },\n  limitations: f.limitations,\n  hummingbot_validation_status: 'PENDING',\n  hb_certified: false,\n  status: 'research-only',\n  adoption: 'not-approved',\n  approval_scope: 'research-only'\n};\nreturn [{ json: Object.assign({}, state, { route: 'PASS', replay: r, survivor_record_contract: contract }) }];\n"
+      }
+    },
+    {
+      "id": "replay-boundary",
+      "name": "11 · Qlib replay readback (external boundary)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6600,
+        860
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// The Qlib replay readback is an external capability. This workflow does not\n// build a Qlib runner, and the existing restricted channel exposes submit and\n// readback only. The boundary states the dependency; it never fabricates PASS\n// evidence. Node11 holds until a real replay readback is supplied.\nreturn [{ json: {\n  payload_kind: 'qlib_replay',\n  replay: null,\n  route: 'QLIB_REPLAY_UNAVAILABLE',\n  blocked_by: {\n    code: 'qlib_replay_readback_not_available',\n    evidence: 'No native Qlib replay readback is exposed to this n8n instance. The workflow never fabricates replay evidence.',\n    operator_action: 'Supply the replay readback of the frozen version through the existing Qlib channel; Node11 holds until then.'\n  }\n} }];\n"
+      }
+    },
+    {
+      "id": "pass-lane",
+      "name": "11 · PASS lane gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6830,
+        660
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $input.all().filter((entry) => entry.json.route === 'PASS');\n"
+      }
+    },
+    {
+      "id": "record-payload",
+      "name": "12 · Survivor record payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        7060,
+        660
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Node12 builds the record file from the Node11 PASS contract. The record schema\n// is the existing research-survivor-record-v1. No second schema exists. The HB\n// fields stay PENDING. Node12 never fabricates Node13 evidence.\nconst x = $input.first().json;\nconst stop = (reason) => [{ json: Object.assign({}, x, { route: 'NEEDS_REVIEW', reason: reason }) }];\nif (x.route !== 'PASS') { return stop('upstream_route_not_pass:' + x.route); }\nconst c = x.survivor_record_contract;\nif (!c || typeof c !== 'object') { return stop('record_contract_missing'); }\nif (c.schema !== 'research-survivor-record-v1') { return stop('record_schema_unknown'); }\nconst missing = [];\nconst required = ['survivor_id', 'survivor_version', 'family_id', 'source_strategy_id', 'source_repository_url',\n  'source_strategy_path', 'source_git_commit', 'strategy_sha', 'frozen_version_sha', 'effective_config_hash',\n  'is_run_id', 'oos_run_id', 'is_run_key', 'oos_run_key', 'config_snapshot', 'data_snapshot', 'is_window',\n  'oos_window', 'runtime', 'cost_model', 'metrics', 'evaluation_period', 'evidence_refs', 'coverage_42cell',\n  'wiki_refs', 'qlib_replay', 'promotion', 'limitations'];\nfor (const key of required) {\n  if (c[key] === undefined || c[key] === null) { missing.push(key); }\n}\nif (missing.length > 0) { return stop('record_payload_incomplete:' + missing.join(',')); }\nif (c.hummingbot_validation_status !== 'PENDING' || c.hb_certified !== false) { return stop('hb_status_must_stay_pending'); }\nconst blob = JSON.stringify(c);\nconst banned = ['hb_certified_at_utc', 'parity_diff_uri', 'parity_verification_status', 'hummingbot_task_id',\n  'hb_certification_git_commit', 'portfolio_evidence_uri', 'hummingbot_archive_uri'];\nfor (const key of banned) {\n  if (blob.indexOf('\"' + key + '\"') !== -1) { return stop('fabricated_hb_evidence:' + key); }\n}\nif (/CERTIFIED/.test(blob)) { return stop('fabricated_hb_evidence:CERTIFIED'); }\nconst id = c.survivor_id;\nconst version = c.survivor_version;\nif (!/^[a-z0-9][a-z0-9-]*$/.test(String(id))) { return stop('survivor_id_shape'); }\nif (!/^[a-z0-9][a-z0-9-]*$/.test(String(version))) { return stop('survivor_version_shape'); }\nconst path = id + '-' + version + '.md';\nconst frontmatter = {\n  schema: 'research-survivor-record-v1',\n  survivor_id: id,\n  survivor_version: version,\n  family_id: c.family_id,\n  source_strategy_id: c.source_strategy_id,\n  source_repository_url: c.source_repository_url,\n  source_strategy_path: c.source_strategy_path,\n  source_git_commit: c.source_git_commit,\n  strategy_sha: c.strategy_sha,\n  qlib_survivor_status: 'PASS',\n  hummingbot_validation_status: 'PENDING',\n  hb_certified: false,\n  status: 'research-only',\n  adoption: 'not-approved',\n  approval_scope: 'research-only'\n};\nconst body_sections = [\n  'Provenance',\n  'Frozen Strategy & Execution',\n  'Dataset / IS / OOS',\n  'Qlib Metrics & Artifacts',\n  '42-Cell Coverage',\n  'Hummingbot Validation & Parity',\n  'Audit & GitHub History',\n  'Wiki References',\n  'Limitations & Authorization'\n];\nconst pr_plan = {\n  repo: 'HCH725/research-survivor',\n  base_branch: 'main',\n  head_branch: 'promote/' + id + '-' + version,\n  path: path,\n  commit_message: 'feat(survivor): add ' + id + ' ' + version + ' research survivor record',\n  pr_title: 'research survivor: ' + id + ' ' + version,\n  pr_requires: 'independent audit before merge; n8n never merges'\n};\nreturn [{ json: Object.assign({}, x, {\n  route: 'RECORD_PAYLOAD_READY',\n  record_file: { path: path, frontmatter: frontmatter, body_sections: body_sections, record: c },\n  pr_plan: pr_plan\n}) }];\n"
+      }
+    },
+    {
+      "id": "record-file",
+      "name": "12 · Record file content",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        7290,
+        660
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Serialises the survivor record to the file that is committed. The frontmatter\n// is the flat contract set; the machine-readable record travels as a JSON block\n// so the merge readback can read back exactly what was written.\nconst x = $input.first().json;\nif (x.route !== 'RECORD_PAYLOAD_READY') { return []; }\nconst file = x.record_file || {};\nconst fm = file.frontmatter || {};\nconst order = ['schema', 'survivor_id', 'survivor_version', 'family_id', 'source_strategy_id', 'source_repository_url',\n  'source_strategy_path', 'source_git_commit', 'strategy_sha', 'qlib_survivor_status',\n  'hummingbot_validation_status', 'hb_certified', 'status', 'adoption', 'approval_scope'];\nconst lines = ['---'];\nfor (const key of order) {\n  const value = fm[key];\n  lines.push(key + ': ' + (typeof value === 'string' ? JSON.stringify(value) : String(value)));\n}\nlines.push('---', '', '# ' + fm.survivor_id + ' ' + fm.survivor_version, '');\nfor (const section of file.body_sections || []) { lines.push('## ' + section, ''); }\n// The merged-record readback contract names the frozen config identity\n// full_config_sha256; the record's own effective_config_hash is that value.\nconst block = Object.assign({}, file.record, {\n  full_config_sha256: file.record.full_config_sha256 || file.record.effective_config_hash || null\n});\nlines.push('## Record (machine readable)', '', '```json', JSON.stringify(block, null, 2), '```', '');\nreturn [{ json: Object.assign({}, x, {\n  payload_kind: 'record_file',\n  record_content: lines.join('\\n'),\n  record_path: file.path,\n  pr_plan: x.pr_plan\n}) }];\n"
+      }
+    },
+    {
+      "id": "review-gate-12",
+      "name": "12 · NEEDS_REVIEW gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        7520,
+        120
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $input.all().filter((entry) => entry.json.route === 'NEEDS_REVIEW');\n"
+      }
+    },
+    {
+      "id": "review-endpoint-12",
+      "name": "12 · NEEDS_REVIEW endpoint",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        7750,
+        120
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "survivor-main-ref",
+      "name": "12 · Read survivor main ref",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        7520,
+        460
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.github.com/repos/HCH725/research-survivor/git/ref/heads/main",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "githubApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "githubApi": {
+          "id": "research-survivor-github",
+          "name": "GitHub (research-survivor)"
+        }
+      }
+    },
+    {
+      "id": "survivor-branch",
+      "name": "12 · Create survivor branch",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        7750,
+        460
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.github.com/repos/HCH725/research-survivor/git/refs",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "githubApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ ref: 'refs/heads/' + $('12 · Survivor record payload').first().json.pr_plan.head_branch, sha: $json.object.sha }) }}",
+        "options": {}
+      },
+      "credentials": {
+        "githubApi": {
+          "id": "research-survivor-github",
+          "name": "GitHub (research-survivor)"
+        }
+      }
+    },
+    {
+      "id": "survivor-commit",
+      "name": "12 · Commit survivor record",
+      "type": "n8n-nodes-base.github",
+      "typeVersion": 1.1,
+      "position": [
+        7980,
+        460
+      ],
+      "parameters": {
+        "resource": "file",
+        "operation": "create",
+        "owner": {
+          "mode": "name",
+          "value": "HCH725"
+        },
+        "repository": {
+          "mode": "name",
+          "value": "research-survivor"
+        },
+        "filePath": "={{ $('12 · Record file content').first().json.record_path }}",
+        "binaryData": false,
+        "fileContent": "={{ $('12 · Record file content').first().json.record_content }}",
+        "commitMessage": "={{ $('12 · Survivor record payload').first().json.pr_plan.commit_message }}",
+        "additionalParameters": {
+          "branch": {
+            "branch": "={{ $('12 · Survivor record payload').first().json.pr_plan.head_branch }}"
+          }
+        }
+      },
+      "credentials": {
+        "githubApi": {
+          "id": "research-survivor-github",
+          "name": "GitHub (research-survivor)"
+        }
+      }
+    },
+    {
+      "id": "survivor-pr",
+      "name": "12 · Open promotion PR",
+      "type": "n8n-nodes-base.github",
+      "typeVersion": 1.1,
+      "position": [
+        8210,
+        460
+      ],
+      "parameters": {
+        "resource": "pullRequest",
+        "operation": "create",
+        "owner": {
+          "mode": "name",
+          "value": "HCH725"
+        },
+        "repository": {
+          "mode": "name",
+          "value": "research-survivor"
+        },
+        "base": "main",
+        "head": "={{ $('12 · Survivor record payload').first().json.pr_plan.head_branch }}",
+        "title": "={{ $('12 · Survivor record payload').first().json.pr_plan.pr_title }}",
+        "body": "={{ 'Research survivor record. Schema research-survivor-record-v1. Independent auditor review required before merge; the workflow never merges.' }}",
+        "draft": false
+      },
+      "credentials": {
+        "githubApi": {
+          "id": "research-survivor-github",
+          "name": "GitHub (research-survivor)"
+        }
+      }
+    },
+    {
+      "id": "pr-created",
+      "name": "12 · PR created",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        8440,
+        460
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Validates the created pull request and gives the durable PR state. The\n// workflow never merges: an independent auditor owns the merge.\nconst x = $input.first().json;\nconst plan = $('12 · Survivor record payload').first().json.pr_plan || {};\nconst base = {\n  repo: 'HCH725/research-survivor',\n  base_branch: 'main',\n  head_branch: plan.head_branch,\n  path: plan.path,\n  survivor_id: (x.record_file || {}).frontmatter ? x.record_file.frontmatter.survivor_id : null,\n  survivor_version: (x.record_file || {}).frontmatter ? x.record_file.frontmatter.survivor_version : null\n};\n// The native GitHub node returns the REST pull request body itself: the number\n// is `number` and the url is `html_url`. The boundary fixture shape is accepted\n// too, so the contract reads the same either way.\nconst pr = (x.pr_number !== undefined || x.number !== undefined) ? x : null;\nconst stop = (reason) => [{ json: Object.assign({}, base, { route: 'NEEDS_REVIEW', reason: reason, pr_request: base }) }];\nif (!pr) { return stop('pr_create_result_missing'); }\nconst number = String(pr.pr_number || pr.number || '');\nconst url = String(pr.html_url || pr.pr_url || '');\nconst headSha = String(pr.head && pr.head.sha ? pr.head.sha : '');\nif (!/^[0-9]+$/.test(number) || url.length === 0 || !/^[a-f0-9]{40}$/.test(headSha)) { return stop('pr_create_result_incomplete'); }\nif (headSha !== String(plan.head_sha || headSha)) { /* head sha is read back from GitHub */ }\nreturn [{ json: Object.assign({}, base, {\n  route: 'AWAITING_AUDIT_MERGE',\n  pr_state: 'AWAITING_AUDIT_MERGE',\n  // ponytail: one fixed 24-hour deadline survives the native Wait/Get loop.\n  // Expiry needs operator review. Do not reset it on each poll.\n  audit_deadline_utc: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),\n  pr: Object.assign({}, base, { pr_number: number, pr_url: url, head_sha: headSha }),\n  audit_boundary: 'independent auditor review before merge; n8n never merges'\n}) }];\n"
+      }
+    },
+    {
+      "id": "audit-wait",
+      "name": "12 · Wait for audit merge",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        8670,
+        460
+      ],
+      "parameters": {
+        "resume": "timeInterval",
+        "amount": 15,
+        "unit": "minutes"
+      }
+    },
+    {
+      "id": "pr-read",
+      "name": "12 · Read promotion PR",
+      "type": "n8n-nodes-base.github",
+      "typeVersion": 1.1,
+      "position": [
+        8900,
+        460
+      ],
+      "parameters": {
+        "resource": "pullRequest",
+        "operation": "get",
+        "owner": {
+          "mode": "name",
+          "value": "HCH725"
+        },
+        "repository": {
+          "mode": "name",
+          "value": "research-survivor"
+        },
+        "pullRequestNumber": "={{ $('12 · PR created').first().json.pr.pr_number }}"
+      },
+      "credentials": {
+        "githubApi": {
+          "id": "research-survivor-github",
+          "name": "GitHub (research-survivor)"
+        }
+      }
+    },
+    {
+      "id": "pr-merge-state",
+      "name": "12 · PR merge state",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        9130,
+        460
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Reads the promotion pull request back. It never merges and it never trusts a\n// payload alone: the merged state comes from this GitHub read.\nconst x = $input.first().json;\nconst number = String(x.number || '');\nconst state = String(x.state || '').toUpperCase();\nconst merged = x.merged === true;\nconst stop = (reason) => [{ json: { payload_kind: 'merge_review', route: 'NEEDS_REVIEW', reason: reason } }];\nif (!/^[0-9]+$/.test(number)) { return stop('pr_readback_incomplete'); }\nif (merged) {\n  if (state !== 'CLOSED') { return stop('merge_state_inconsistent'); }\n  if (!/^[a-f0-9]{40}$/.test(String(x.merge_commit_sha || ''))) { return stop('merge_commit_not_confirmed'); }\n  return [{ json: {\n    payload_kind: 'merged_pr_event',\n    event: {\n      delivery: 'github_pull_request_read',\n      repo: 'HCH725/research-survivor',\n      pr_number: Number(number),\n      pr_state: 'MERGED',\n      base_branch: (x.base && x.base.ref) || null,\n      head_branch: (x.head && x.head.ref) || null,\n      head_sha: String((x.head && x.head.sha) || ''),\n      merge_commit_sha: String(x.merge_commit_sha),\n      path: String($('12 · Survivor record payload').first().json.pr_plan.path),\n      survivor_id: $('12 · Survivor record payload').first().json.record_file.frontmatter.survivor_id,\n      survivor_version: $('12 · Survivor record payload').first().json.record_file.frontmatter.survivor_version,\n      merged_at_utc: String(x.merged_at || '')\n    },\n    route: 'MERGED_PR_EVENT'\n  } }];\n}\nif (state === 'OPEN') {\n  const created = $('12 · PR created');\n  const deadline = created.isExecuted ? Date.parse(created.first().json.audit_deadline_utc) : NaN;\n  if (!Number.isFinite(deadline)) { return stop('audit_deadline_missing'); }\n  if (Date.now() >= deadline) { return stop('audit_merge_timeout'); }\n  return [{ json: { payload_kind: 'pr_still_open', route: 'PR_OPEN', pr_number: Number(number) } }];\n}\nreturn stop('merge_readback_not_merged:' + state);\n"
+      }
+    },
+    {
+      "id": "pr-open-gate",
+      "name": "12 · PR open gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        9130,
+        960
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $input.all().filter((entry) => entry.json.route === 'PR_OPEN');\n"
+      }
+    },
+    {
+      "id": "merge-lane-gate",
+      "name": "12 · Merge lane gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        9130,
+        160
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $input.all().filter((entry) => entry.json.route === 'MERGED_PR_EVENT');\n"
+      }
+    },
+    {
+      "id": "pr-reviews",
+      "name": "12 · Read audit reviews",
+      "type": "n8n-nodes-base.github",
+      "typeVersion": 1.1,
+      "position": [
+        9130,
+        760
+      ],
+      "parameters": {
+        "resource": "review",
+        "operation": "getAll",
+        "owner": {
+          "mode": "name",
+          "value": "HCH725"
+        },
+        "repository": {
+          "mode": "name",
+          "value": "research-survivor"
+        },
+        "pullRequestNumber": "={{ $('12 · PR created').first().json.pr.pr_number }}"
+      },
+      "credentials": {
+        "githubApi": {
+          "id": "research-survivor-github",
+          "name": "GitHub (research-survivor)"
+        }
+      }
+    },
+    {
+      "id": "merged-file",
+      "name": "12 · Read merged record",
+      "type": "n8n-nodes-base.github",
+      "typeVersion": 1.1,
+      "position": [
+        9360,
+        460
+      ],
+      "parameters": {
+        "resource": "file",
+        "operation": "get",
+        "owner": {
+          "mode": "name",
+          "value": "HCH725"
+        },
+        "repository": {
+          "mode": "name",
+          "value": "research-survivor"
+        },
+        "filePath": "={{ $('12 · Survivor record payload').first().json.pr_plan.path }}"
+      },
+      "credentials": {
+        "githubApi": {
+          "id": "research-survivor-github",
+          "name": "GitHub (research-survivor)"
+        }
+      }
+    },
+    {
+      "id": "merge-readback",
+      "name": "12 · Merge readback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        9590,
+        460
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Reads the merged record file back and builds the readback of the existing\n// merge verification contract. The auditor evidence is the pull request review\n// evidence of this exact head, read natively.\nconst rows = $input.all().map((entry) => entry.json);\nconst file = rows.filter((row) => row && typeof row.content === 'string')[0] || null;\nconst reviews = $('12 · Read audit reviews').isExecuted ? $('12 · Read audit reviews').all().map((entry) => entry.json) : [];\nconst event = $('12 · PR merge state').isExecuted ? $('12 · PR merge state').first().json : {};\nconst stop = (reason) => [{ json: { payload_kind: 'merge_review', route: 'NEEDS_REVIEW', reason: reason } }];\nif (event.payload_kind !== 'merged_pr_event') { return []; }\nconst ev = event.event || {};\nif (!file || typeof file.content !== 'string') { return stop('merged_record_not_readable'); }\nlet text = '';\ntry { text = Buffer.from(file.content.replace(/\\s/g, ''), 'base64').toString('utf8'); } catch (error) { return stop('merged_record_not_decodable'); }\nif (!text.startsWith('---\\n')) { return stop('merged_record_has_no_frontmatter'); }\nconst end = text.indexOf('\\n---', 4);\nif (end < 0) { return stop('merged_record_unterminated_frontmatter'); }\nconst fm = {};\nfor (const line of text.slice(4, end).split('\\n')) {\n  const at = line.indexOf(':');\n  if (at < 0) { continue; }\n  const key = line.slice(0, at).trim();\n  const raw = line.slice(at + 1).trim();\n  if (raw === 'true' || raw === 'false') { fm[key] = raw === 'true'; continue; }\n  try { fm[key] = JSON.parse(raw); } catch (error) { fm[key] = raw; }\n}\nconst block = text.match(/```json\\s*\\n([\\s\\S]*?)\\n```/);\nlet record = null;\ntry { record = block ? JSON.parse(block[1]) : null; } catch (error) { record = null; }\nif (!record || typeof record !== 'object' || Array.isArray(record)) { return stop('merged_record_payload_missing'); }\nconst approved = reviews.filter((review) => String(review.state || '').toUpperCase() === 'APPROVED');\nconst audit = approved.length > 0 ? {\n  verdict: 'PASS',\n  reviewed_head_sha: String(approved[approved.length - 1].commit_id || ''),\n  audit_record_ref: 'github://HCH725/research-survivor/pull/' + ev.pr_number + '#review/' + String(approved[approved.length - 1].id || ''),\n  audit_merge_commit: String(ev.merge_commit_sha || ''),\n  audited_at_utc: String(approved[approved.length - 1].submitted_at || '')\n} : { verdict: 'NONE' };\nreturn [{ json: { payload_kind: 'github_readback', readback: {\n  source: 'github_pull_request_read + merged file read',\n  repo: 'HCH725/research-survivor',\n  pr_number: ev.pr_number,\n  pr_state: 'MERGED',\n  base_branch: ev.base_branch,\n  head_branch: ev.head_branch,\n  head_sha: ev.head_sha,\n  merge_commit_sha: ev.merge_commit_sha,\n  merged_at_utc: ev.merged_at_utc,\n  path: fm.survivor_id + '-' + fm.survivor_version + '.md',\n  file_sha256: null,\n  file_blob_sha: String(file.sha || ''),\n  frontmatter: fm,\n  audited_pass_evidence: audit,\n  record: record\n} } }];\n"
+      }
+    },
+    {
+      "id": "merge-verify",
+      "name": "12 · Merge verification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        9820,
+        460
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Node12 re-entry. It does not trust the event payload. It compares the GitHub\n// readback with the event: exact repo, path, survivor id, survivor version,\n// head and merge commit, plus the audited PASS evidence that covers this exact\n// head and merge commit. Any mismatch fails closed. No Sheets write follows.\nconst inItems = $input.all().map((entry) => entry.json);\nconst isText = (v) => typeof v === 'string' && v.length > 0;\nconst eventItem = inItems.filter((row) => row && row.payload_kind === 'merged_pr_event')[0];\nconst readItem = inItems.filter((row) => row && row.payload_kind === 'github_readback')[0];\nconst stop = (reason) => [{ json: { payload_kind: 'merge_review', route: 'NEEDS_REVIEW', reason: reason } }];\nif (!eventItem || !readItem) { return stop('merge_entry_missing'); }\nconst e = eventItem.event || {};\nconst r = readItem.readback || {};\nconst fm = r.frontmatter || {};\nconst audit = r.audited_pass_evidence || {};\nconst record = r.record || {};\nif (e.repo !== 'HCH725/research-survivor' || r.repo !== 'HCH725/research-survivor') { return stop('merge_repo_mismatch'); }\nif (e.pr_state !== 'MERGED') { return stop('merge_not_merged:' + e.pr_state); }\nif (r.pr_state !== 'MERGED') { return stop('merge_readback_not_merged:' + r.pr_state); }\nif (e.base_branch !== 'main' || r.base_branch !== 'main') { return stop('merge_base_not_main'); }\nif (e.pr_number !== r.pr_number) { return stop('merge_pr_number_mismatch'); }\nif (e.head_branch !== r.head_branch) { return stop('merge_head_branch_mismatch'); }\nif (e.head_sha !== r.head_sha) { return stop('merge_head_sha_mismatch'); }\nif (e.merge_commit_sha !== r.merge_commit_sha) { return stop('merge_commit_not_confirmed'); }\nif (!/^[a-f0-9]{40}$/.test(String(r.merge_commit_sha || ''))) { return stop('merge_commit_bad_shape'); }\nif (fm.schema !== 'research-survivor-record-v1') { return stop('record_schema_unknown'); }\nif (fm.survivor_id !== e.survivor_id || fm.survivor_version !== e.survivor_version) { return stop('merge_identity_mismatch:survivor'); }\nconst expectedPath = String(fm.survivor_id) + '-' + String(fm.survivor_version) + '.md';\nif (r.path !== expectedPath) { return stop('merge_identity_mismatch:path'); }\nif (e.path !== expectedPath) { return stop('merge_identity_mismatch:event_path'); }\nif (fm.qlib_survivor_status !== 'PASS') { return stop('record_not_qlib_pass'); }\nif (fm.hummingbot_validation_status !== 'PENDING' || fm.hb_certified !== false) { return stop('record_hb_status_not_pending'); }\nif (audit.verdict !== 'PASS') { return stop('audit_evidence_not_pass'); }\nif (audit.reviewed_head_sha !== r.head_sha) { return stop('audit_head_sha_mismatch'); }\nif (audit.audit_merge_commit !== r.merge_commit_sha) { return stop('audit_merge_commit_mismatch'); }\nif (!isText(audit.audit_record_ref)) { return stop('audit_record_ref_missing'); }\nif (!/^[a-f0-9]{64}$/.test(String(record.full_config_sha256 || ''))) { return stop('record_config_identity_missing'); }\nif (!/^[a-f0-9]{64}$/.test(String(record.frozen_version_sha || ''))) { return stop('record_frozen_version_missing'); }\nif (!/^[a-f0-9]{32}$/.test(String(record.is_run_id || ''))) { return stop('record_is_run_id_missing'); }\nif (!/^[a-f0-9]{32}$/.test(String(record.oos_run_id || ''))) { return stop('record_oos_run_id_missing'); }\nreturn [{ json: {\n  payload_kind: 'merge_verified',\n  route: 'MERGE_VERIFIED',\n  merge: {\n    repo: r.repo,\n    path: r.path,\n    pr_number: r.pr_number,\n    head_branch: r.head_branch,\n    head_sha: r.head_sha,\n    merge_commit_sha: r.merge_commit_sha,\n    merged_at_utc: r.merged_at_utc,\n    survivor_id: fm.survivor_id,\n    survivor_version: fm.survivor_version,\n    audit_record_ref: audit.audit_record_ref,\n    file_sha256: r.file_sha256,\n    frontmatter: fm,\n    record: record\n  }\n} }];\n"
+      }
+    },
+    {
+      "id": "merge-lane",
+      "name": "12 · MERGE_VERIFIED lane gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        10050,
+        460
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $input.all().filter((entry) => entry.json.route === 'MERGE_VERIFIED');\n"
+      }
+    },
+    {
+      "id": "sheets-plan",
+      "name": "12 · Sheets upsert plan",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        10280,
+        460
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Node12 Sheets contract. It aligns the record with the existing 84-column\n// native Survivor Registry. It never adds a column and never changes the sheet\n// schema. It never writes the 42 empty coverage cells. The native Google Sheets\n// node performs the upsert once a credential exists. The instance holds none,\n// so the write stays an explicit boundary with the exact blocker.\nconst x = $input.first().json;\nconst stop = (reason) => [{ json: Object.assign({}, x, { route: 'NEEDS_REVIEW', reason: reason }) }];\nif (x.route !== 'MERGE_VERIFIED') { return stop('merge_not_verified:' + x.route); }\nconst HEADERS = [\"survivor_id\", \"survivor_version\", \"family_id\", \"family_name\", \"source_strategy_id\", \"source_strategy_version\", \"source_repository_url\", \"source_strategy_path\", \"source_git_commit\", \"survivor_repository_url\", \"survivor_strategy_path\", \"survivor_git_commit\", \"promotion_time_utc\", \"promotion_decision_id\", \"exchange\", \"market_type\", \"symbol\", \"timeframe\", \"position_side\", \"margin_mode\", \"leverage_x\", \"initial_capital_usdt\", \"portfolio_allocation_pct\", \"base_order_capital_pct\", \"safety_order_capital_pct\", \"backtest_start_utc\", \"backtest_end_utc\", \"data_source\", \"dataset_version_or_hash\", \"entry_rule_summary\", \"exit_rule_summary\", \"dca_base_order_enabled\", \"dca_safety_order_count\", \"dca_so_step_pct\", \"dca_so_step_scale\", \"dca_so_volume_scale\", \"take_profit_pct\", \"stop_loss_pct\", \"order_execution_type\", \"fee_rate_bps\", \"slippage_bps\", \"compounding_enabled\", \"full_config_snapshot_uri\", \"full_config_sha256\", \"qlib_run_id\", \"mlflow_experiment_id\", \"qlib_engine_version\", \"runtime_git_commit_or_image\", \"net_return_pct\", \"annualized_return_pct\", \"sharpe_ratio\", \"max_drawdown_pct\", \"max_drawdown_definition\", \"win_rate_pct\", \"total_trades\", \"profit_factor\", \"net_profit_usdt\", \"oos_verification_status\", \"robustness_status\", \"survivor_gate_version\", \"qlib_report_uri\", \"trades_artifact_uri\", \"equity_curve_uri\", \"artifacts_manifest_uri\", \"artifacts_manifest_sha256\", \"research_note_uri\", \"hummingbot_validation_status\", \"hummingbot_task_id\", \"parity_verification_status\", \"testnet_status\", \"mainnet_status\", \"registry_last_synced_utc\", \"registry_sync_status\", \"is_run_id\", \"oos_run_id\", \"is_window_hash\", \"oos_window_hash\", \"hummingbot_engine_version\", \"hummingbot_archive_uri\", \"parity_diff_uri\", \"hb_certified_at_utc\", \"hb_certification_git_commit\", \"portfolio_evidence_uri\", \"parity_diff_sha256\"];\nconst m = x.merge;\nconst fm = m.frontmatter || {};\nconst rec = m.record || {};\nconst met = rec.metrics || {};\nconst columns = {\n  survivor_id: fm.survivor_id,\n  survivor_version: fm.survivor_version,\n  family_id: fm.family_id,\n  family_name: rec.family_name,\n  source_strategy_id: fm.source_strategy_id,\n  source_repository_url: fm.source_repository_url,\n  source_strategy_path: fm.source_strategy_path,\n  source_git_commit: fm.source_git_commit,\n  survivor_repository_url: 'https://github.com/HCH725/research-survivor',\n  survivor_strategy_path: m.path,\n  survivor_git_commit: m.merge_commit_sha,\n  promotion_time_utc: m.merged_at_utc,\n  promotion_decision_id: 'pr#' + String(m.pr_number) + '@' + String(m.merge_commit_sha).substring(0, 12),\n  backtest_start_utc: rec.backtest_start_utc,\n  backtest_end_utc: rec.backtest_end_utc,\n  data_source: rec.data_source,\n  dataset_version_or_hash: rec.dataset_version_or_hash,\n  full_config_snapshot_uri: rec.full_config_snapshot_uri,\n  full_config_sha256: rec.full_config_sha256,\n  qlib_engine_version: rec.qlib_engine_version,\n  runtime_git_commit_or_image: rec.runtime_git_commit_or_image,\n  annualized_return_pct: met.cagr_pct,\n  net_return_pct: met.net_return_pct,\n  sharpe_ratio: met.sharpe,\n  max_drawdown_pct: met.max_drawdown_pct,\n  max_drawdown_definition: met.max_drawdown_definition,\n  win_rate_pct: met.win_rate_pct,\n  total_trades: met.total_trades,\n  profit_factor: met.profit_factor,\n  oos_verification_status: 'PASS',\n  survivor_gate_version: rec.survivor_gate_version,\n  qlib_report_uri: rec.qlib_report_uri,\n  trades_artifact_uri: rec.trades_artifact_uri,\n  equity_curve_uri: rec.equity_curve_uri,\n  artifacts_manifest_uri: rec.artifacts_manifest_uri,\n  artifacts_manifest_sha256: rec.artifacts_manifest_sha256,\n  research_note_uri: rec.research_note_uri,\n  fee_rate_bps: (rec.cost_model || {}).fee_rate_bps,\n  slippage_bps: (rec.cost_model || {}).slippage_bps,\n  hummingbot_validation_status: 'NOT_STARTED',\n  is_run_id: rec.is_run_id,\n  oos_run_id: rec.oos_run_id,\n  is_window_hash: rec.is_window_hash,\n  oos_window_hash: rec.oos_window_hash\n};\nconst keys = Object.keys(columns);\nconst unknown = keys.filter((key) => HEADERS.indexOf(key) === -1);\nif (unknown.length > 0) { return stop('unknown_registry_columns:' + unknown.join(',')); }\nconst required = ['survivor_id', 'survivor_version', 'survivor_git_commit', 'full_config_sha256', 'is_run_id',\n  'oos_run_id', 'is_window_hash', 'oos_window_hash', 'hummingbot_validation_status'];\nconst lacking = required.filter((key) => columns[key] === undefined || columns[key] === null || columns[key] === '');\nif (lacking.length > 0) { return stop('registry_row_incomplete:' + lacking.join(',')); }\nconst KEY = ['survivor_id', 'survivor_version'];\nreturn [{ json: Object.assign({}, x, {\n  payload_kind: 'sheets_plan',\n  route: 'UPSERT_PLAN_READY',\n  sheets: {\n    spreadsheet_id: '1fzO3zH5xSmQWMH856KY_Z2atLCHkDdRg_cBzltSB_rg',\n    tab: 'Survivor Registry',\n    key: KEY,\n    // The local n8n schema (2.39.9) shows the appendOrUpdate and update\n    // resourceMapper with multiKeyMatch=false: a composite native match does\n    // not exist. The composite key is decided by the upsert decision node and\n    // the write is one plain native operation.\n    native_node: {\n      type: 'n8n-nodes-base.googleSheets',\n      typeVersion: 4.7,\n      resource: 'sheet',\n      read: { operation: 'read', filtersUI: ['survivor_id'] },\n      update: { operation: 'update', matchingColumns: ['survivor_id'] },\n      append: { operation: 'append' },\n      documentId: '1fzO3zH5xSmQWMH856KY_Z2atLCHkDdRg_cBzltSB_rg',\n      sheetName: 'Survivor Registry'\n    },\n    schema_evidence: 'n8n-nodes-base 2.39.9 dist: sheet/appendOrUpdate.operation.js and sheet/update.operation.js declare resourceMapper multiKeyMatch=false',\n    columns: columns,\n    headers_ref: { count: HEADERS.length, source: 'native Survivor Registry header row, read 2026-10-15' },\n    write_policy: {\n      only_after_verified_merge: true,\n      idempotent_by_key: true,\n      duplicate_rows_forbidden: true,\n      never_write_empty_coverage_cells: true,\n      bounded_retries: 3\n    },\n    write_state: 'PENDING_SYNC',\n    blocked_by: {\n      code: 'google_sheets_credential_missing_in_n8n_instance',\n      evidence: 'Live n8n instance credential inventory (2026-10-15): exactly one credential, type sshPrivateKey (the 01-05 connector). No Google Sheets credential exists. No bridge and no service are created.',\n      required_capability: { node: 'n8n-nodes-base.googleSheets', credential_type: 'googleSheetsOAuth2Api' },\n      decision_needed: 'Provide an existing Google Sheets connection for the native node. The upsert stays a boundary until then.'\n    }\n  }\n}) }];\n"
+      }
+    },
+    {
+      "id": "sheets-decision",
+      "name": "12 · Sheets upsert decision",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        10510,
+        460
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// The minimal native upsert for this n8n version. The local node schema shows\n// the appendOrUpdate/update resourceMapper with multiKeyMatch=false, so the\n// composite key (survivor_id + survivor_version) is decided here and the write\n// is a plain Update Row or Append Row against the row that already exists.\nconst x = $input.first().json;\nconst plan = $('12 · Sheets upsert plan').first().json;\nconst sheets = plan.sheets || {};\nconst key = sheets.key || ['survivor_id', 'survivor_version'];\nconst columns = sheets.columns || {};\nconst readback = Array.isArray(x) ? x : (Array.isArray(x.data) ? x.data : []);\nconst keyOf = (row) => key.map((field) => String(row ? row[field] : '')).join('\\u0001');\nconst wanted = keyOf(columns);\nconst matches = readback.filter((row) => keyOf(row) === wanted);\nconst sameId = readback.filter((row) => String(row ? row.survivor_id : '') === String(columns.survivor_id));\nif (matches.length > 1) { return [{ json: Object.assign({}, plan, { route: 'ERROR', reason: 'duplicate_rows_forbidden', retry: { same_key: true, rollback_repo: false, duplicate_allowed: false } }) }]; }\nconst syncedAt = new Date().toISOString();\nconst row = Object.assign({}, columns, { registry_sync_status: 'SYNCED', registry_last_synced_utc: syncedAt });\nconst shared = Object.assign({}, plan, {\n  payload_kind: 'sheets_write_intent',\n  sheets_row: row,\n  sheets_synced_at_utc: syncedAt,\n  rows_for_survivor_id: sameId.length\n});\nif (matches.length === 1) { return [{ json: Object.assign({}, shared, { route: 'UPSERT_UPDATE' }) }]; }\nreturn [{ json: Object.assign({}, shared, { route: 'UPSERT_APPEND' }) }];\n"
+      }
+    },
+    {
+      "id": "sheets-lookup",
+      "name": "12 · Read registry row",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        10740,
+        460
+      ],
+      "parameters": {
+        "operation": "read",
+        "documentId": {
+          "mode": "id",
+          "value": "1fzO3zH5xSmQWMH856KY_Z2atLCHkDdRg_cBzltSB_rg"
+        },
+        "sheetName": {
+          "mode": "name",
+          "value": "Survivor Registry"
+        },
+        "filtersUI": {
+          "values": [
+            {
+              "lookupColumn": "survivor_id",
+              "lookupValue": "={{ $('12 · Sheets upsert plan').first().json.sheets.columns.survivor_id }}"
+            }
+          ]
+        },
+        "combineFilters": "AND",
+        "options": {}
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "survivor-registry-sheets",
+          "name": "Google Sheets (Survivor Registry)"
+        }
+      }
+    },
+    {
+      "id": "sheets-update",
+      "name": "12 · Update registry row",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        10970,
+        360
+      ],
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "mode": "id",
+          "value": "1fzO3zH5xSmQWMH856KY_Z2atLCHkDdRg_cBzltSB_rg"
+        },
+        "sheetName": {
+          "mode": "name",
+          "value": "Survivor Registry"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [
+            "survivor_id"
+          ],
+          "schema": []
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "survivor-registry-sheets",
+          "name": "Google Sheets (Survivor Registry)"
+        }
+      }
+    },
+    {
+      "id": "sheets-append",
+      "name": "12 · Append registry row",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        10970,
+        560
+      ],
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "mode": "id",
+          "value": "1fzO3zH5xSmQWMH856KY_Z2atLCHkDdRg_cBzltSB_rg"
+        },
+        "sheetName": {
+          "mode": "name",
+          "value": "Survivor Registry"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "schema": []
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "survivor-registry-sheets",
+          "name": "Google Sheets (Survivor Registry)"
+        }
+      }
+    },
+    {
+      "id": "sheets-readback",
+      "name": "12 · Read registry row back",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        11200,
+        460
+      ],
+      "parameters": {
+        "operation": "read",
+        "documentId": {
+          "mode": "id",
+          "value": "1fzO3zH5xSmQWMH856KY_Z2atLCHkDdRg_cBzltSB_rg"
+        },
+        "sheetName": {
+          "mode": "name",
+          "value": "Survivor Registry"
+        },
+        "filtersUI": {
+          "values": [
+            {
+              "lookupColumn": "survivor_id",
+              "lookupValue": "={{ $('12 · Sheets upsert plan').first().json.sheets.columns.survivor_id }}"
+            }
+          ]
+        },
+        "combineFilters": "AND",
+        "options": {}
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "survivor-registry-sheets",
+          "name": "Google Sheets (Survivor Registry)"
+        }
+      }
+    },
+    {
+      "id": "sheets-result",
+      "name": "12 · Sheets write result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        11430,
+        460
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Projects the readback rows into the write result of the existing ACK gate.\nconst plan = $('12 · Sheets upsert plan').first().json;\nconst intent = $('12 · Sheets upsert decision').first().json;\nconst x = $input.first().json;\nconst readback = Array.isArray(x) ? x : (Array.isArray(x.data) ? x.data : []);\nconst last = readback.length > 0 ? readback[readback.length - 1] : null;\nconst value = (key) => (last ? last[key] : undefined);\nconst field = (name) => (value(name) !== undefined && value(name) !== null && value(name) !== '' ? value(name) : intent.sheets_row[name]);\nconst row = {};\nfor (const name of Object.keys(intent.sheets_row)) { row[name] = field(name); }\nreturn [{ json: Object.assign({}, plan, {\n  payload_kind: 'sheets_write_result',\n  write_result: {\n    mode: 'upsert_by_key',\n    attempt: 1,\n    max_attempts: 3,\n    outcome: 'upsert_ok',\n    key: { survivor_id: intent.sheets_row.survivor_id, survivor_version: intent.sheets_row.survivor_version },\n    synced_at_utc: row.registry_last_synced_utc,\n    rows_after: [row]\n  }\n}) }];\n"
+      }
+    },
+    {
+      "id": "sheets-ack",
+      "name": "12 · Sheets ACK gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        11660,
+        460
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Node12 Sheets ACK gate. The write happens only after the verified merge. The\n// readback must return the same key with the same identity, hash, run ids and\n// sync status. A mismatch is ERROR. A write failure retries the same key in a\n// bounded loop. A duplicate row for the same key is ERROR. The repository is\n// never rolled back.\nconst inItems = $input.all().map((entry) => entry.json);\nconst planItem = inItems.filter((row) => row && row.payload_kind === 'sheets_plan')[0];\nconst writeItem = inItems.filter((row) => row && row.payload_kind === 'sheets_write_result')[0];\nconst carr = planItem || {};\nconst stop = (route, reason, extra) => [{ json: Object.assign({}, carr, extra || {}, { route: route, reason: reason }) }];\nif (!planItem || !writeItem) { return stop('ERROR', 'sheets_state_missing'); }\nconst w = writeItem.write_result || {};\nconst key = planItem.sheets.key;\nconst keyOf = (row) => key.map((field) => String(row ? row[field] : '')).join('\\u0001');\nconst keyValue = keyOf(planItem.sheets.columns);\nconst outcome = String(w.outcome || '');\nif (outcome !== 'upsert_ok') {\n  const attempt = Number(w.attempt);\n  const max = Number(w.max_attempts);\n  if (!(attempt >= 1) || !(max >= 1) || attempt >= max) {\n    return stop('ERROR', 'sheet_retry_exhausted', { retry: { same_key: true, attempts: attempt, max_attempts: max, rollback_repo: false } });\n  }\n  return stop('RETRY', 'sheet_write_' + outcome, { retry: { same_key: true, next_attempt: attempt + 1, max_attempts: max, duplicate_allowed: false, rollback_repo: false } });\n}\nconst rows = (Array.isArray(w.rows_after) ? w.rows_after : []).filter((row) => keyOf(row) === keyValue);\nif (rows.length === 0) { return stop('ERROR', 'readback_row_missing'); }\nif (rows.length > 1) { return stop('ERROR', 'duplicate_rows_forbidden'); }\nconst row = rows[0];\nconst expect = planItem.sheets.columns;\nconst fields = ['survivor_git_commit', 'full_config_sha256', 'is_run_id', 'oos_run_id', 'is_window_hash', 'oos_window_hash', 'qlib_report_uri'];\nfor (const field of fields) {\n  if (expect[field] === undefined) { continue; }\n  if (row[field] !== expect[field]) { return stop('ERROR', 'readback_mismatch:' + field); }\n}\nif (row.registry_sync_status !== 'SYNCED') { return stop('ERROR', 'readback_sync_status_not_synced'); }\nif (typeof row.registry_last_synced_utc !== 'string' || row.registry_last_synced_utc.length === 0) { return stop('ERROR', 'readback_sync_time_missing'); }\nif (String(w.synced_at_utc || '') !== row.registry_last_synced_utc) { return stop('ERROR', 'readback_sync_time_mismatch'); }\nreturn [{ json: Object.assign({}, planItem, {\n  route: 'SHEETS_ACK',\n  sheets_ack: {\n    status: 'SHEETS_ACK',\n    spreadsheet_id: planItem.sheets.spreadsheet_id,\n    tab: planItem.sheets.tab,\n    survivor_id: row.survivor_id,\n    survivor_version: row.survivor_version,\n    survivor_git_commit: row.survivor_git_commit,\n    full_config_sha256: row.full_config_sha256,\n    is_run_id: row.is_run_id,\n    oos_run_id: row.oos_run_id,\n    registry_sync_status: row.registry_sync_status,\n    synced_at_utc: row.registry_last_synced_utc\n  }\n}) }];\n"
+      }
+    },
+    {
+      "id": "sheets-retry",
+      "name": "12 · Sheets RETRY endpoint (bounded, same key)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        11890,
+        660
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "sheets-error",
+      "name": "12 · Sheets ERROR endpoint",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        11890,
+        860
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "sheets-ack-lane",
+      "name": "12 · SHEETS_ACK lane gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        11890,
+        460
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $input.all().filter((entry) => entry.json.route === 'SHEETS_ACK');\n"
+      }
+    },
+    {
+      "id": "node13-payload",
+      "name": "12 · Node13 boundary payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        12120,
+        460
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// The Node13 boundary payload. Node12 stops here. It does not call Hummingbot.\n// It does no parity and no certification. The HB status stays PENDING.\nconst x = $input.first().json;\nif (x.route !== 'SHEETS_ACK') { return [{ json: { route: 'NEEDS_REVIEW', reason: 'sheets_not_acked:' + x.route } }]; }\nconst m = x.merge;\nconst rec = m.record || {};\nconst fm = m.frontmatter || {};\nreturn [{ json: {\n  payload_kind: 'node13_boundary',\n  route: 'NODE13_BOUNDARY_READY',\n  node13: {\n    survivor_repository_url: 'https://github.com/HCH725/research-survivor',\n    survivor_strategy_path: m.path,\n    survivor_git_commit: m.merge_commit_sha,\n    survivor_id: m.survivor_id,\n    survivor_version: m.survivor_version,\n    strategy_sha: fm.strategy_sha,\n    frozen_version_sha: rec.frozen_version_sha,\n    effective_config_hash: rec.full_config_sha256,\n    full_config_snapshot_uri: rec.full_config_snapshot_uri,\n    is_run_id: rec.is_run_id,\n    oos_run_id: rec.oos_run_id,\n    is_window_hash: rec.is_window_hash,\n    oos_window_hash: rec.oos_window_hash,\n    data_snapshot: rec.data_snapshot,\n    cost_model: rec.cost_model,\n    hummingbot_validation_status: 'PENDING',\n    hb_certified: false,\n    sheets: {\n      spreadsheet_id: x.sheets.spreadsheet_id,\n      tab: x.sheets.tab,\n      registry_sync_status: 'SYNCED',\n      registry_last_synced_utc: x.sheets_ack.synced_at_utc\n    },\n    note: 'Node12 stops here. No Hummingbot call, no parity, no certificate.'\n  }\n} }];\n"
+      }
+    },
+    {
+      "id": "node13-boundary",
+      "name": "12 · Node13 boundary",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        12350,
+        460
+      ],
+      "parameters": {}
+    }
+  ],
+  "connections": {
+    "01 · Manual preflight": {
+      "main": [
+        [
+          {
+            "node": "01 · Select candidate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "01 · Select candidate": {
+      "main": [
+        [
+          {
+            "node": "02 · Pin Alpha main",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "02 · Pin Alpha main": {
+      "main": [
+        [
+          {
+            "node": "02 · Read pinned record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "02 · Read pinned record": {
+      "main": [
+        [
+          {
+            "node": "03 · Engineering readiness",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "03 · Engineering readiness": {
+      "main": [
+        [
+          {
+            "node": "03b · READY gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "03b · READY gate": {
+      "main": [
+        [
+          {
+            "node": "04 · Submit representative Qlib",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "04 · Submit representative Qlib": {
+      "main": [
+        [
+          {
+            "node": "04 · Verify submit receipt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "04 · Verify submit receipt": {
+      "main": [
+        [
+          {
+            "node": "05 · Read representative artifacts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "05 · Read representative artifacts": {
+      "main": [
+        [
+          {
+            "node": "05 · Verify artifact completeness",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "05 · Verify artifact completeness": {
+      "main": [
+        [
+          {
+            "node": "06 · IS_READY campaign gate",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "10 · OOS_READY from 05 readback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "06 · IS_READY campaign gate": {
+      "main": [
+        [
+          {
+            "node": "06 · IS_READY lane gate",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "06 · IS_READY HOLD endpoint",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "06 · IS_READY lane gate": {
+      "main": [
+        [
+          {
+            "node": "06 · Hermes task payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "06 · Hermes task payload": {
+      "main": [
+        [
+          {
+            "node": "06 · Hermes research (SSH)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "06 · Hermes research (SSH)": {
+      "main": [
+        [
+          {
+            "node": "06 · Hermes reply reader",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "06 · Hermes reply reader": {
+      "main": [
+        [
+          {
+            "node": "06 · Analysis contract gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "06 · Analysis contract gate": {
+      "main": [
+        [
+          {
+            "node": "07 · Wiki persistence gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "07 · Wiki persistence gate": {
+      "main": [
+        [
+          {
+            "node": "08 · Deterministic validation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "08 · Deterministic validation": {
+      "main": [
+        [
+          {
+            "node": "09 · Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "09 · Decision": {
+      "main": [
+        [
+          {
+            "node": "09 · RETEST gate",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "09 · FINALIZE gate",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "09 · NEEDS_REVIEW gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "09 · NEEDS_REVIEW gate": {
+      "main": [
+        [
+          {
+            "node": "09 · NEEDS_REVIEW endpoint",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "09 · RETEST gate": {
+      "main": [
+        [
+          {
+            "node": "09 · RETEST re-entry (04 contract)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "09 · RETEST re-entry (04 contract)": {
+      "main": [
+        [
+          {
+            "node": "09 · RETEST lane gate",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "09 · NEEDS_REVIEW gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "09 · RETEST lane gate": {
+      "main": [
+        [
+          {
+            "node": "04 · Submit representative Qlib",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "09 · FINALIZE gate": {
+      "main": [
+        [
+          {
+            "node": "10 · FINALIZE payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "10 · FINALIZE payload": {
+      "main": [
+        [
+          {
+            "node": "10 · frozen IS snapshot (05 readback)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "10 · Freeze & OOS request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "10 · frozen IS snapshot (05 readback)": {
+      "main": [
+        [
+          {
+            "node": "10 · Freeze & OOS request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "10 · Freeze & OOS request": {
+      "main": [
+        [
+          {
+            "node": "10 · OOS_REQUEST gate",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "10 · NEEDS_REVIEW gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "10 · NEEDS_REVIEW gate": {
+      "main": [
+        [
+          {
+            "node": "10 · NEEDS_REVIEW endpoint",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "10 · OOS_REQUEST gate": {
+      "main": [
+        [
+          {
+            "node": "10 · OOS re-entry (04/05 contract)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "10 · OOS re-entry (04/05 contract)": {
+      "main": [
+        [
+          {
+            "node": "10 · OOS lane gate",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "10 · NEEDS_REVIEW gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "10 · OOS lane gate": {
+      "main": [
+        [
+          {
+            "node": "04 · Submit representative Qlib",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "10 · OOS_READY from 05 readback": {
+      "main": [
+        [
+          {
+            "node": "10 · OOS_READY gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "10 · OOS_READY gate": {
+      "main": [
+        [
+          {
+            "node": "10 · OOS_READY lane gate",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "10 · NEEDS_REVIEW gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "11 · Read survivor policy (GitHub)": {
+      "main": [
+        [
+          {
+            "node": "11 · Promotion policy (native read)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "11 · Promotion policy (native read)": {
+      "main": [
+        [
+          {
+            "node": "11 · Research Survivor evaluation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "10 · OOS_READY lane gate": {
+      "main": [
+        [
+          {
+            "node": "11 · Research Survivor evaluation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "11 · Qlib replay readback (external boundary)": {
+      "main": [
+        [
+          {
+            "node": "11 · Replay & PASS assembly",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "11 · Research Survivor evaluation": {
+      "main": [
+        [
+          {
+            "node": "11 · HOLD gate",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "11 · REJECT gate",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "11 · PERF_PASS lane gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "11 · HOLD gate": {
+      "main": [
+        [
+          {
+            "node": "11 · HOLD endpoint",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "11 · REJECT gate": {
+      "main": [
+        [
+          {
+            "node": "11 · REJECT endpoint",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "11 · PERF_PASS lane gate": {
+      "main": [
+        [
+          {
+            "node": "11 · Replay & PASS assembly",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "11 · Replay & PASS assembly": {
+      "main": [
+        [
+          {
+            "node": "11 · PASS lane gate",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "11 · HOLD gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "11 · PASS lane gate": {
+      "main": [
+        [
+          {
+            "node": "12 · Survivor record payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · Survivor record payload": {
+      "main": [
+        [
+          {
+            "node": "12 · Record file content",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "12 · NEEDS_REVIEW gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · NEEDS_REVIEW gate": {
+      "main": [
+        [
+          {
+            "node": "12 · NEEDS_REVIEW endpoint",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · Record file content": {
+      "main": [
+        [
+          {
+            "node": "12 · Read survivor main ref",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · Read survivor main ref": {
+      "main": [
+        [
+          {
+            "node": "12 · Create survivor branch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · Create survivor branch": {
+      "main": [
+        [
+          {
+            "node": "12 · Commit survivor record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · Commit survivor record": {
+      "main": [
+        [
+          {
+            "node": "12 · Open promotion PR",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · Open promotion PR": {
+      "main": [
+        [
+          {
+            "node": "12 · PR created",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · PR created": {
+      "main": [
+        [
+          {
+            "node": "12 · Wait for audit merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · Wait for audit merge": {
+      "main": [
+        [
+          {
+            "node": "12 · Read promotion PR",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · Read promotion PR": {
+      "main": [
+        [
+          {
+            "node": "12 · PR merge state",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · PR merge state": {
+      "main": [
+        [
+          {
+            "node": "12 · PR open gate",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "12 · Merge lane gate",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "12 · NEEDS_REVIEW gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · PR open gate": {
+      "main": [
+        [
+          {
+            "node": "12 · Wait for audit merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · Merge lane gate": {
+      "main": [
+        [
+          {
+            "node": "12 · Read audit reviews",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "12 · Read merged record",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "12 · Merge verification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · Read merged record": {
+      "main": [
+        [
+          {
+            "node": "12 · Merge readback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · Read audit reviews": {
+      "main": [
+        [
+          {
+            "node": "12 · Merge readback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · Merge readback": {
+      "main": [
+        [
+          {
+            "node": "12 · Merge verification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · Merge verification": {
+      "main": [
+        [
+          {
+            "node": "12 · MERGE_VERIFIED lane gate",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "12 · NEEDS_REVIEW gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · MERGE_VERIFIED lane gate": {
+      "main": [
+        [
+          {
+            "node": "12 · Sheets upsert plan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · Sheets upsert plan": {
+      "main": [
+        [
+          {
+            "node": "12 · Sheets upsert decision",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "12 · NEEDS_REVIEW gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · Sheets upsert decision": {
+      "main": [
+        [
+          {
+            "node": "12 · Read registry row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · Read registry row": {
+      "main": [
+        [
+          {
+            "node": "12 · Update registry row",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "12 · Append registry row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · Update registry row": {
+      "main": [
+        [
+          {
+            "node": "12 · Read registry row back",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · Append registry row": {
+      "main": [
+        [
+          {
+            "node": "12 · Read registry row back",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · Read registry row back": {
+      "main": [
+        [
+          {
+            "node": "12 · Sheets write result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · Sheets write result": {
+      "main": [
+        [
+          {
+            "node": "12 · Sheets ACK gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · Sheets ACK gate": {
+      "main": [
+        [
+          {
+            "node": "12 · Sheets RETRY endpoint (bounded, same key)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "12 · Sheets ERROR endpoint",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "12 · SHEETS_ACK lane gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · SHEETS_ACK lane gate": {
+      "main": [
+        [
+          {
+            "node": "12 · Node13 boundary payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · Node13 boundary payload": {
+      "main": [
+        [
+          {
+            "node": "12 · Node13 boundary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "pinData": {},
+  "tags": []
+}
