@@ -324,6 +324,125 @@ def main():
     rc, out = run_forced("research-readback", g10)
     check("T15c forced-command bare verb fails closed", rc == 2, out)
 
+    # ponytail: B1 exact consumed file, not any sibling with matching fields.
+    sroot = Path(tempfile.mkdtemp(prefix="transport-neg-"))
+    sentry, scfg = write_stub_files(sroot)
+    other = json.loads(scfg.read_text())
+    other["candidate"] = {"path": "wrong-consumed-config.md", "git_blob_sha": "d" * 40}
+    scfg.write_text(json.dumps(other))
+    declared = sroot / "declared_config.json"
+    declared.write_text(json.dumps({
+        "candidate": {"path": "demo-candidate.md", "git_blob_sha": "a" * 40},
+        "execution": {"entrypoint": str(sentry)}, "runtime": {"commit": "c" * 40},
+    }, sort_keys=True))
+    code = sentry.read_text()
+    start = code.index("frozen_cfg = {")
+    end = code.index("(out / \"mlruns\"", start)
+    code = code[:start] + "frozen_cfg = json.loads(Path(__file__).with_name(\"effective_config.json\").read_text())\n" + code[end:]
+    sentry.write_text(code)
+    rc, out = run("submit", b64(make_handoff(sroot, sentry, declared)), root=sroot)
+    check("T16a sibling decoy config fails before executing",
+          rc == 2 and "identity mismatch" in out and not list(sroot.glob("n8n-live-*")), out)
+
+    mroot = Path(tempfile.mkdtemp(prefix="transport-neg-"))
+    mentry, mcfg = write_stub_files(mroot)
+    seen = mroot / "execution-marker.txt"
+    mentry.write_text("from pathlib import Path\nPath(" + repr(str(seen)) + ").write_text(\"x\")\n")
+    rc, out = run("submit", b64(make_handoff(mroot, mentry, mcfg)), root=mroot)
+    check("T16b unbound marker never executes",
+          rc == 2 and "identity" in out and not seen.exists()
+          and not list(mroot.glob("n8n-live-*")), out)
+
+    # ponytail: B2 native bytes, not only inventory names.
+    b1, ob1 = golden_submit()
+    (ob1 / "mlruns" / EXP_ID / RUN_ID / "artifacts" / "backtest" / "a.csv").write_text("different\n")
+    rc, out = run("readback", RUN_ID, root=b1)
+    check("T17a tampered native backtest bytes fail closed",
+          rc == 2 and "mismatch" in out, out)
+
+    b2, ob2 = golden_submit()
+    (ob2 / "mlruns" / EXP_ID / RUN_ID / "artifacts" / "backtest" / "unreported.csv").write_text("x\n")
+    rc, out = run("readback", RUN_ID, root=b2)
+    check("T17b unreported native artifact fails closed",
+          rc == 2 and "inventory mismatch" in out, out)
+
+    nroot = Path(tempfile.mkdtemp(prefix="transport-neg-"))
+    nentry, ncfg = write_stub_files(nroot)
+    nentry.write_text(nentry.read_text().replace(
+        "print(json.dumps({\"summary\": {\"ok\": True}, \"mlflow\": readback, \"manifest\": manifest}))",
+        "(out / \"mlruns\" / \"%s\" / \"%s\" / \"meta.yaml\").unlink()\nprint(json.dumps({\"summary\": {\"ok\": True}, \"mlflow\": readback, \"manifest\": manifest}))" % (EXP_ID, RUN_ID)))
+    rc, out = run("submit", b64(make_handoff(nroot, nentry, ncfg)), root=nroot)
+    check("T17c submit without native meta fails before PASS",
+          rc == 2 and "metadata is missing" in out
+          and not list(nroot.glob("n8n-live-*/submit-receipt.json")), out)
+
+    # ponytail: B3 artifact directory root must stay inside its native run.
+    droot, odir = golden_submit()
+    nrun = odir / "mlruns" / EXP_ID / RUN_ID
+    outside = odir / "evidence-outside-native-run"
+    (nrun / "artifacts").rename(outside)
+    (nrun / "artifacts").symlink_to(outside, target_is_directory=True)
+    rc, out = run("readback", RUN_ID, root=droot)
+    check("T18 artifacts dir symlink fails closed", rc == 2, out)
+
+    # ponytail: B4 bounded host-to-fixed-runtime forwarding, isolated.
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("transport_fwd", TRANSPORT)
+    assert _spec is not None and _spec.loader is not None
+    _t = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_t)
+    bad = _t.build_forward_command("evil", RUN_ID)
+    check("T19a forward rejects unknown verb", bad is None)
+    bad = _t.build_forward_command("research-readback", "zz")
+    check("T19b forward rejects bad run id", bad is None)
+    good = _t.build_forward_command("research-readback", RUN_ID)
+    check("T19c forward uses fixed image and python",
+          good is not None and _t.FIXED_IMAGE in good
+          and _t.FIXED_GUEST_PYTHON in good and good[-2:] == ["research-readback", RUN_ID]
+          and not any(";" in a or "|" in a or "$" in a for a in good), str(good))
+    hroot = Path(tempfile.mkdtemp(prefix="transport-fwd-"))
+    hsrc = hroot / "qlib-results"
+    (hsrc / "_validation").mkdir(parents=True)
+    fentry, fcfg = write_stub_files(hsrc / "_validation")
+    # Move stub pair into a temp host source and submit locally there first.
+    rc, out = run("submit", b64(make_handoff(hsrc / "_validation", fentry, fcfg)), root=hsrc / "_validation")
+    check("T19d forward fixture submit", rc == 0, out)
+    fake_bin = hroot / "fakebin" / "container"
+    fake_bin.parent.mkdir(parents=True)
+    seen_fwd = hroot / "forward-seen.json"
+    fake_bin.write_text(
+        "#!/usr/bin/env python3\nimport json,os,sys,subprocess\n"
+        "from pathlib import Path\n"
+        "argv=sys.argv[1:]\n"
+        "Path(r'" + str(seen_fwd) + "').write_text(json.dumps(argv))\n"
+        "assert 'run' in argv, argv\n"
+        "assert '" + _t.FIXED_IMAGE + "' in argv, argv\n"
+        "assert '" + _t.FIXED_GUEST_PYTHON + "' in argv, argv\n"
+        "verb=argv[-2]; arg=argv[-1]\n"
+        "assert verb in ('submit','research-submit','readback','research-readback'), verb\n"
+        "src=[a.split('source=',1)[1].split(',',1)[0] for a in argv if 'target=/results' in a][0]\n"
+        "env=dict(os.environ, RESEARCH_RESULTS_ROOT=src+'/_validation', RESEARCH_FORWARDED='1')\n"
+        "env.pop('SSH_ORIGINAL_COMMAND', None)\n"
+        "p=subprocess.run([sys.executable, r'" + str(TRANSPORT) + "', verb, arg], env=env, capture_output=True, text=True)\n"
+        "sys.stdout.write(p.stdout)\n"
+        "sys.stderr.write(p.stderr)\n"
+        "sys.exit(p.returncode)\n")
+    fake_bin.chmod(0o755)
+    env = dict(os.environ, RESEARCH_CONTAINER_CLI=str(fake_bin),
+               RESEARCH_HOST_RESULTS_SOURCE=str(hsrc),
+               SSH_ORIGINAL_COMMAND="research-readback " + RUN_ID)
+    env.pop("RESEARCH_RESULTS_ROOT", None)
+    env.pop("RESEARCH_FORWARDED", None)
+    proc = subprocess.run([sys.executable, str(TRANSPORT)], env=env,
+                          capture_output=True, text=True, timeout=120)
+    check("T19e host shape forwards to fixed runtime",
+          proc.returncode == 0 and seen_fwd.is_file()
+          and _t.FIXED_IMAGE in seen_fwd.read_text()
+          and _t.FIXED_GUEST_PYTHON in seen_fwd.read_text(), proc.stdout + proc.stderr)
+    back = json.loads(proc.stdout) if proc.returncode == 0 else {}
+    check("T19f forwarded readback is PASS",
+          back.get("node05") == "PASS" and back.get("run_id") == RUN_ID, proc.stdout)
+
     print("ALL DETERMINISTIC CHECKS PASSED")
 
 

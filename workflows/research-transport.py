@@ -10,10 +10,12 @@ field comes from hashes checked here or files the native run wrote.
 ponytail: single-file bridge on purpose. Synchronous subprocess only, one fixed
 results root, one out_dir per frozen executable (a re-submit refuses instead of
 clobbering evidence), single-candidate coverage only. Submit binds the caller
-hashes to the frozen config formal fields before executing; readback verifies
-every manifest entry plus the native run metadata/params/metrics/artifacts and
-keeps run/experiment identity across stdout, disk, receipt, and native. No-argv
-runs only dispatch a strict SSH_ORIGINAL_COMMAND (one verb, one arg). Ceilings:
+hashes to the frozen config formal fields and the exact consumed file before
+executing; readback verifies every manifest entry plus the native run
+metadata/params/metrics/artifact bytes and keeps run/experiment identity
+across stdout, disk, receipt, and native. No-argv runs only dispatch a strict
+SSH_ORIGINAL_COMMAND (one verb, one arg), forwarding host launches with no
+/results to the fixed container runtime. Ceilings:
 RESULTS_ROOT holds at most a few hundred run dirs (readback scans one filename
 per dir); SUBMIT_TIMEOUT bounds one native run; MAX_ARTIFACTS bounds one native
 inventory walk; run_inputs/cost ride along as declared facts and never steer
@@ -27,6 +29,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -76,6 +79,20 @@ FORCED_VERBS = ("submit", "research-submit", "readback", "research-readback")
 # ponytail: readback actually reads these four files, so the manifest must
 # cover them. Other manifest entries are verified when listed, never assumed.
 REQUIRED_MANIFEST = ("mlflow_readback.json", "summary.json", "signals.csv", "events.csv")
+
+# ponytail: bounded host-to-fixed-runtime forwarding. The host key runs this
+# file with no argv; when the guest /results root is missing on the host but
+# the fixed container runtime exists, forward the same bounded verb/arg to
+# that fixed runtime. Never accept arbitrary shell/image/argv here.
+FIXED_CONTAINER = "qlib-run"
+FIXED_GUEST_PYTHON = "/opt/venv/bin/python"
+FIXED_IMAGE = "qlib:main-bee09f23-arm64"
+FIXED_IMAGE_DIGEST = "sha256:8bee2a8beed672b17096ad44db5064dbaadcafe124c2ee989cd03b47683355b9"
+HOST_RESULTS_SOURCE = "/Volumes/ExpansionDrive/qlib-results"
+
+# ponytail: native backtest copies must equal the verified root evidence
+# bytes. Production entry logs these root files under artifacts/backtest.
+REQUIRED_BACKTEST_COPY = ("events.csv", "signals.csv", "summary.json", "portfolio_report.csv")
 
 
 def fail(reason):
@@ -307,6 +324,75 @@ def check_frozen_binding(obj):
         return "config/execution identity is not resolvable"
     if not same_dir:
         return "config/execution identity mismatch"
+    # ponytail: bind the exact consumed file, not any sibling with matching
+    # fields. The native entry reads <entry_dir>/effective_config.json.
+    if Path(obj["effective_config_ref"]).name != "effective_config.json":
+        return "config/execution identity mismatch"
+    try:
+        want = os.path.realpath(
+            str(Path(os.path.realpath(obj["entrypoint_ref"])).parent / "effective_config.json")
+        )
+        got = os.path.realpath(obj["effective_config_ref"])
+    except (OSError, ValueError):
+        return "config/execution identity is not resolvable"
+    if want != got:
+        return "config/execution identity mismatch"
+    # ponytail: a matching declaration must not authorize a program that
+    # never consumes the config. Require the entry to reference the frozen
+    # config contract and the fixed out dir before any execution.
+    try:
+        entry_bytes = Path(obj["entrypoint_ref"]).read_bytes()
+    except OSError:
+        return "entrypoint is not readable"
+    if b"effective_config.json" not in entry_bytes or b"QLIB_OUT_DIR" not in entry_bytes:
+        return "config/execution identity mismatch"
+    return None
+
+
+def check_submit_native(out_dir, run_id, experiment_id, disk):
+    """Share readback native identity checks before submit reports PASS.
+
+    A child that deletes meta.yaml or drifts params/metrics must fail here,
+    not only on later readback. Return None when clean, else a reason.
+    """
+    run_ref = out_dir / "mlruns" / experiment_id / run_id
+    try:
+        if not contained(str(out_dir), str(run_ref)) or not run_ref.is_dir():
+            return "mlflow run is missing"
+    except OSError:
+        return "mlflow run is missing"
+    meta_bytes = read_contained(run_ref, "meta.yaml")
+    if meta_bytes is None:
+        return "native run metadata is missing"
+    try:
+        native_run, native_exp, native_status = parse_run_meta(meta_bytes.decode("utf-8"))
+    except UnicodeDecodeError:
+        return "native run metadata is missing"
+    if native_run != run_id or native_exp != experiment_id:
+        return "native run identity mismatch"
+    if native_status != "3":
+        return "native run is not FINISHED"
+    native_params = read_native_params(run_ref)
+    disk_params = disk.get("params") or {}
+    if native_params is None or native_params != disk_params:
+        return "native params mismatch"
+    native_metrics = read_native_metrics(run_ref)
+    disk_metrics = disk.get("metrics") or {}
+    if native_metrics is None or set(native_metrics) != set(disk_metrics):
+        return "native metrics mismatch"
+    for key, claimed in disk_metrics.items():
+        try:
+            same = float(native_metrics[key]) == float(claimed)
+        except (TypeError, ValueError, KeyError):
+            same = False
+        if not same:
+            return "native metrics mismatch"
+    inventory = artifact_inventory(run_ref)
+    disk_artifacts = disk.get("artifact_names") or []
+    if inventory is None or not isinstance(disk_artifacts, list):
+        return "native artifact inventory mismatch"
+    if set(disk_artifacts) != set(inventory):
+        return "native artifact inventory mismatch"
     return None
 
 
@@ -374,6 +460,12 @@ def cmd_submit(payload_b64):
         return fail("native run identity mismatch")
     if str(disk.get("experiment_id")) != experiment_id:
         return fail("native experiment identity mismatch")
+    reason = check_submit_native(out_dir, run_id, experiment_id, disk)
+    if reason is not None:
+        return fail(reason)
+    native_hashes = native_artifact_hashes(out_dir / "mlruns" / experiment_id / run_id)
+    if native_hashes is None:
+        return fail("native artifact inventory mismatch")
     cost_declared = obj.get("research_cost_model") is not None or obj.get("run_inputs") is not None
     receipt = {
         "candidate_path": obj["candidate_path"],
@@ -388,6 +480,7 @@ def cmd_submit(payload_b64):
         "experiment_id": experiment_id,
         "cost_declared": bool(cost_declared),
         "evidence_refs": obj.get("evidence_refs") or {},
+        "native_artifact_sha256": native_hashes,
     }
     try:
         (out_dir / "submit-receipt.json").write_text(
@@ -507,6 +600,17 @@ def read_native_metrics(run_ref):
 def artifact_inventory(run_ref):
     """List native artifact paths, or None on any symlink/escape/overflow."""
     adir = run_ref / "artifacts"
+    # ponytail: anchor the artifact directory root itself. Descendant checks
+    # alone resolve a relocated directory as a new trusted base.
+    try:
+        if adir.is_symlink():
+            return None
+        if not contained(str(run_ref), str(adir)):
+            return None
+        if not adir.is_dir():
+            return None
+    except OSError:
+        return None
     names = []
     try:
         paths = sorted(adir.rglob("*"))
@@ -518,10 +622,45 @@ def artifact_inventory(run_ref):
         if path.is_file():
             if not contained(str(adir), str(path)):
                 return None
-            names.append(path.relative_to(adir).as_posix())
+            try:
+                names.append(path.relative_to(adir).as_posix())
+            except ValueError:
+                return None
             if len(names) > MAX_ARTIFACTS:
                 return None
     return names
+
+
+def native_artifact_hashes(run_ref):
+    """Map each native artifact path to its sha256, or None when unverifiable."""
+    adir = run_ref / "artifacts"
+    try:
+        if adir.is_symlink() or not contained(str(run_ref), str(adir)):
+            return None
+    except OSError:
+        return None
+    out = {}
+    try:
+        paths = sorted(adir.rglob("*"))
+    except OSError:
+        return None
+    for path in paths:
+        if path.is_symlink():
+            return None
+        if path.is_file():
+            if not contained(str(adir), str(path)):
+                return None
+            try:
+                rel = path.relative_to(adir).as_posix()
+            except ValueError:
+                return None
+            digest = file_sha256(str(path))
+            if digest is None:
+                return None
+            out[rel] = digest
+            if len(out) > MAX_ARTIFACTS:
+                return None
+    return out
 
 
 def cmd_readback(run_id):
@@ -633,7 +772,7 @@ def cmd_readback(run_id):
         if not same:
             return fail("native metrics mismatch")
     inventory = artifact_inventory(run_ref)
-    if inventory is None or not set(artifacts) <= set(inventory):
+    if inventory is None or set(artifacts) != set(inventory):
         return fail("native artifact inventory mismatch")
     repro = [a for a in artifacts if isinstance(a, str) and a.startswith("repro/")]
     configs = [a for a in repro if a.endswith("/effective_config.json")]
@@ -675,6 +814,56 @@ def cmd_readback(run_id):
     cfg_digest = file_sha256(str(repro_cfg_path))
     if cfg_digest is None or cfg_digest != submit.get("effective_config_sha256"):
         return fail("repro/config identity mismatch")
+    # ponytail: verify native artifact bytes, not only inventory names. New
+    # submits record hashes; legacy receipts without the field still verify
+    # via root-copy equality and provider binding below.
+    recorded = submit.get("native_artifact_sha256")
+    if isinstance(recorded, dict):
+        current = native_artifact_hashes(run_ref)
+        if current is None or current != recorded:
+            return fail("native artifact bytes mismatch")
+    # ponytail: each live native backtest copy must equal its verified root
+    # file. Stubs carry no data/strategy section and skip this; their bytes
+    # are still bound by the recorded hashes above.
+    if isinstance(repro_cfg, dict) and ("data" in repro_cfg or "strategy" in repro_cfg):
+        for name in REQUIRED_BACKTEST_COPY:
+            root_bytes = read_contained(real_out, name)
+            native_bytes = read_contained(run_ref / "artifacts" / "backtest", name)
+            if root_bytes is None and native_bytes is None:
+                continue
+            if root_bytes is None or native_bytes is None:
+                return fail("native backtest bytes mismatch: " + name)
+            if root_bytes != native_bytes:
+                return fail("native backtest bytes mismatch: " + name)
+    # ponytail: bind the provider manifest to the frozen config digest.
+    data = repro_cfg.get("data") if isinstance(repro_cfg, dict) else None
+    if isinstance(data, dict) and "provider_manifest_sha256" in data:
+        if len(providers) != 1:
+            return fail("repro/provider identity mismatch")
+        pm_bytes = read_contained(run_ref / "artifacts", providers[0])
+        if pm_bytes is None:
+            return fail("repro/provider identity mismatch")
+        try:
+            pm_obj = json.loads(pm_bytes.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return fail("repro/provider identity mismatch")
+        try:
+            compact = json.dumps(pm_obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        except (TypeError, ValueError):
+            return fail("repro/provider identity mismatch")
+        if hashlib.sha256(compact).hexdigest() != data.get("provider_manifest_sha256"):
+            return fail("repro/provider identity mismatch")
+        want_count = data.get("provider_file_count")
+        if not isinstance(want_count, int):
+            return fail("repro/provider identity mismatch")
+        if not isinstance(pm_obj, list) or len(pm_obj) != want_count:
+            return fail("repro/provider identity mismatch")
+    # ponytail: live runs must keep portfolio and trade evidence. Stubs have
+    # no data/strategy section and skip this; live configs carry it.
+    if isinstance(repro_cfg, dict) and ("data" in repro_cfg or "strategy" in repro_cfg):
+        for name in ("portfolio_report.csv", "trade_indicators.csv"):
+            if name not in manifest:
+                return fail("required evidence is missing from the manifest: " + name)
     refs = {
         "candidate": CANDIDATE_BLOB_API + str(submit["candidate_blob_sha"]),
         "mlflow_run": str(run_ref),
@@ -688,7 +877,15 @@ def cmd_readback(run_id):
     for key, ref in refs.items():
         if key == "candidate":
             continue
-        if not contained(str(real_out), ref) or not Path(ref).exists():
+        # ponytail: native refs must stay inside the native run, not merely
+        # inside the outer out_dir. A symlinked artifacts dir stays inside
+        # out_dir while leaving its native run.
+        want_base = (
+            str(run_ref)
+            if key in ("mlflow_run", "effective_config", "entrypoint", "provider_manifest")
+            else str(real_out)
+        )
+        if not contained(want_base, ref) or not Path(ref).exists():
             return fail("evidence reference is missing")
     blob_sha = str(submit["candidate_blob_sha"])
     candidate_ok = HEX40.match(blob_sha) is not None
@@ -786,6 +983,124 @@ def parse_forced_command(value):
     return (verb, arg), None
 
 
+def resolve_container_cli():
+    """Return the fixed container CLI path, or None when unavailable."""
+    override = os.environ.get("RESEARCH_CONTAINER_CLI")
+    if override:
+        try:
+            p = Path(override)
+            if p.is_file() and os.access(p, os.X_OK):
+                return str(p)
+        except OSError:
+            pass
+        return None
+    for cand in ("/usr/local/bin/container",):
+        try:
+            if Path(cand).is_file() and os.access(cand, os.X_OK):
+                return cand
+        except OSError:
+            continue
+    return shutil.which("container")
+
+
+def host_results_source():
+    """Return the host dir backing guest /results, or None when absent."""
+    override = os.environ.get("RESEARCH_HOST_RESULTS_SOURCE")
+    if override:
+        try:
+            if Path(override).is_dir():
+                return override
+        except OSError:
+            pass
+        return None
+    try:
+        if Path(HOST_RESULTS_SOURCE).is_dir():
+            return HOST_RESULTS_SOURCE
+    except OSError:
+        pass
+    return None
+
+
+def should_forward_host():
+    """True when a no-argv host launch should use the fixed runtime.
+
+    Only for the default guest root missing on the host. Temp-root tests
+    stay local; inside the fixed runtime /results exists so no forwarding.
+    """
+    if "RESEARCH_RESULTS_ROOT" in os.environ:
+        return False
+    if os.environ.get("RESEARCH_FORWARDED") == "1":
+        return False
+    try:
+        if Path("/results/_validation").is_dir():
+            return False
+    except OSError:
+        pass
+    if resolve_container_cli() is None:
+        return False
+    if host_results_source() is None:
+        return False
+    return True
+
+
+def build_forward_command(verb, arg):
+    """Build the bounded fixed-runtime command, or None when invalid.
+
+    Fixed image/python/mounts only; the sole variables are the already
+    validated verb and one bounded payload/run id. No shell is used.
+    """
+    if verb not in FORCED_VERBS:
+        return None
+    if verb in ("readback", "research-readback"):
+        if not RUNID.match(arg or ""):
+            return None
+    else:
+        if not isinstance(arg, str) or len(arg) > 65536:
+            return None
+        if re.fullmatch(r"[A-Za-z0-9+/=]+", arg) is None:
+            return None
+    cli = resolve_container_cli()
+    src = host_results_source()
+    if cli is None or src is None:
+        return None
+    audit_src = str(Path(__file__).resolve().parent)
+    if verb in ("readback", "research-readback"):
+        return [
+            cli, "run", "--read-only",
+            "--mount", "type=bind,source=" + src + ",target=/results,readonly",
+            "--mount", "type=bind,source=" + audit_src + ",target=/audit,readonly",
+            FIXED_IMAGE, FIXED_GUEST_PYTHON,
+            "/audit/research-transport.py", verb, arg,
+        ]
+    return [
+        cli, "run",
+        "--mount", "type=bind,source=" + src + ",target=/results",
+        "--mount", "type=bind,source=" + audit_src + ",target=/audit,readonly",
+        FIXED_IMAGE, FIXED_GUEST_PYTHON,
+        "/audit/research-transport.py", verb, arg,
+    ]
+
+
+def forward_via_container(verb, arg):
+    """Forward one bounded host command to the fixed runtime. No shell."""
+    cmd = build_forward_command(verb, arg)
+    if cmd is None:
+        return fail("forced-command input is missing or invalid")
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=SUBMIT_TIMEOUT)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return fail("fixed runtime is not reachable: " + str(exc)[:200])
+    if proc.stdout:
+        print(proc.stdout, end="" if proc.stdout.endswith("\n") else "\n")
+    if proc.stderr:
+        print(proc.stderr, end="" if proc.stderr.endswith("\n") else "\n", file=sys.stderr)
+    if proc.returncode == 0:
+        return 0
+    if proc.returncode == 2:
+        return 2
+    return fail("fixed runtime execution failed")
+
+
 def main(argv):
     """Parse args and dispatch to one subcommand."""
     if not argv:
@@ -794,6 +1109,9 @@ def main(argv):
         if parsed is None:
             return fail(reason or "forced-command input is missing or invalid")
         verb, arg = parsed
+        # ponytail: host launches with no /results use the fixed runtime.
+        if should_forward_host():
+            return forward_via_container(verb, arg)
         if verb in ("submit", "research-submit"):
             return cmd_submit(arg)
         return cmd_readback(arg)
