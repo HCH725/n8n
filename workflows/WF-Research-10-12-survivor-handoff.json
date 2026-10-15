@@ -1,0 +1,926 @@
+{
+  "id": "WF1012SurvivorHandoff",
+  "name": "Quant WF-Research · survivor handoff (10–12)",
+  "nodes": [
+    {
+      "id": "r1012-01",
+      "name": "10 · Manual trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "r1012-02",
+      "name": "10 · 09 FINALIZE input fixture",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        160
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// FROZEN fixture. It represents the Node09 FINALIZE output of PR #12\n// (WF-Research-06-09). It is the Node10 boundary input. A live wiring replaces\n// this node after both workflows are merged. It carries the IS selection only.\n// It holds no OOS result.\nconst runKey = 'b7c1e0d4a9f24c8fb3e6d5a10c72f984';\nconst runId = '3ad9f0c4b1e2487fa5c6d87013be92f4';\nconst analysisHash = 'a7d2f6b8c4e0193d5a6f7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e';\nconst noteRef = 'quant/research-loop/' + runKey + '.md';\nconst analysis = {\n  source_run_key: runKey,\n  source_run_id: runId,\n  period_basis: 'IS',\n  previous_hypothesis_ref: null,\n  expectation_vs_actual: [\n    { condition: 'drawdown band', expectation: 'max_drawdown <= 0.20', actual: 0.18, verdict: 'MET' }\n  ],\n  lessons: ['The 20/10 breakout keeps the drawdown inside the declared band.'],\n  worth_retesting: false,\n  analysis_ref: 'hermes-analysis://research-loop/' + runKey + '/round-0',\n  analysis_hash: analysisHash,\n  proposal: { source_run_key: runKey, change_set: null }\n};\nreturn [{\n  json: {\n    payload_kind: 'node09_finalize',\n    finalize: {\n      run_key: runKey,\n      run_id: runId,\n      round_index: 0,\n      period_basis: 'IS',\n      metrics_summary: { sharpe: 1.12, max_drawdown: 0.18, trades: 214 },\n      metrics_ref: 'mlflow://qlib/runs/' + runKey + '/metrics',\n      evidence_refs: {\n        run_manifest: 'mlflow://qlib/runs/' + runKey + '/manifest.json',\n        analysis_source: 'hermes-analysis://research-loop/' + runKey + '/round-0'\n      },\n      completed_runs: [{ round_index: 0, run_key: runKey, status: 'IS_SUCCESS' }],\n      analysis: analysis,\n      wiki_ack: { status: 'ACK', action: 'CREATED', note_ref: noteRef, run_key: runKey, analysis_hash: analysisHash },\n      change_set: null,\n      route: 'FINALIZE',\n      decision: {\n        selected_run_key: runKey,\n        selected_run_id: runId,\n        selected_round_index: 0,\n        selected_analysis_ref: analysis.analysis_ref,\n        selected_analysis_hash: analysisHash,\n        selected_wiki_note_ref: noteRef,\n        period_basis: 'IS',\n        finalize_reason: 'WORTH_RETESTING_FALSE'\n      }\n    }\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "r1012-03",
+      "name": "10 · frozen IS snapshot fixture",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// FROZEN fixture. It represents the existing upstream readback of the frozen IS\n// run manifest: identity, config, data, window and cost snapshots. A live\n// readback over the existing 01-05 path replaces this node. It carries no OOS\n// result. The OOS window and the OOS run key are predefined here.\nreturn [{\n  json: {\n    payload_kind: 'frozen_is_snapshot',\n    snapshot: {\n      readback_ref: 'mlflow://qlib/runs/b7c1e0d4a9f24c8fb3e6d5a10c72f984/manifest.json',\n      run_key: 'b7c1e0d4a9f24c8fb3e6d5a10c72f984',\n      run_id: '3ad9f0c4b1e2487fa5c6d87013be92f4',\n      source: {\n        family_id: 'donchian-breakout',\n        family_name: 'Donchian breakout',\n        source_strategy_id: 'alpha-donchian-20-10',\n        source_strategy_version: 'v1',\n        source_repository_url: 'https://github.com/HCH725/alpha-strategy-research',\n        source_strategy_path: 'strategies/donchian-20-10.md',\n        source_git_commit: '9a1b2c3d4e5f60718293a4b5c6d7e8f901234567',\n        change_note: 'Exit window tightened to 15 after the Node06-09 IS loop.'\n      },\n      strategy_sha: '1f0a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8',\n      frozen_version_sha: '2a1b3c4d5e6f70819a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f7081',\n      effective_config_hash: '3b2c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a',\n      config_snapshot: {\n        uri: 'mlflow://qlib/runs/b7c1e0d4a9f24c8fb3e6d5a10c72f984/artifacts/frozen_config.json',\n        sha256: '4c3d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b'\n      },\n      data_snapshot: {\n        uri: 'research-data://klines/2022-01-01_2025-06-30/day',\n        sha256: '5d4e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c',\n        dataset_version: 'kline-day-v3'\n      },\n      is_window: { start_utc: '2022-01-01', end_utc: '2024-12-31', window_hash: '6e5f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d' },\n      oos_plan: {\n        start_utc: '2025-01-01',\n        end_utc: '2025-06-30',\n        window_hash: '7f608192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e',\n        oos_run_key: 'c8d9e0f1a2b3c4d5e6f708192a3b4c5d'\n      },\n      cost_model: {\n        uri: 'mlflow://qlib/cost-models/futures-taker-v2.json',\n        sha256: '8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f',\n        fee_rate_bps: 4,\n        slippage_bps: 2,\n        funding_model: 'modelled_v2'\n      },\n      runtime: { qlib_engine_version: 'pyqlib-0.9.7', runtime_git_commit_or_image: 'qlib-arm64-container:2026-10-01' },\n      research_refs: {\n        coverage_42cell: {\n          planned_ref: 'research-nav://42cell/donchian/planned.json',\n          tested_ref: 'research-nav://42cell/donchian/tested.json',\n          excluded_ref: 'research-nav://42cell/donchian/excluded.json'\n        },\n        wiki_refs: ['quant/research-loop/b7c1e0d4a9f24c8fb3e6d5a10c72f984.md']\n      },\n      limitations: [\n        'Funding uses the frozen modelled series. It is not live-verified.',\n        'The 42-cell coverage excludes the trailing-stop family by plan.'\n      ]\n    }\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "r1012-04",
+      "name": "10 · Freeze & OOS request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        230
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Node10 freezes the IS-selected identity, config, data, window and cost\n// snapshots. It emits the single one-time OOS request. No LLM runs here. No OOS\n// result is read. The version decision uses the IS round series only.\nconst inItems = $input.all().map((entry) => entry.json);\nconst isText = (v) => typeof v === 'string' && v.length > 0;\nconst isHex = (v, n) => typeof v === 'string' && v.length === n && /^[a-f0-9]+$/.test(v);\nconst stop = (reason) => [{ json: { payload_kind: 'node10_review', stage: '10', route: 'NEEDS_REVIEW', reason: reason } }];\nconst finalizeItem = inItems.filter((row) => row && row.payload_kind === 'node09_finalize')[0];\nconst snapshotItem = inItems.filter((row) => row && row.payload_kind === 'frozen_is_snapshot')[0];\nif (!finalizeItem) { return stop('finalize_input_missing'); }\nif (!snapshotItem) { return stop('frozen_snapshot_input_missing'); }\nconst f = finalizeItem.finalize;\nconst s = snapshotItem.snapshot;\nif (!f || typeof f !== 'object') { return stop('finalize_payload_missing'); }\nif (!s || typeof s !== 'object') { return stop('snapshot_payload_missing'); }\nif (f.route !== 'FINALIZE') { return stop('finalize_route_not_finalize'); }\nconst d = f.decision || {};\nif (d.period_basis !== 'IS') { return stop('selection_basis_not_is'); }\nif (!isHex(d.selected_run_key, 32)) { return stop('selected_run_key_bad_shape'); }\nif (!isHex(d.selected_run_id, 32)) { return stop('selected_run_id_bad_shape'); }\nif (!isHex(d.selected_analysis_hash, 64)) { return stop('selected_analysis_hash_bad_shape'); }\nif (!isText(d.selected_analysis_ref) || !isText(d.selected_wiki_note_ref)) { return stop('selected_refs_missing'); }\nconst rounds = Array.isArray(f.completed_runs) ? f.completed_runs : [];\nif (rounds.length === 0) { return stop('completed_runs_empty'); }\nfor (let i = 0; i < rounds.length; i += 1) {\n  const row = rounds[i];\n  if (!row || row.round_index !== i) { return stop('round_series_not_contiguous'); }\n  if (row.status !== 'IS_SUCCESS') { return stop('round_series_not_is_success'); }\n  if (!isHex(row.run_key, 32)) { return stop('round_run_key_bad_shape'); }\n}\nconst head = rounds[rounds.length - 1];\nif (head.run_key !== d.selected_run_key) { return stop('selected_run_not_is_head'); }\nif (head.round_index !== d.selected_round_index) { return stop('selected_round_mismatch'); }\nif (f.analysis && f.analysis.analysis_hash !== d.selected_analysis_hash) { return stop('selected_analysis_hash_mismatch'); }\nif (f.wiki_ack && f.wiki_ack.note_ref !== d.selected_wiki_note_ref) { return stop('selected_wiki_note_mismatch'); }\n\n// The frozen snapshot must describe the same selected IS run.\nif (s.run_key !== d.selected_run_key || s.run_id !== d.selected_run_id) { return stop('snapshot_identity_mismatch'); }\nif (!isHex(s.strategy_sha, 64)) { return stop('strategy_sha_bad_shape'); }\nif (!isHex(s.frozen_version_sha, 64)) { return stop('frozen_version_sha_bad_shape'); }\nif (!isHex(s.effective_config_hash, 64)) { return stop('effective_config_hash_bad_shape'); }\nif (!s.config_snapshot || !isHex(s.config_snapshot.sha256, 64) || !isText(s.config_snapshot.uri)) { return stop('config_snapshot_incomplete'); }\nif (!s.data_snapshot || !isHex(s.data_snapshot.sha256, 64) || !isText(s.data_snapshot.uri)) { return stop('data_snapshot_incomplete'); }\nif (!s.cost_model || !isHex(s.cost_model.sha256, 64) || !isText(s.cost_model.uri)) { return stop('cost_model_incomplete'); }\nif (!s.runtime || !isText(s.runtime.qlib_engine_version)) { return stop('runtime_snapshot_incomplete'); }\nif (!s.source || !isText(s.source.source_strategy_id) || !/^[a-f0-9]{40}$/.test(String(s.source.source_git_commit || ''))) { return stop('source_provenance_incomplete'); }\nconst windowOk = (w) => w && isText(w.start_utc) && isText(w.end_utc) && isHex(w.window_hash, 64);\nif (!windowOk(s.is_window)) { return stop('is_window_snapshot_incomplete'); }\nif (!windowOk(s.oos_plan)) { return stop('oos_window_not_predefined'); }\nif (!isHex(s.oos_plan.oos_run_key, 32)) { return stop('oos_run_key_bad_shape'); }\nconst stamp = (v) => Date.parse(v);\nif (!(stamp(s.is_window.start_utc) < stamp(s.is_window.end_utc))) { return stop('is_window_bad_period'); }\nif (!(stamp(s.oos_plan.start_utc) > stamp(s.is_window.end_utc))) { return stop('oos_window_overlaps_is'); }\nif (s.oos_plan.window_hash === s.is_window.window_hash) { return stop('oos_window_hash_reused'); }\nif (s.oos_plan.oos_run_key === d.selected_run_key) { return stop('oos_run_key_not_unique'); }\nfor (const row of rounds) {\n  if (row.run_key === s.oos_plan.oos_run_key) { return stop('oos_run_key_not_unique'); }\n}\n// No OOS result may influence the selection.\nconst blob = JSON.stringify(f) + JSON.stringify(s);\nif (/\"(oos_metrics|oos_result|oos_equity|oos_trades|oos_returns|oos_fills)\"/.test(blob)) { return stop('oos_result_material_in_input'); }\n\nconst identity = {\n  best_is_run_key: d.selected_run_key,\n  best_is_run_id: d.selected_run_id,\n  round_index: d.selected_round_index,\n  analysis_ref: d.selected_analysis_ref,\n  analysis_hash: d.selected_analysis_hash,\n  wiki_note_ref: d.selected_wiki_note_ref,\n  finalize_reason: d.finalize_reason\n};\nconst freeze = {\n  frozen_version_sha: s.frozen_version_sha,\n  effective_config_hash: s.effective_config_hash,\n  strategy_sha: s.strategy_sha,\n  source: s.source,\n  config_snapshot: s.config_snapshot,\n  data_snapshot: s.data_snapshot,\n  is_window: s.is_window,\n  oos_plan: s.oos_plan,\n  cost_model: s.cost_model,\n  runtime: s.runtime,\n  research_refs: s.research_refs,\n  limitations: s.limitations\n};\nconst oos_request = {\n  best_is_run_key: d.selected_run_key,\n  frozen_version_sha: s.frozen_version_sha,\n  effective_config_hash: s.effective_config_hash,\n  period_basis: 'OOS',\n  window_hash: s.oos_plan.window_hash,\n  parent_is_run_key: d.selected_run_key,\n  oos_run_key: s.oos_plan.oos_run_key,\n  holdout_policy: 'ONE_TIME_NO_RETUNE'\n};\nreturn [{ json: {\n  payload_kind: 'oos_request',\n  stage: '10',\n  identity: identity,\n  freeze: freeze,\n  oos_request: oos_request,\n  route: 'OOS_REQUEST'\n} }];\n"
+      }
+    },
+    {
+      "id": "r1012-05",
+      "name": "10 · OOS_REQUEST gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        860,
+        160
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $input.all().filter((entry) => entry.json.route === 'OOS_REQUEST');\n"
+      }
+    },
+    {
+      "id": "r1012-06",
+      "name": "10 · OOS_TO_EXISTING_04 boundary",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1080,
+        160
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "r1012-07",
+      "name": "05 · OOS_READY fixture/re-entry",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        160
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Node10 hands the one-time OOS request to this boundary. The existing 04/05\n// execution is not wired here and is not modified. This fixture represents the\n// OOS_READY reply of the existing 05 readback. A live readback replaces it.\nconst x = $input.first().json;\nconst request = x.oos_request;\nconst freeze = x.freeze;\nreturn [{ json: Object.assign({}, x, {\n  oos_ready: {\n    oos_run_key: request.oos_run_key,\n    oos_run_id: 'd9e0f1a2b3c4d5e6f708192a3b4c5d6e',\n    period_basis: 'OOS',\n    window_hash: request.window_hash,\n    frozen_version_sha: request.frozen_version_sha,\n    effective_config_hash: request.effective_config_hash,\n    strategy_sha: freeze.strategy_sha,\n    data_snapshot_sha256: freeze.data_snapshot.sha256,\n    oos_attempt_index: 1,\n    retune_performed: false,\n    holdout_policy: request.holdout_policy,\n    manifest_complete: true,\n    metrics: {\n      cagr_pct: 14.2,\n      sharpe: 1.21,\n      max_drawdown_pct: 19.0,\n      max_drawdown_definition: 'peak_to_trough_net',\n      trades: 128,\n      net_return_pct: 14.2,\n      win_rate_pct: 48.4,\n      profit_factor: 1.62\n    },\n    evaluation_period: { start_utc: freeze.oos_plan.start_utc, end_utc: freeze.oos_plan.end_utc },\n    cost_model_applied: {\n      fee_rate_bps: freeze.cost_model.fee_rate_bps,\n      slippage_bps: freeze.cost_model.slippage_bps,\n      funding: 'modelled'\n    },\n    evidence_refs: {\n      oos_manifest: 'mlflow://qlib/runs/' + request.oos_run_key + '/manifest.json',\n      metrics: 'mlflow://qlib/runs/' + request.oos_run_key + '/metrics',\n      portfolio_report: 'mlflow://qlib/runs/' + request.oos_run_key + '/portfolio_report',\n      trades: 'mlflow://qlib/runs/' + request.oos_run_key + '/trades',\n      equity: 'mlflow://qlib/runs/' + request.oos_run_key + '/equity'\n    },\n    runtime: freeze.runtime\n  },\n  route: 'OOS_READY'\n}) }];\n"
+      }
+    },
+    {
+      "id": "r1012-08",
+      "name": "10 · OOS_READY gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1520,
+        160
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Node10 re-entry gate. It validates the OOS_READY reply against the frozen\n// request before Node11 evaluates. An incomplete reply or one identity mismatch\n// is a review item. The workflow never sends this state back to Nodes 06-09.\nconst x = $input.first().json;\nconst isText = (v) => typeof v === 'string' && v.length > 0;\nconst isHex = (v, n) => typeof v === 'string' && v.length === n && /^[a-f0-9]+$/.test(v);\nconst stop = (reason) => [{ json: Object.assign({}, x, { route: 'NEEDS_REVIEW', reason: reason }) }];\nif (x.route === 'NEEDS_REVIEW') { return [{ json: x }]; }\nif (x.route !== 'OOS_READY') { return stop('oos_boundary_route_not_ready:' + x.route); }\nconst r = x.oos_request || {};\nconst o = x.oos_ready || {};\nconst freeze = x.freeze || {};\nconst missing = [];\nif (!isHex(o.oos_run_key, 32)) { missing.push('oos_run_key'); }\nif (!isHex(o.oos_run_id, 32)) { missing.push('oos_run_id'); }\nif (!isHex(o.window_hash, 64)) { missing.push('window_hash'); }\nif (!isHex(o.frozen_version_sha, 64)) { missing.push('frozen_version_sha'); }\nif (!isHex(o.effective_config_hash, 64)) { missing.push('effective_config_hash'); }\nif (!isHex(o.strategy_sha, 64)) { missing.push('strategy_sha'); }\nif (!isHex(o.data_snapshot_sha256, 64)) { missing.push('data_snapshot_sha256'); }\nif (!o.metrics || typeof o.metrics !== 'object') { missing.push('metrics'); }\nif (!o.evaluation_period || !isText(o.evaluation_period.start_utc) || !isText(o.evaluation_period.end_utc)) { missing.push('evaluation_period'); }\nif (!o.evidence_refs || typeof o.evidence_refs !== 'object') { missing.push('evidence_refs'); }\nif (!o.cost_model_applied || typeof o.cost_model_applied !== 'object') { missing.push('cost_model_applied'); }\nif (!o.runtime || typeof o.runtime !== 'object') { missing.push('runtime'); }\nif (missing.length > 0) { return stop('oos_ready_incomplete:' + missing.join(',')); }\nif (o.manifest_complete !== true) { return stop('oos_manifest_incomplete'); }\nif (o.period_basis !== 'OOS') { return stop('oos_period_basis_mismatch'); }\nif (o.oos_run_key !== r.oos_run_key) { return stop('oos_run_key_mismatch'); }\nif (o.window_hash !== r.window_hash) { return stop('oos_window_hash_mismatch'); }\nif (o.frozen_version_sha !== r.frozen_version_sha) { return stop('frozen_version_sha_mismatch'); }\nif (o.effective_config_hash !== r.effective_config_hash) { return stop('effective_config_hash_mismatch'); }\nif (o.strategy_sha !== freeze.strategy_sha) { return stop('strategy_sha_mismatch'); }\nif (o.data_snapshot_sha256 !== (freeze.data_snapshot || {}).sha256) { return stop('data_snapshot_mismatch'); }\nif (o.cost_model_applied.fee_rate_bps !== (freeze.cost_model || {}).fee_rate_bps) { return stop('cost_model_fee_mismatch'); }\nif (o.cost_model_applied.slippage_bps !== (freeze.cost_model || {}).slippage_bps) { return stop('cost_model_slippage_mismatch'); }\nif (o.oos_attempt_index !== 1) { return stop('oos_not_one_time_attempt_1'); }\nif (o.retune_performed !== false) { return stop('oos_retune_forbidden'); }\nif (o.holdout_policy !== 'ONE_TIME_NO_RETUNE') { return stop('oos_holdout_policy_mismatch'); }\nreturn [{ json: Object.assign({}, x, { route: 'OOS_READY_OK' }) }];\n"
+      }
+    },
+    {
+      "id": "r1012-09",
+      "name": "10 · OOS_READY lane gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1740,
+        100
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $input.all().filter((entry) => entry.json.route === 'OOS_READY_OK');\n"
+      }
+    },
+    {
+      "id": "r1012-10",
+      "name": "10 · NEEDS_REVIEW gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        860,
+        380
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $input.all().filter((entry) => entry.json.route === 'NEEDS_REVIEW');\n"
+      }
+    },
+    {
+      "id": "r1012-11",
+      "name": "10 · NEEDS_REVIEW endpoint",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1080,
+        380
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "r1012-12",
+      "name": "11 · promotion policy & identity boundary fixture",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        520
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Boundary fixture. It represents a fresh read of the authoritative promotion\n// policy: the HCH725/research-survivor README on main, plus the promotion\n// identity assignment. A live read replaces this node. The workflow never\n// guesses a policy. An unapproved or unreadable policy holds.\nreturn [{ json: {\n  payload_kind: 'promotion_policy',\n  policy: {\n    source_ref: 'https://github.com/HCH725/research-survivor/blob/384ab0df97ebaa48ddf7f1e398e347f210c57212/README.md',\n    policy_version: 'qlib-promotion-policy-v1',\n    approved: true,\n    thresholds: { cagr_min_pct: 10, sharpe_min: 1.0 },\n    evaluation_period_defined: true,\n    cost_basis_defined: true,\n    evaluation_unit: 'OOS window, net of declared fees and slippage',\n    draft_8pct_used: false\n  },\n  promotion: { survivor_id: 'svr-donchian-exit15', survivor_version: 'v1' },\n  route: 'POLICY_INPUT'\n} }];\n"
+      }
+    },
+    {
+      "id": "r1012-13",
+      "name": "11 · Research Survivor evaluation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1960,
+        160
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Node11 is deterministic evaluation only. No LLM and no MoA run here. The\n// promotion policy is injected from the authoritative input. It is never\n// guessed in code. A performance shortfall is REJECT. A missing policy, cost,\n// period or reproducibility evidence is HOLD.\nconst inItems = $input.all().map((entry) => entry.json);\nconst isText = (v) => typeof v === 'string' && v.length > 0;\nconst state = inItems.filter((row) => row && row.payload_kind === 'oos_request')[0];\nconst policyItem = inItems.filter((row) => row && row.payload_kind === 'promotion_policy')[0];\nconst stop = (route, reason) => [{ json: Object.assign({}, state || {}, { route: route, reason: reason }) }];\n// No OOS state means the upstream gate already signalled a review item.\nif (!state) { return []; }\nif (!policyItem || !policyItem.policy) { return stop('HOLD', 'promotion_policy_input_missing'); }\nconst p = policyItem.policy;\nconst promotion = policyItem.promotion || {};\nif (p.approved !== true) { return stop('HOLD', 'promotion_policy_not_approved'); }\nif (!/^https:\\/\\/github\\.com\\/HCH725\\/research-survivor\\/blob\\/[a-f0-9]{40}\\/README\\.md$/.test(String(p.source_ref || ''))) { return stop('HOLD', 'promotion_policy_source_unreadable'); }\nif (p.draft_8pct_used === true) { return stop('HOLD', 'draft_8pct_policy_forbidden'); }\nif (!p.thresholds || p.thresholds.cagr_min_pct !== 10 || p.thresholds.sharpe_min !== 1.0) { return stop('HOLD', 'promotion_thresholds_not_authoritative'); }\nif (p.evaluation_period_defined !== true || p.cost_basis_defined !== true) { return stop('HOLD', 'evaluation_basis_undefined'); }\nif (!isText(p.evaluation_unit)) { return stop('HOLD', 'evaluation_unit_undefined'); }\nif (!isText(promotion.survivor_id) || !/^[a-z0-9][a-z0-9-]*$/.test(promotion.survivor_id)) { return stop('HOLD', 'promotion_identity_missing'); }\nif (!isText(promotion.survivor_version)) { return stop('HOLD', 'promotion_version_missing'); }\nconst o = state.oos_ready || {};\nconst m = o.metrics || {};\nconst refs = o.evidence_refs || {};\nconst unreadable = ['oos_manifest', 'metrics', 'portfolio_report', 'trades', 'equity'].filter((key) => !isText(refs[key]));\nif (unreadable.length > 0) { return stop('HOLD', 'oos_evidence_refs_unreadable:' + unreadable.join(',')); }\nif (typeof m.cagr_pct !== 'number' || typeof m.sharpe !== 'number') { return stop('HOLD', 'oos_metrics_not_numeric'); }\nif (!(m.trades > 0)) { return stop('HOLD', 'oos_trades_missing'); }\nconst evaluation = {\n  cagr_pct: m.cagr_pct,\n  sharpe: m.sharpe,\n  cagr_min_pct: p.thresholds.cagr_min_pct,\n  sharpe_min: p.thresholds.sharpe_min,\n  evaluation_unit: p.evaluation_unit,\n  evaluation_period: o.evaluation_period\n};\nconst carry = Object.assign({}, state, {\n  promotion: { survivor_id: promotion.survivor_id, survivor_version: promotion.survivor_version },\n  policy: p,\n  evaluation: evaluation\n});\nif (m.cagr_pct >= p.thresholds.cagr_min_pct && m.sharpe >= p.thresholds.sharpe_min) {\n  return [{ json: Object.assign({}, carry, { route: 'PERF_PASS' }) }];\n}\nreturn [{ json: Object.assign({}, carry, { route: 'REJECT', reason: 'performance_below_policy' }) }];\n"
+      }
+    },
+    {
+      "id": "r1012-14",
+      "name": "11 · HOLD gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2180,
+        420
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $input.all().filter((entry) => entry.json.route === 'HOLD');\n"
+      }
+    },
+    {
+      "id": "r1012-15",
+      "name": "11 · HOLD endpoint",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        2400,
+        420
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "r1012-16",
+      "name": "11 · REJECT gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2180,
+        540
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $input.all().filter((entry) => entry.json.route === 'REJECT');\n"
+      }
+    },
+    {
+      "id": "r1012-17",
+      "name": "11 · REJECT endpoint",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        2400,
+        540
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "r1012-18",
+      "name": "11 · PERF_PASS lane gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2180,
+        180
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $input.all().filter((entry) => entry.json.route === 'PERF_PASS');\n"
+      }
+    },
+    {
+      "id": "r1012-19",
+      "name": "11 · QLIB_REPLAY_PASS fixture",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        660
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Boundary fixture. It represents the existing Qlib replay readback. This\n// workflow does not build a new Qlib runner. A live replay readback replaces\n// this node.\nreturn [{ json: {\n  payload_kind: 'qlib_replay',\n  replay: {\n    status: 'QLIB_REPLAY_PASS',\n    run_key: 'b7c1e0d4a9f24c8fb3e6d5a10c72f984',\n    oos_run_key: 'c8d9e0f1a2b3c4d5e6f708192a3b4c5d',\n    frozen_version_sha: '2a1b3c4d5e6f70819a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f7081',\n    effective_config_hash: '3b2c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a',\n    strategy_sha: '1f0a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8',\n    window_hash: '7f608192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e',\n    evidence_uri: 'mlflow://qlib/replays/b7c1e0d4a9f24c8fb3e6d5a10c72f984/replay.json',\n    replayed_at_utc: '2026-10-15T08:30:00Z'\n  },\n  route: 'QLIB_REPLAY_INPUT'\n} }];\n"
+      }
+    },
+    {
+      "id": "r1012-20",
+      "name": "11 · Replay & PASS assembly",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2400,
+        180
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// The PASS gate. Replay evidence must confirm the same frozen identity, the\n// same OOS window and the same config. This workflow does not build a Qlib\n// runner; the replay readback is a boundary. The PASS output is the complete\n// survivor-record payload contract for Node12. Large artifacts stay as URI and\n// hash references.\nconst inItems = $input.all().map((entry) => entry.json);\nconst isText = (v) => typeof v === 'string' && v.length > 0;\nconst state = inItems.filter((row) => row && row.payload_kind === 'oos_request')[0];\nconst replayItem = inItems.filter((row) => row && row.payload_kind === 'qlib_replay')[0];\nconst stop = (reason) => [{ json: Object.assign({}, state || {}, { route: 'HOLD', reason: reason }) }];\n// No PERF_PASS state means the performance gate already routed HOLD or REJECT.\nif (!state || state.route !== 'PERF_PASS') { return []; }\nif (!replayItem || !replayItem.replay) { return stop('qlib_replay_evidence_missing'); }\nconst r = replayItem.replay;\nconst f = state.freeze;\nif (r.status !== 'QLIB_REPLAY_PASS') { return stop('qlib_replay_not_pass'); }\nif (!isText(r.evidence_uri)) { return stop('qlib_replay_evidence_uri_missing'); }\nif (r.run_key !== state.identity.best_is_run_key) { return stop('qlib_replay_run_mismatch'); }\nif (r.oos_run_key !== state.oos_request.oos_run_key) { return stop('qlib_replay_oos_mismatch'); }\nif (r.frozen_version_sha !== f.frozen_version_sha) { return stop('qlib_replay_frozen_version_mismatch'); }\nif (r.effective_config_hash !== f.effective_config_hash) { return stop('qlib_replay_config_mismatch'); }\nif (r.strategy_sha !== f.strategy_sha) { return stop('qlib_replay_strategy_mismatch'); }\nif (r.window_hash !== state.oos_request.window_hash) { return stop('qlib_replay_window_mismatch'); }\nconst o = state.oos_ready;\nconst contract = {\n  schema: 'research-survivor-record-v1',\n  survivor_id: state.promotion.survivor_id,\n  survivor_version: state.promotion.survivor_version,\n  family_id: f.source.family_id,\n  family_name: f.source.family_name,\n  source_strategy_id: f.source.source_strategy_id,\n  source_strategy_version: f.source.source_strategy_version,\n  source_repository_url: f.source.source_repository_url,\n  source_strategy_path: f.source.source_strategy_path,\n  source_git_commit: f.source.source_git_commit,\n  change_note: f.source.change_note,\n  strategy_sha: f.strategy_sha,\n  frozen_version_sha: f.frozen_version_sha,\n  effective_config_hash: f.effective_config_hash,\n  config_snapshot: f.config_snapshot,\n  data_snapshot: f.data_snapshot,\n  is_window: f.is_window,\n  oos_window: { start_utc: f.oos_plan.start_utc, end_utc: f.oos_plan.end_utc, window_hash: f.oos_plan.window_hash },\n  is_run_key: state.identity.best_is_run_key,\n  is_run_id: state.identity.best_is_run_id,\n  is_note_ref: state.identity.wiki_note_ref,\n  oos_run_key: state.oos_request.oos_run_key,\n  oos_run_id: o.oos_run_id,\n  runtime: f.runtime,\n  cost_model: f.cost_model,\n  metrics: o.metrics,\n  evaluation_period: o.evaluation_period,\n  evidence_refs: o.evidence_refs,\n  coverage_42cell: f.research_refs.coverage_42cell,\n  wiki_refs: f.research_refs.wiki_refs,\n  qlib_replay: { status: r.status, evidence_uri: r.evidence_uri, replayed_at_utc: r.replayed_at_utc },\n  promotion: { policy_version: state.policy.policy_version, policy_source_ref: state.policy.source_ref, decided_basis: 'OOS', decision: 'PASS' },\n  limitations: f.limitations,\n  hummingbot_validation_status: 'PENDING',\n  hb_certified: false,\n  status: 'research-only',\n  adoption: 'not-approved',\n  approval_scope: 'research-only'\n};\nreturn [{ json: Object.assign({}, state, { route: 'PASS', replay: r, survivor_record_contract: contract }) }];\n"
+      }
+    },
+    {
+      "id": "r1012-21",
+      "name": "11 · PASS lane gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2620,
+        180
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $input.all().filter((entry) => entry.json.route === 'PASS');\n"
+      }
+    },
+    {
+      "id": "r1012-22",
+      "name": "12 · Survivor record payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2840,
+        180
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Node12 builds the record file from the Node11 PASS contract. The record schema\n// is the existing research-survivor-record-v1. No second schema exists. The HB\n// fields stay PENDING. Node12 never fabricates Node13 evidence.\nconst x = $input.first().json;\nconst stop = (reason) => [{ json: Object.assign({}, x, { route: 'NEEDS_REVIEW', reason: reason }) }];\nif (x.route !== 'PASS') { return stop('upstream_route_not_pass:' + x.route); }\nconst c = x.survivor_record_contract;\nif (!c || typeof c !== 'object') { return stop('record_contract_missing'); }\nif (c.schema !== 'research-survivor-record-v1') { return stop('record_schema_unknown'); }\nconst missing = [];\nconst required = ['survivor_id', 'survivor_version', 'family_id', 'source_strategy_id', 'source_repository_url',\n  'source_strategy_path', 'source_git_commit', 'strategy_sha', 'frozen_version_sha', 'effective_config_hash',\n  'is_run_id', 'oos_run_id', 'is_run_key', 'oos_run_key', 'config_snapshot', 'data_snapshot', 'is_window',\n  'oos_window', 'runtime', 'cost_model', 'metrics', 'evaluation_period', 'evidence_refs', 'coverage_42cell',\n  'wiki_refs', 'qlib_replay', 'promotion', 'limitations'];\nfor (const key of required) {\n  if (c[key] === undefined || c[key] === null) { missing.push(key); }\n}\nif (missing.length > 0) { return stop('record_payload_incomplete:' + missing.join(',')); }\nif (c.hummingbot_validation_status !== 'PENDING' || c.hb_certified !== false) { return stop('hb_status_must_stay_pending'); }\nconst blob = JSON.stringify(c);\nconst banned = ['hb_certified_at_utc', 'parity_diff_uri', 'parity_verification_status', 'hummingbot_task_id',\n  'hb_certification_git_commit', 'portfolio_evidence_uri', 'hummingbot_archive_uri'];\nfor (const key of banned) {\n  if (blob.indexOf('\"' + key + '\"') !== -1) { return stop('fabricated_hb_evidence:' + key); }\n}\nif (/CERTIFIED/.test(blob)) { return stop('fabricated_hb_evidence:CERTIFIED'); }\nconst id = c.survivor_id;\nconst version = c.survivor_version;\nif (!/^[a-z0-9][a-z0-9-]*$/.test(String(id))) { return stop('survivor_id_shape'); }\nif (!/^[a-z0-9][a-z0-9-]*$/.test(String(version))) { return stop('survivor_version_shape'); }\nconst path = id + '-' + version + '.md';\nconst frontmatter = {\n  schema: 'research-survivor-record-v1',\n  survivor_id: id,\n  survivor_version: version,\n  family_id: c.family_id,\n  source_strategy_id: c.source_strategy_id,\n  source_repository_url: c.source_repository_url,\n  source_strategy_path: c.source_strategy_path,\n  source_git_commit: c.source_git_commit,\n  strategy_sha: c.strategy_sha,\n  qlib_survivor_status: 'PASS',\n  hummingbot_validation_status: 'PENDING',\n  hb_certified: false,\n  status: 'research-only',\n  adoption: 'not-approved',\n  approval_scope: 'research-only'\n};\nconst body_sections = [\n  'Provenance',\n  'Frozen Strategy & Execution',\n  'Dataset / IS / OOS',\n  'Qlib Metrics & Artifacts',\n  '42-Cell Coverage',\n  'Hummingbot Validation & Parity',\n  'Audit & GitHub History',\n  'Wiki References',\n  'Limitations & Authorization'\n];\nconst pr_plan = {\n  repo: 'HCH725/research-survivor',\n  base_branch: 'main',\n  head_branch: 'promote/' + id + '-' + version,\n  path: path,\n  commit_message: 'feat(survivor): add ' + id + ' ' + version + ' research survivor record',\n  pr_title: 'research survivor: ' + id + ' ' + version,\n  pr_requires: 'independent audit before merge; n8n never merges'\n};\nreturn [{ json: Object.assign({}, x, {\n  route: 'RECORD_PAYLOAD_READY',\n  record_file: { path: path, frontmatter: frontmatter, body_sections: body_sections, record: c },\n  pr_plan: pr_plan\n}) }];\n"
+      }
+    },
+    {
+      "id": "r1012-23",
+      "name": "12 · GITHUB_PR_CREATE boundary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3060,
+        180
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Node12 never writes main. It prepares the pull request. The live n8n instance\n// holds no GitHub credential, so this boundary records the exact blocker. No\n// bridge and no service are created. A created PR has its own durable state:\n// AWAITING_AUDIT_MERGE.\nconst x = $input.first().json;\nconst isText = (v) => typeof v === 'string' && v.length > 0;\n// A record that is not ready already went to the review gate. Stay silent.\nif (x.route !== 'RECORD_PAYLOAD_READY') { return []; }\nconst file = x.record_file || {};\nconst plan = x.pr_plan || {};\nconst base = {\n  repo: 'HCH725/research-survivor',\n  base_branch: 'main',\n  head_branch: plan.head_branch,\n  path: file.path,\n  survivor_id: (file.frontmatter || {}).survivor_id,\n  survivor_version: (file.frontmatter || {}).survivor_version\n};\nconst result = x.pr_create_result;\nif (result && typeof result === 'object') {\n  if (!/^[0-9]+$/.test(String(result.pr_number || '')) || !isText(result.pr_url) || !/^[a-f0-9]{40}$/.test(String(result.head_sha || ''))) {\n    return [{ json: Object.assign({}, x, { route: 'NEEDS_REVIEW', reason: 'pr_create_result_incomplete' }) }];\n  }\n  return [{ json: Object.assign({}, x, {\n    route: 'AWAITING_AUDIT_MERGE',\n    pr_state: 'AWAITING_AUDIT_MERGE',\n    pr: Object.assign({}, base, { pr_number: result.pr_number, pr_url: result.pr_url, head_sha: result.head_sha }),\n    audit_boundary: 'independent auditor review before merge; n8n never merges'\n  }) }];\n}\nreturn [{ json: Object.assign({}, x, {\n  route: 'AWAITING_PR_CREATE',\n  pr_state: 'AWAITING_PR_CREATE',\n  pr_request: base,\n  audit_boundary: 'independent auditor review before merge; n8n never merges',\n  blocked_by: {\n    code: 'github_credential_missing_in_n8n_instance',\n    evidence: 'Live n8n instance credential inventory (2026-10-15): exactly one credential, type sshPrivateKey (the 01-05 connector). No GitHub credential exists. No bridge or service is created.',\n    required_capability: { node: 'n8n-nodes-base.github', resource: 'file', operation: 'create', credential_type: 'githubApi' },\n    decision_needed: 'Provide an existing GitHub connection for the native node, or create the PR through the reviewed human path.'\n  }\n}) }];\n"
+      }
+    },
+    {
+      "id": "r1012-24",
+      "name": "12 · PR boundary endpoint",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        3280,
+        180
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "r1012-25",
+      "name": "12 · NEEDS_REVIEW gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3060,
+        420
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $input.all().filter((entry) => entry.json.route === 'NEEDS_REVIEW');\n"
+      }
+    },
+    {
+      "id": "r1012-26",
+      "name": "12 · NEEDS_REVIEW endpoint",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        3280,
+        420
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "r1012-27",
+      "name": "12 · merged PR event fixture",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        900
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Boundary fixture. It represents the merge event entry: a merge webhook or a\n// minimal merge-check entry. The live trigger is not available. The instance\n// holds no GitHub credential, so this flow is the MERGED_PR_REENTRY boundary.\n// The workflow never trusts this payload alone.\nreturn [{ json: {\n  payload_kind: 'merged_pr_event',\n  event: {\n    delivery: 'merge_entry_fixture',\n    repo: 'HCH725/research-survivor',\n    pr_number: 3,\n    pr_state: 'MERGED',\n    base_branch: 'main',\n    head_branch: 'promote/svr-donchian-exit15-v1',\n    head_sha: 'ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12',\n    merge_commit_sha: 'cd34ef56ab12cd34ef56ab12cd34ef56ab12cd34',\n    path: 'svr-donchian-exit15-v1.md',\n    survivor_id: 'svr-donchian-exit15',\n    survivor_version: 'v1',\n    merged_at_utc: '2026-10-15T09:10:00Z'\n  }\n} }];\n"
+      }
+    },
+    {
+      "id": "r1012-28",
+      "name": "12 · GitHub readback fixture",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        1040
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Boundary fixture. It represents an independent readback through the existing\n// GitHub surface: repo, pull request, merged file, frontmatter and audit\n// evidence. The re-entry trusts this readback, not the event payload.\nreturn [{ json: {\n  payload_kind: 'github_readback',\n  readback: {\n    source: 'github_readback_fixture',\n    repo: 'HCH725/research-survivor',\n    pr_number: 3,\n    pr_state: 'MERGED',\n    base_branch: 'main',\n    head_branch: 'promote/svr-donchian-exit15-v1',\n    head_sha: 'ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12',\n    merge_commit_sha: 'cd34ef56ab12cd34ef56ab12cd34ef56ab12cd34',\n    merged_at_utc: '2026-10-15T09:10:00Z',\n    path: 'svr-donchian-exit15-v1.md',\n    file_sha256: 'e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f',\n    frontmatter: {\n      schema: 'research-survivor-record-v1',\n      survivor_id: 'svr-donchian-exit15',\n      survivor_version: 'v1',\n      family_id: 'donchian-breakout',\n      source_strategy_id: 'alpha-donchian-20-10',\n      source_repository_url: 'https://github.com/HCH725/alpha-strategy-research',\n      source_strategy_path: 'strategies/donchian-20-10.md',\n      source_git_commit: '9a1b2c3d4e5f60718293a4b5c6d7e8f901234567',\n      strategy_sha: '1f0a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8',\n      qlib_survivor_status: 'PASS',\n      hummingbot_validation_status: 'PENDING',\n      hb_certified: false,\n      status: 'research-only',\n      adoption: 'not-approved',\n      approval_scope: 'research-only'\n    },\n    audited_pass_evidence: {\n      verdict: 'PASS',\n      reviewed_head_sha: 'ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12',\n      audit_record_ref: 'github://HCH725/research-survivor/pull/3#review',\n      audit_merge_commit: 'cd34ef56ab12cd34ef56ab12cd34ef56ab12cd34',\n      audited_at_utc: '2026-10-15T09:05:00Z'\n    },\n    record: {\n      schema: 'research-survivor-record-v1',\n      survivor_repository_url: 'https://github.com/HCH725/research-survivor',\n      survivor_strategy_path: 'svr-donchian-exit15-v1.md',\n      family_name: 'Donchian breakout',\n      frozen_version_sha: '2a1b3c4d5e6f70819a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f7081',\n      full_config_snapshot_uri: 'mlflow://qlib/runs/b7c1e0d4a9f24c8fb3e6d5a10c72f984/artifacts/frozen_config.json',\n      full_config_sha256: '3b2c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a',\n      is_run_id: '3ad9f0c4b1e2487fa5c6d87013be92f4',\n      oos_run_id: 'd9e0f1a2b3c4d5e6f708192a3b4c5d6e',\n      is_window_hash: '6e5f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d',\n      oos_window_hash: '7f608192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e',\n      backtest_start_utc: '2025-01-01',\n      backtest_end_utc: '2025-06-30',\n      data_source: 'research-data://klines/2022-01-01_2025-06-30/day',\n      dataset_version_or_hash: '5d4e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c',\n      data_snapshot: {\n        uri: 'research-data://klines/2022-01-01_2025-06-30/day',\n        sha256: '5d4e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c',\n        dataset_version: 'kline-day-v3'\n      },\n      cost_model: {\n        uri: 'mlflow://qlib/cost-models/futures-taker-v2.json',\n        sha256: '8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f',\n        fee_rate_bps: 4,\n        slippage_bps: 2,\n        funding_model: 'modelled_v2'\n      },\n      qlib_engine_version: 'pyqlib-0.9.7',\n      runtime_git_commit_or_image: 'qlib-arm64-container:2026-10-01',\n      qlib_report_uri: 'mlflow://qlib/runs/c8d9e0f1a2b3c4d5e6f708192a3b4c5d/report',\n      trades_artifact_uri: 'mlflow://qlib/runs/c8d9e0f1a2b3c4d5e6f708192a3b4c5d/trades',\n      equity_curve_uri: 'mlflow://qlib/runs/c8d9e0f1a2b3c4d5e6f708192a3b4c5d/equity',\n      artifacts_manifest_uri: 'mlflow://qlib/runs/c8d9e0f1a2b3c4d5e6f708192a3b4c5d/artifacts/manifest.json',\n      artifacts_manifest_sha256: 'a1b2c3d4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e9f0',\n      research_note_uri: 'quant/research-loop/b7c1e0d4a9f24c8fb3e6d5a10c72f984.md',\n      coverage_42cell_ref: 'research-nav://42cell/donchian/coverage.json',\n      metrics: {\n        cagr_pct: 14.2,\n        sharpe: 1.21,\n        max_drawdown_pct: 19.0,\n        max_drawdown_definition: 'peak_to_trough_net',\n        win_rate_pct: 48.4,\n        total_trades: 128,\n        profit_factor: 1.62,\n        net_return_pct: 14.2\n      },\n      survivor_gate_version: 'qlib-promotion-policy-v1'\n    }\n  }\n} }];\n"
+      }
+    },
+    {
+      "id": "r1012-29",
+      "name": "12 · Merge verification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        970
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Node12 re-entry. It does not trust the event payload. It compares the GitHub\n// readback with the event: exact repo, path, survivor id, survivor version,\n// head and merge commit, plus the audited PASS evidence that covers this exact\n// head and merge commit. Any mismatch fails closed. No Sheets write follows.\nconst inItems = $input.all().map((entry) => entry.json);\nconst isText = (v) => typeof v === 'string' && v.length > 0;\nconst eventItem = inItems.filter((row) => row && row.payload_kind === 'merged_pr_event')[0];\nconst readItem = inItems.filter((row) => row && row.payload_kind === 'github_readback')[0];\nconst stop = (reason) => [{ json: { payload_kind: 'merge_review', route: 'NEEDS_REVIEW', reason: reason } }];\nif (!eventItem || !readItem) { return stop('merge_entry_missing'); }\nconst e = eventItem.event || {};\nconst r = readItem.readback || {};\nconst fm = r.frontmatter || {};\nconst audit = r.audited_pass_evidence || {};\nconst record = r.record || {};\nif (e.repo !== 'HCH725/research-survivor' || r.repo !== 'HCH725/research-survivor') { return stop('merge_repo_mismatch'); }\nif (e.pr_state !== 'MERGED') { return stop('merge_not_merged:' + e.pr_state); }\nif (r.pr_state !== 'MERGED') { return stop('merge_readback_not_merged:' + r.pr_state); }\nif (e.base_branch !== 'main' || r.base_branch !== 'main') { return stop('merge_base_not_main'); }\nif (e.pr_number !== r.pr_number) { return stop('merge_pr_number_mismatch'); }\nif (e.head_branch !== r.head_branch) { return stop('merge_head_branch_mismatch'); }\nif (e.head_sha !== r.head_sha) { return stop('merge_head_sha_mismatch'); }\nif (e.merge_commit_sha !== r.merge_commit_sha) { return stop('merge_commit_not_confirmed'); }\nif (!/^[a-f0-9]{40}$/.test(String(r.merge_commit_sha || ''))) { return stop('merge_commit_bad_shape'); }\nif (fm.schema !== 'research-survivor-record-v1') { return stop('record_schema_unknown'); }\nif (fm.survivor_id !== e.survivor_id || fm.survivor_version !== e.survivor_version) { return stop('merge_identity_mismatch:survivor'); }\nconst expectedPath = String(fm.survivor_id) + '-' + String(fm.survivor_version) + '.md';\nif (r.path !== expectedPath) { return stop('merge_identity_mismatch:path'); }\nif (e.path !== expectedPath) { return stop('merge_identity_mismatch:event_path'); }\nif (fm.qlib_survivor_status !== 'PASS') { return stop('record_not_qlib_pass'); }\nif (fm.hummingbot_validation_status !== 'PENDING' || fm.hb_certified !== false) { return stop('record_hb_status_not_pending'); }\nif (audit.verdict !== 'PASS') { return stop('audit_evidence_not_pass'); }\nif (audit.reviewed_head_sha !== r.head_sha) { return stop('audit_head_sha_mismatch'); }\nif (audit.audit_merge_commit !== r.merge_commit_sha) { return stop('audit_merge_commit_mismatch'); }\nif (!isText(audit.audit_record_ref)) { return stop('audit_record_ref_missing'); }\nif (!/^[a-f0-9]{64}$/.test(String(record.full_config_sha256 || ''))) { return stop('record_config_identity_missing'); }\nif (!/^[a-f0-9]{64}$/.test(String(record.frozen_version_sha || ''))) { return stop('record_frozen_version_missing'); }\nif (!/^[a-f0-9]{32}$/.test(String(record.is_run_id || ''))) { return stop('record_is_run_id_missing'); }\nif (!/^[a-f0-9]{32}$/.test(String(record.oos_run_id || ''))) { return stop('record_oos_run_id_missing'); }\nreturn [{ json: {\n  payload_kind: 'merge_verified',\n  route: 'MERGE_VERIFIED',\n  merge: {\n    repo: r.repo,\n    path: r.path,\n    pr_number: r.pr_number,\n    head_branch: r.head_branch,\n    head_sha: r.head_sha,\n    merge_commit_sha: r.merge_commit_sha,\n    merged_at_utc: r.merged_at_utc,\n    survivor_id: fm.survivor_id,\n    survivor_version: fm.survivor_version,\n    audit_record_ref: audit.audit_record_ref,\n    file_sha256: r.file_sha256,\n    frontmatter: fm,\n    record: record\n  }\n} }];\n"
+      }
+    },
+    {
+      "id": "r1012-30",
+      "name": "12 · MERGE_VERIFIED lane gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        860,
+        970
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $input.all().filter((entry) => entry.json.route === 'MERGE_VERIFIED');\n"
+      }
+    },
+    {
+      "id": "r1012-31",
+      "name": "12 · Sheets upsert plan",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        970
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Node12 Sheets contract. It aligns the record with the existing 84-column\n// native Survivor Registry. It never adds a column and never changes the sheet\n// schema. It never writes the 42 empty coverage cells. The native Google Sheets\n// node performs the upsert once a credential exists. The instance holds none,\n// so the write stays an explicit boundary with the exact blocker.\nconst x = $input.first().json;\nconst stop = (reason) => [{ json: Object.assign({}, x, { route: 'NEEDS_REVIEW', reason: reason }) }];\nif (x.route !== 'MERGE_VERIFIED') { return stop('merge_not_verified:' + x.route); }\nconst HEADERS = [\"survivor_id\", \"survivor_version\", \"family_id\", \"family_name\", \"source_strategy_id\", \"source_strategy_version\", \"source_repository_url\", \"source_strategy_path\", \"source_git_commit\", \"survivor_repository_url\", \"survivor_strategy_path\", \"survivor_git_commit\", \"promotion_time_utc\", \"promotion_decision_id\", \"exchange\", \"market_type\", \"symbol\", \"timeframe\", \"position_side\", \"margin_mode\", \"leverage_x\", \"initial_capital_usdt\", \"portfolio_allocation_pct\", \"base_order_capital_pct\", \"safety_order_capital_pct\", \"backtest_start_utc\", \"backtest_end_utc\", \"data_source\", \"dataset_version_or_hash\", \"entry_rule_summary\", \"exit_rule_summary\", \"dca_base_order_enabled\", \"dca_safety_order_count\", \"dca_so_step_pct\", \"dca_so_step_scale\", \"dca_so_volume_scale\", \"take_profit_pct\", \"stop_loss_pct\", \"order_execution_type\", \"fee_rate_bps\", \"slippage_bps\", \"compounding_enabled\", \"full_config_snapshot_uri\", \"full_config_sha256\", \"qlib_run_id\", \"mlflow_experiment_id\", \"qlib_engine_version\", \"runtime_git_commit_or_image\", \"net_return_pct\", \"annualized_return_pct\", \"sharpe_ratio\", \"max_drawdown_pct\", \"max_drawdown_definition\", \"win_rate_pct\", \"total_trades\", \"profit_factor\", \"net_profit_usdt\", \"oos_verification_status\", \"robustness_status\", \"survivor_gate_version\", \"qlib_report_uri\", \"trades_artifact_uri\", \"equity_curve_uri\", \"artifacts_manifest_uri\", \"artifacts_manifest_sha256\", \"research_note_uri\", \"hummingbot_validation_status\", \"hummingbot_task_id\", \"parity_verification_status\", \"testnet_status\", \"mainnet_status\", \"registry_last_synced_utc\", \"registry_sync_status\", \"is_run_id\", \"oos_run_id\", \"is_window_hash\", \"oos_window_hash\", \"hummingbot_engine_version\", \"hummingbot_archive_uri\", \"parity_diff_uri\", \"hb_certified_at_utc\", \"hb_certification_git_commit\", \"portfolio_evidence_uri\", \"parity_diff_sha256\"];\nconst m = x.merge;\nconst fm = m.frontmatter || {};\nconst rec = m.record || {};\nconst met = rec.metrics || {};\nconst columns = {\n  survivor_id: fm.survivor_id,\n  survivor_version: fm.survivor_version,\n  family_id: fm.family_id,\n  family_name: rec.family_name,\n  source_strategy_id: fm.source_strategy_id,\n  source_repository_url: fm.source_repository_url,\n  source_strategy_path: fm.source_strategy_path,\n  source_git_commit: fm.source_git_commit,\n  survivor_repository_url: 'https://github.com/HCH725/research-survivor',\n  survivor_strategy_path: m.path,\n  survivor_git_commit: m.merge_commit_sha,\n  promotion_time_utc: m.merged_at_utc,\n  promotion_decision_id: 'pr#' + String(m.pr_number) + '@' + String(m.merge_commit_sha).substring(0, 12),\n  backtest_start_utc: rec.backtest_start_utc,\n  backtest_end_utc: rec.backtest_end_utc,\n  data_source: rec.data_source,\n  dataset_version_or_hash: rec.dataset_version_or_hash,\n  full_config_snapshot_uri: rec.full_config_snapshot_uri,\n  full_config_sha256: rec.full_config_sha256,\n  qlib_engine_version: rec.qlib_engine_version,\n  runtime_git_commit_or_image: rec.runtime_git_commit_or_image,\n  annualized_return_pct: met.cagr_pct,\n  net_return_pct: met.net_return_pct,\n  sharpe_ratio: met.sharpe,\n  max_drawdown_pct: met.max_drawdown_pct,\n  max_drawdown_definition: met.max_drawdown_definition,\n  win_rate_pct: met.win_rate_pct,\n  total_trades: met.total_trades,\n  profit_factor: met.profit_factor,\n  oos_verification_status: 'PASS',\n  survivor_gate_version: rec.survivor_gate_version,\n  qlib_report_uri: rec.qlib_report_uri,\n  trades_artifact_uri: rec.trades_artifact_uri,\n  equity_curve_uri: rec.equity_curve_uri,\n  artifacts_manifest_uri: rec.artifacts_manifest_uri,\n  artifacts_manifest_sha256: rec.artifacts_manifest_sha256,\n  research_note_uri: rec.research_note_uri,\n  fee_rate_bps: (rec.cost_model || {}).fee_rate_bps,\n  slippage_bps: (rec.cost_model || {}).slippage_bps,\n  hummingbot_validation_status: 'NOT_STARTED',\n  is_run_id: rec.is_run_id,\n  oos_run_id: rec.oos_run_id,\n  is_window_hash: rec.is_window_hash,\n  oos_window_hash: rec.oos_window_hash\n};\nconst keys = Object.keys(columns);\nconst unknown = keys.filter((key) => HEADERS.indexOf(key) === -1);\nif (unknown.length > 0) { return stop('unknown_registry_columns:' + unknown.join(',')); }\nconst required = ['survivor_id', 'survivor_version', 'survivor_git_commit', 'full_config_sha256', 'is_run_id',\n  'oos_run_id', 'is_window_hash', 'oos_window_hash', 'hummingbot_validation_status'];\nconst lacking = required.filter((key) => columns[key] === undefined || columns[key] === null || columns[key] === '');\nif (lacking.length > 0) { return stop('registry_row_incomplete:' + lacking.join(',')); }\nconst KEY = ['survivor_id', 'survivor_version'];\nreturn [{ json: Object.assign({}, x, {\n  payload_kind: 'sheets_plan',\n  route: 'UPSERT_PLAN_READY',\n  sheets: {\n    spreadsheet_id: '1fzO3zH5xSmQWMH856KY_Z2atLCHkDdRg_cBzltSB_rg',\n    tab: 'Survivor Registry',\n    key: KEY,\n    native_node: {\n      type: 'n8n-nodes-base.googleSheets',\n      typeVersion: 4.7,\n      resource: 'sheet',\n      operation: 'appendOrUpdate',\n      matchingColumns: KEY,\n      documentId: '1fzO3zH5xSmQWMH856KY_Z2atLCHkDdRg_cBzltSB_rg',\n      sheetName: 'Survivor Registry'\n    },\n    columns: columns,\n    headers_ref: { count: HEADERS.length, source: 'native Survivor Registry header row, read 2026-10-15' },\n    write_policy: {\n      only_after_verified_merge: true,\n      idempotent_by_key: true,\n      duplicate_rows_forbidden: true,\n      never_write_empty_coverage_cells: true,\n      bounded_retries: 3\n    },\n    write_state: 'PENDING_SYNC',\n    blocked_by: {\n      code: 'google_sheets_credential_missing_in_n8n_instance',\n      evidence: 'Live n8n instance credential inventory (2026-10-15): exactly one credential, type sshPrivateKey (the 01-05 connector). No Google Sheets credential exists. No bridge and no service are created.',\n      required_capability: { node: 'n8n-nodes-base.googleSheets', credential_type: 'googleSheetsOAuth2Api' },\n      decision_needed: 'Provide an existing Google Sheets connection for the native node. The upsert stays a boundary until then.'\n    }\n  }\n}) }];\n"
+      }
+    },
+    {
+      "id": "r1012-32",
+      "name": "12 · Sheets write result fixture",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        970
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Boundary fixture. It represents the native Google Sheets upsert plus its\n// readback. The n8n instance holds no Google Sheets credential, so no live\n// write exists yet. Tests override this node to model retry and mismatch\n// outcomes. The fixture derives a matching row from the plan.\nconst x = $input.first().json;\nconst row = Object.assign({}, x.sheets.columns, {\n  registry_sync_status: 'SYNCED',\n  registry_last_synced_utc: '2026-10-15T09:20:00Z'\n});\nreturn [{ json: Object.assign({}, x, {\n  payload_kind: 'sheets_write_result',\n  write_result: {\n    mode: 'upsert_by_key',\n    attempt: 1,\n    max_attempts: 3,\n    outcome: 'upsert_ok',\n    key: { survivor_id: row.survivor_id, survivor_version: row.survivor_version },\n    synced_at_utc: '2026-10-15T09:20:00Z',\n    rows_after: [row]\n  }\n}) }];\n"
+      }
+    },
+    {
+      "id": "r1012-33",
+      "name": "12 · Sheets ACK gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1520,
+        970
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Node12 Sheets ACK gate. The write happens only after the verified merge. The\n// readback must return the same key with the same identity, hash, run ids and\n// sync status. A mismatch is ERROR. A write failure retries the same key in a\n// bounded loop. A duplicate row for the same key is ERROR. The repository is\n// never rolled back.\nconst inItems = $input.all().map((entry) => entry.json);\nconst planItem = inItems.filter((row) => row && row.payload_kind === 'sheets_plan')[0];\nconst writeItem = inItems.filter((row) => row && row.payload_kind === 'sheets_write_result')[0];\nconst carr = planItem || {};\nconst stop = (route, reason, extra) => [{ json: Object.assign({}, carr, extra || {}, { route: route, reason: reason }) }];\nif (!planItem || !writeItem) { return stop('ERROR', 'sheets_state_missing'); }\nconst w = writeItem.write_result || {};\nconst key = planItem.sheets.key;\nconst keyOf = (row) => key.map((field) => String(row ? row[field] : '')).join('\\u0001');\nconst keyValue = keyOf(planItem.sheets.columns);\nconst outcome = String(w.outcome || '');\nif (outcome !== 'upsert_ok') {\n  const attempt = Number(w.attempt);\n  const max = Number(w.max_attempts);\n  if (!(attempt >= 1) || !(max >= 1) || attempt >= max) {\n    return stop('ERROR', 'sheet_retry_exhausted', { retry: { same_key: true, attempts: attempt, max_attempts: max, rollback_repo: false } });\n  }\n  return stop('RETRY', 'sheet_write_' + outcome, { retry: { same_key: true, next_attempt: attempt + 1, max_attempts: max, duplicate_allowed: false, rollback_repo: false } });\n}\nconst rows = (Array.isArray(w.rows_after) ? w.rows_after : []).filter((row) => keyOf(row) === keyValue);\nif (rows.length === 0) { return stop('ERROR', 'readback_row_missing'); }\nif (rows.length > 1) { return stop('ERROR', 'duplicate_rows_forbidden'); }\nconst row = rows[0];\nconst expect = planItem.sheets.columns;\nconst fields = ['survivor_git_commit', 'full_config_sha256', 'is_run_id', 'oos_run_id', 'is_window_hash', 'oos_window_hash', 'qlib_report_uri'];\nfor (const field of fields) {\n  if (expect[field] === undefined) { continue; }\n  if (row[field] !== expect[field]) { return stop('ERROR', 'readback_mismatch:' + field); }\n}\nif (row.registry_sync_status !== 'SYNCED') { return stop('ERROR', 'readback_sync_status_not_synced'); }\nif (typeof row.registry_last_synced_utc !== 'string' || row.registry_last_synced_utc.length === 0) { return stop('ERROR', 'readback_sync_time_missing'); }\nif (String(w.synced_at_utc || '') !== row.registry_last_synced_utc) { return stop('ERROR', 'readback_sync_time_mismatch'); }\nreturn [{ json: Object.assign({}, planItem, {\n  route: 'SHEETS_ACK',\n  sheets_ack: {\n    status: 'SHEETS_ACK',\n    spreadsheet_id: planItem.sheets.spreadsheet_id,\n    tab: planItem.sheets.tab,\n    survivor_id: row.survivor_id,\n    survivor_version: row.survivor_version,\n    survivor_git_commit: row.survivor_git_commit,\n    full_config_sha256: row.full_config_sha256,\n    is_run_id: row.is_run_id,\n    oos_run_id: row.oos_run_id,\n    registry_sync_status: row.registry_sync_status,\n    synced_at_utc: row.registry_last_synced_utc\n  }\n}) }];\n"
+      }
+    },
+    {
+      "id": "r1012-34",
+      "name": "12 · Sheets RETRY endpoint (bounded, same key)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1740,
+        1100
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "r1012-35",
+      "name": "12 · Sheets ERROR endpoint",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1740,
+        1230
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "r1012-36",
+      "name": "12 · SHEETS_ACK lane gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1740,
+        840
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $input.all().filter((entry) => entry.json.route === 'SHEETS_ACK');\n"
+      }
+    },
+    {
+      "id": "r1012-37",
+      "name": "12 · Node13 boundary payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1960,
+        840
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// The Node13 boundary payload. Node12 stops here. It does not call Hummingbot.\n// It does no parity and no certification. The HB status stays PENDING.\nconst x = $input.first().json;\nif (x.route !== 'SHEETS_ACK') { return [{ json: { route: 'NEEDS_REVIEW', reason: 'sheets_not_acked:' + x.route } }]; }\nconst m = x.merge;\nconst rec = m.record || {};\nconst fm = m.frontmatter || {};\nreturn [{ json: {\n  payload_kind: 'node13_boundary',\n  route: 'NODE13_BOUNDARY_READY',\n  node13: {\n    survivor_repository_url: 'https://github.com/HCH725/research-survivor',\n    survivor_strategy_path: m.path,\n    survivor_git_commit: m.merge_commit_sha,\n    survivor_id: m.survivor_id,\n    survivor_version: m.survivor_version,\n    strategy_sha: fm.strategy_sha,\n    frozen_version_sha: rec.frozen_version_sha,\n    effective_config_hash: rec.full_config_sha256,\n    full_config_snapshot_uri: rec.full_config_snapshot_uri,\n    is_run_id: rec.is_run_id,\n    oos_run_id: rec.oos_run_id,\n    is_window_hash: rec.is_window_hash,\n    oos_window_hash: rec.oos_window_hash,\n    data_snapshot: rec.data_snapshot,\n    cost_model: rec.cost_model,\n    hummingbot_validation_status: 'PENDING',\n    hb_certified: false,\n    sheets: {\n      spreadsheet_id: x.sheets.spreadsheet_id,\n      tab: x.sheets.tab,\n      registry_sync_status: 'SYNCED',\n      registry_last_synced_utc: x.sheets_ack.synced_at_utc\n    },\n    note: 'Node12 stops here. No Hummingbot call, no parity, no certificate.'\n  }\n} }];\n"
+      }
+    },
+    {
+      "id": "r1012-38",
+      "name": "12 · Node13 boundary",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        2180,
+        840
+      ],
+      "parameters": {}
+    }
+  ],
+  "connections": {
+    "10 · Manual trigger": {
+      "main": [
+        [
+          {
+            "node": "10 · 09 FINALIZE input fixture",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "10 · frozen IS snapshot fixture",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "11 · promotion policy & identity boundary fixture",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "11 · QLIB_REPLAY_PASS fixture",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "12 · merged PR event fixture",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "12 · GitHub readback fixture",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "10 · 09 FINALIZE input fixture": {
+      "main": [
+        [
+          {
+            "node": "10 · Freeze & OOS request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "10 · frozen IS snapshot fixture": {
+      "main": [
+        [
+          {
+            "node": "10 · Freeze & OOS request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "10 · Freeze & OOS request": {
+      "main": [
+        [
+          {
+            "node": "10 · OOS_REQUEST gate",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "10 · NEEDS_REVIEW gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "10 · OOS_REQUEST gate": {
+      "main": [
+        [
+          {
+            "node": "10 · OOS_TO_EXISTING_04 boundary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "10 · OOS_TO_EXISTING_04 boundary": {
+      "main": [
+        [
+          {
+            "node": "05 · OOS_READY fixture/re-entry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "05 · OOS_READY fixture/re-entry": {
+      "main": [
+        [
+          {
+            "node": "10 · OOS_READY gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "10 · OOS_READY gate": {
+      "main": [
+        [
+          {
+            "node": "10 · OOS_READY lane gate",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "10 · NEEDS_REVIEW gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "10 · OOS_READY lane gate": {
+      "main": [
+        [
+          {
+            "node": "11 · Research Survivor evaluation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "10 · NEEDS_REVIEW gate": {
+      "main": [
+        [
+          {
+            "node": "10 · NEEDS_REVIEW endpoint",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "11 · promotion policy & identity boundary fixture": {
+      "main": [
+        [
+          {
+            "node": "11 · Research Survivor evaluation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "11 · Research Survivor evaluation": {
+      "main": [
+        [
+          {
+            "node": "11 · HOLD gate",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "11 · REJECT gate",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "11 · PERF_PASS lane gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "11 · HOLD gate": {
+      "main": [
+        [
+          {
+            "node": "11 · HOLD endpoint",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "11 · REJECT gate": {
+      "main": [
+        [
+          {
+            "node": "11 · REJECT endpoint",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "11 · PERF_PASS lane gate": {
+      "main": [
+        [
+          {
+            "node": "11 · Replay & PASS assembly",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "11 · QLIB_REPLAY_PASS fixture": {
+      "main": [
+        [
+          {
+            "node": "11 · Replay & PASS assembly",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "11 · Replay & PASS assembly": {
+      "main": [
+        [
+          {
+            "node": "11 · HOLD gate",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "11 · PASS lane gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "11 · PASS lane gate": {
+      "main": [
+        [
+          {
+            "node": "12 · Survivor record payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · Survivor record payload": {
+      "main": [
+        [
+          {
+            "node": "12 · GITHUB_PR_CREATE boundary",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "12 · NEEDS_REVIEW gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · GITHUB_PR_CREATE boundary": {
+      "main": [
+        [
+          {
+            "node": "12 · PR boundary endpoint",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "12 · NEEDS_REVIEW gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · NEEDS_REVIEW gate": {
+      "main": [
+        [
+          {
+            "node": "12 · NEEDS_REVIEW endpoint",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · merged PR event fixture": {
+      "main": [
+        [
+          {
+            "node": "12 · Merge verification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · GitHub readback fixture": {
+      "main": [
+        [
+          {
+            "node": "12 · Merge verification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · Merge verification": {
+      "main": [
+        [
+          {
+            "node": "12 · MERGE_VERIFIED lane gate",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "12 · NEEDS_REVIEW gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · MERGE_VERIFIED lane gate": {
+      "main": [
+        [
+          {
+            "node": "12 · Sheets upsert plan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · Sheets upsert plan": {
+      "main": [
+        [
+          {
+            "node": "12 · Sheets write result fixture",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "12 · Sheets ACK gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · Sheets write result fixture": {
+      "main": [
+        [
+          {
+            "node": "12 · Sheets ACK gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · Sheets ACK gate": {
+      "main": [
+        [
+          {
+            "node": "12 · Sheets RETRY endpoint (bounded, same key)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "12 · Sheets ERROR endpoint",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "12 · SHEETS_ACK lane gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · SHEETS_ACK lane gate": {
+      "main": [
+        [
+          {
+            "node": "12 · Node13 boundary payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · Node13 boundary payload": {
+      "main": [
+        [
+          {
+            "node": "12 · Node13 boundary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "pinData": {},
+  "tags": []
+}
