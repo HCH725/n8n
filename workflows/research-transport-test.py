@@ -560,6 +560,126 @@ def main():
         rc, out = run("submit", b64(make_handoff(eroot, eentry, ecfg)), root=eroot)
         check(name, rc == 2 and not list(eroot.glob("n8n-live-*/submit-receipt.json")), out)
 
+    # ponytail: B1 consuming literals, not keyword mentions.
+    droot = Path(tempfile.mkdtemp(prefix="transport-neg-"))
+    dentry, dcfg = write_stub_files(droot)
+    dseen = droot / "execution-marker.txt"
+    dentry.write_text(
+        '"""effective_config.json QLIB_OUT_DIR"""\nfrom pathlib import Path\n'
+        "Path(" + repr(str(dseen)) + ').write_text("executed")\n'
+    )
+    rc, out = run("submit", b64(make_handoff(droot, dentry, dcfg)), root=droot)
+    check("T23a docstring both tokens never executes",
+          rc == 2 and "identity" in out and not dseen.exists()
+          and not list(droot.glob("n8n-live-*")), out)
+
+    uroot = Path(tempfile.mkdtemp(prefix="transport-neg-"))
+    uentry, ucfg = write_stub_files(uroot)
+    useen = uroot / "execution-marker.txt"
+    uentry.write_text(
+        "from pathlib import Path\nunused=(\"effective_config.json\", \"QLIB_OUT_DIR\")\n"
+        "Path(" + repr(str(useen)) + ').write_text("executed")\n'
+    )
+    rc, out = run("submit", b64(make_handoff(uroot, uentry, ucfg)), root=uroot)
+    check("T23b unused tuple both tokens never executes",
+          rc == 2 and "identity" in out and not useen.exists()
+          and not list(uroot.glob("n8n-live-*")), out)
+
+    rroot = Path(tempfile.mkdtemp(prefix="transport-neg-"))
+    rentry, rcfg = write_stub_files(rroot)
+    actual = rroot / "actual-native-root"
+    actual.mkdir()
+    wrong = json.loads(rcfg.read_text())
+    wrong["candidate"] = {"path": "wrong-consumed.md", "git_blob_sha": "d" * 40}
+    (actual / "effective_config.json").write_text(json.dumps(wrong, sort_keys=True))
+    rcode = rentry.read_text()
+    start = rcode.index("frozen_cfg = {")
+    end = rcode.index('(out / "mlruns"', start)
+    stub_cfg = 'frozen_cfg = json.loads(Path(__file__).with_name("effective_config.json").read_text())\n'
+    rcode = rcode[:start] + stub_cfg + rcode[end:]
+    replacement = 'ROOT: Path = Path(__file__).with_name("actual-native-root")\n'
+    replacement += 'frozen_cfg=json.loads((ROOT / "effective_config.json").read_text())\n'
+    rcode = rcode.replace(stub_cfg, replacement)
+    rseen = rroot / "execution-marker.txt"
+    rcode = "from pathlib import Path\nPath(" + repr(str(rseen)) + ').write_text("executed")\n' + rcode
+    rentry.write_text(rcode)
+    rc, out = run("submit", b64(make_handoff(rroot, rentry, rcfg)), root=rroot)
+    check("T23c relative other-root with ROOT pin fails before executing",
+          rc == 2 and "identity mismatch" in out and not rseen.exists()
+          and not list(rroot.glob("n8n-live-*/submit-receipt.json")), out)
+
+    # ponytail: B2 shared live proof rejects native drift before PASS.
+    live_commit = "bee09f23d938b96c2c1ef82d891aa0abfa171cd0"
+    live_image = "qlib:main-bee09f23-arm64"
+    live_digest = "sha256:8bee2a8beed672b17096ad44db5064dbaadcafe124c2ee989cd03b47683355b9"
+
+    def write_live_stub(root):
+        entry, config = write_stub_files(root)
+        value = json.loads(config.read_text())
+        value["runtime"] = {"commit": live_commit, "image": live_image, "image_digest": live_digest}
+        value["data"] = {"provider_file_count": 0,
+                         "provider_manifest_sha256": hashlib.sha256(b"[]").hexdigest()}
+        value["strategy"] = {"family": "test-only"}
+        config.write_text(json.dumps(value, sort_keys=True))
+        code = entry.read_text()
+        start = code.index("frozen_cfg = {")
+        end = code.index('(out / "mlruns"', start)
+        code = code[:start] + stub_cfg + code[end:]
+        code = code.replace('write_text("{}")', 'write_text("[]")')
+        addition = '(out / "portfolio_report.csv").write_text("a\\n1\\n")\n'
+        addition += '(out / "trade_indicators.csv").write_text("a\\n1\\n")\n'
+        addition += 'adir = out / "mlruns" / "%s" / "%s" / "artifacts"\n' % (EXP_ID, RUN_ID)
+        addition += 'for name in ("events.csv", "signals.csv", "summary.json", "portfolio_report.csv"):\n'
+        addition += '    (adir / "backtest" / name).write_bytes((out / name).read_bytes())\n'
+        code = code.replace("readback = {", addition + "readback = {", 1)
+        code = code.replace('(out / "mlflow_readback.json").write_text(',
+                            'readback["artifact_names"] = '
+                            '[p.relative_to(adir).as_posix() for p in sorted(adir.rglob("*")) '
+                            'if p.is_file()]\n(out / "mlflow_readback.json").write_text(', 1)
+        entry.write_text(code)
+        return entry, config
+
+    def live_handoff(root, entry, config):
+        handoff = make_handoff(root, entry, config)
+        handoff["qlib_runtime_commit"] = live_commit
+        return handoff
+
+    for name, action in [
+        ("T24a submit native events drift fails before PASS",
+         '(adir / "backtest/events.csv").write_text("changed-native-only\\n1\\n")'),
+        ("T24b submit native summary drift fails before PASS",
+         '(adir / "backtest/summary.json").write_text("{\\"evaluation_rows_including_force_flat\\": 999}\\n")'),
+        ("T24c submit native provider drift fails before PASS",
+         '(adir / "repro/provider-manifest.json").write_text("{}")'),
+        ("T24d submit missing portfolio fails before PASS",
+         '(out / "portfolio_report.csv").unlink()\n'
+         '(adir / "backtest/portfolio_report.csv").unlink()\n'
+         'manifest.pop("portfolio_report.csv")\n'
+         'readback["artifact_names"].remove("backtest/portfolio_report.csv")\n'
+         '(out / "mlflow_readback.json").write_text(json.dumps(readback, sort_keys=True))\n'
+         'p = out / "mlflow_readback.json"\n'
+         'manifest[p.name] = {"bytes": p.stat().st_size, '
+         '"sha256": hashlib.sha256(p.read_bytes()).hexdigest()}\n'
+         '(out / "manifest.json").write_text(json.dumps(manifest, sort_keys=True))'),
+        ("T24e submit missing trade indicators fails before PASS",
+         '(out / "trade_indicators.csv").unlink()\n'
+         'manifest.pop("trade_indicators.csv")\n'
+         '(out / "manifest.json").write_text(json.dumps(manifest, sort_keys=True))'),
+    ]:
+        lroot = Path(tempfile.mkdtemp(prefix="transport-neg-"))
+        lentry, lcfg = write_live_stub(lroot)
+        lcode = lentry.read_text()
+        assert lcode.count(tail) == 1
+        lentry.write_text(lcode.replace(tail, action + "\n" + tail))
+        rc, out = run("submit", b64(live_handoff(lroot, lentry, lcfg)), root=lroot)
+        check(name, rc == 2 and not list(lroot.glob("n8n-live-*/submit-receipt.json")), out)
+
+    lroot = Path(tempfile.mkdtemp(prefix="transport-neg-"))
+    lentry, lcfg = write_live_stub(lroot)
+    rc, out = run("submit", b64(live_handoff(lroot, lentry, lcfg)), root=lroot)
+    check("T24f live-shape positive still passes",
+          rc == 0 and "PASS" in out and list(lroot.glob("n8n-live-*/submit-receipt.json")), out)
+
     print("ALL DETERMINISTIC CHECKS PASSED")
 
 

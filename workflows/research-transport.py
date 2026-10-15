@@ -287,6 +287,108 @@ def decode_handoff(payload_b64):
     return obj, None
 
 
+def _consuming_literals(source_text):
+    """Collect string literals in consuming positions. None on syntax error."""
+    try:
+        tree = ast.parse(source_text)
+    except (SyntaxError, ValueError):
+        return None
+    doc_ids = set()
+    if tree.body and isinstance(tree.body[0], ast.Expr):
+        val = tree.body[0].value
+        if isinstance(val, ast.Constant) and isinstance(val.value, str):
+            doc_ids.add(id(val))
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.body and isinstance(node.body[0], ast.Expr):
+                val = node.body[0].value
+                if isinstance(val, ast.Constant) and isinstance(val.value, str):
+                    doc_ids.add(id(val))
+    out = []
+
+    def visit(node, parent):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if id(node) not in doc_ids:
+                if isinstance(parent, (ast.Call, ast.Subscript, ast.BinOp, ast.keyword)):
+                    out.append(node.value)
+        for child in ast.iter_child_nodes(node):
+            visit(child, node)
+
+    visit(tree, None)
+    return out
+
+
+def _eval_pinned_path(node, entry_dir):
+    """Resolve one ROOT expression to an absolute path. None when unknown."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        if node.value.startswith("/"):
+            return node.value
+        return None
+    if isinstance(node, ast.Call):
+        func = node.func
+        if isinstance(func, ast.Name) and func.id == "Path":
+            if len(node.args) == 1:
+                arg = node.args[0]
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                    if arg.value.startswith("/"):
+                        return arg.value
+                if isinstance(arg, ast.Name) and arg.id == "__file__":
+                    return entry_dir
+        if isinstance(func, ast.Attribute) and func.attr == "with_name":
+            if len(node.args) == 1:
+                arg = node.args[0]
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                    base = _eval_pinned_path(func.value, entry_dir)
+                    if base is None:
+                        return None
+                    # ponytail: Path(__file__).with_name() resolves beside the entry.
+                    if base == entry_dir:
+                        return os.path.join(entry_dir, arg.value)
+                    return os.path.join(base, arg.value)
+        return None
+    if isinstance(node, ast.Attribute) and node.attr == "parent":
+        base = _eval_pinned_path(node.value, entry_dir)
+        if base is None:
+            return None
+        # ponytail: Path(__file__).parent is the entry directory itself.
+        return base
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+        left = _eval_pinned_path(node.left, entry_dir)
+        if left is not None:
+            right = node.right
+            if isinstance(right, ast.Constant) and isinstance(right.value, str):
+                return os.path.join(left, right.value)
+        return None
+    return None
+
+
+def _resolve_pinned_root(source_text, entry_ref):
+    """Return the pinned ROOT absolute path. None when absent or unknown."""
+    try:
+        tree = ast.parse(source_text)
+    except (SyntaxError, ValueError):
+        return None
+    try:
+        entry_dir = str(Path(os.path.realpath(entry_ref)).parent)
+    except (OSError, ValueError):
+        return None
+    for node in tree.body:
+        target_value = None
+        if isinstance(node, ast.Assign):
+            if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                if node.targets[0].id == "ROOT":
+                    target_value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name) and node.target.id == "ROOT":
+                target_value = node.value
+        if target_value is None:
+            continue
+        resolved = _eval_pinned_path(target_value, entry_dir)
+        if resolved is not None:
+            return resolved
+    return None
+
+
 def _code_literals(source_text):
     """Collect string literals from code, ignoring comments. None on syntax error."""
     try:
@@ -374,9 +476,9 @@ def check_frozen_binding(obj):
     if want != got:
         return "config/execution identity mismatch"
     # ponytail: a matching declaration must not authorize a program that
-    # never consumes the config. Require code literals for the frozen config
-    # contract and the fixed out dir. Comments never count, so a marker that
-    # only mentions the tokens in a comment fails before any execution.
+    # never consumes the config. Require consuming literals for the frozen
+    # contract and the fixed out dir. Docstrings, comments, and unused
+    # values never count, so they fail before any execution.
     try:
         entry_bytes = Path(obj["entrypoint_ref"]).read_bytes()
     except OSError:
@@ -385,7 +487,7 @@ def check_frozen_binding(obj):
         entry_text = entry_bytes.decode("utf-8")
     except UnicodeDecodeError:
         return "entrypoint is not readable"
-    literals = _code_literals(entry_text)
+    literals = _consuming_literals(entry_text)
     if literals is None:
         return "config/execution identity mismatch"
     if not any("effective_config.json" in lit for lit in literals):
@@ -415,6 +517,13 @@ def check_frozen_binding(obj):
                 return "config/execution identity mismatch"
         except (OSError, ValueError):
             return "config/execution identity mismatch"
+    resolved = _resolve_pinned_root(entry_text, obj["entrypoint_ref"])
+    if resolved is not None:
+        try:
+            if os.path.realpath(resolved) != os.path.realpath(str(Path(declared_real).parent)):
+                return "config/execution identity mismatch"
+        except (OSError, ValueError):
+            return "config/execution identity mismatch"
     # ponytail: bind the declared runtime to the fixed runtime that executes
     # it. Local stub pythons skip this; the fixed runtime python enforces the
     # frozen commit and, when declared, the fixed image digest.
@@ -429,6 +538,47 @@ def check_frozen_binding(obj):
         declared_digest = runtime.get("image_digest")
         if declared_digest is not None and declared_digest != FIXED_IMAGE_DIGEST:
             return "config/runtime identity mismatch"
+    return None
+
+
+def check_live_evidence(out_dir, run_ref, manifest, repro_cfg, providers):
+    """Share live backtest/provider/portfolio checks. None when clean."""
+    if isinstance(repro_cfg, dict) and ("data" in repro_cfg or "strategy" in repro_cfg):
+        for name in REQUIRED_BACKTEST_COPY:
+            root_bytes = read_contained(out_dir, name)
+            native_bytes = read_contained(run_ref / "artifacts" / "backtest", name)
+            if root_bytes is None and native_bytes is None:
+                continue
+            if root_bytes is None or native_bytes is None:
+                return "native backtest bytes mismatch: " + name
+            if root_bytes != native_bytes:
+                return "native backtest bytes mismatch: " + name
+    data = repro_cfg.get("data") if isinstance(repro_cfg, dict) else None
+    if isinstance(data, dict) and "provider_manifest_sha256" in data:
+        if not isinstance(providers, list) or len(providers) != 1:
+            return "repro/provider identity mismatch"
+        pm_bytes = read_contained(run_ref / "artifacts", providers[0])
+        if pm_bytes is None:
+            return "repro/provider identity mismatch"
+        try:
+            pm_obj = json.loads(pm_bytes.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return "repro/provider identity mismatch"
+        try:
+            compact = json.dumps(pm_obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        except (TypeError, ValueError):
+            return "repro/provider identity mismatch"
+        if hashlib.sha256(compact).hexdigest() != data.get("provider_manifest_sha256"):
+            return "repro/provider identity mismatch"
+        want_count = data.get("provider_file_count")
+        if not isinstance(want_count, int):
+            return "repro/provider identity mismatch"
+        if not isinstance(pm_obj, list) or len(pm_obj) != want_count:
+            return "repro/provider identity mismatch"
+    if isinstance(repro_cfg, dict) and ("data" in repro_cfg or "strategy" in repro_cfg):
+        for name in ("portfolio_report.csv", "trade_indicators.csv"):
+            if name not in manifest:
+                return "required evidence is missing from the manifest: " + name
     return None
 
 
@@ -527,7 +677,8 @@ def check_submit_evidence(out_dir, run_id, experiment_id, obj, disk):
     repro = [a for a in artifacts if isinstance(a, str) and a.startswith("repro/")]
     configs = [a for a in repro if a.endswith("/effective_config.json")]
     entries = [a for a in repro if a.endswith(".py")]
-    if len(configs) != 1 or len(entries) != 1:
+    providers = [a for a in repro if a.endswith("provider-manifest.json")]
+    if len(configs) != 1 or len(entries) != 1 or len(providers) > 1:
         return "repro/candidate identity mismatch"
     run_ref = out_dir / "mlruns" / experiment_id / run_id
     repro_cfg_bytes = read_contained(run_ref / "artifacts", configs[0])
@@ -558,6 +709,10 @@ def check_submit_evidence(out_dir, run_id, experiment_id, obj, disk):
     cfg_digest = file_sha256(str(repro_cfg_path))
     if cfg_digest is None or cfg_digest != obj.get("effective_config_sha256"):
         return "repro/config identity mismatch"
+    # ponytail: share the live native/provider/portfolio proof before PASS.
+    reason = check_live_evidence(out_dir, run_ref, manifest, repro_cfg, providers)
+    if reason is not None:
+        return reason
     return None
 
 
@@ -994,54 +1149,17 @@ def cmd_readback(run_id):
         return fail("repro/config identity mismatch")
     # ponytail: verify native artifact bytes, not only inventory names. New
     # submits record hashes; legacy receipts without the field still verify
-    # via root-copy equality and provider binding below.
+    # via the shared live proof below.
     recorded = submit.get("native_artifact_sha256")
     if isinstance(recorded, dict):
         current = native_artifact_hashes(run_ref)
         if current is None or current != recorded:
             return fail("native artifact bytes mismatch")
-    # ponytail: each live native backtest copy must equal its verified root
-    # file. Stubs carry no data/strategy section and skip this; their bytes
-    # are still bound by the recorded hashes above.
-    if isinstance(repro_cfg, dict) and ("data" in repro_cfg or "strategy" in repro_cfg):
-        for name in REQUIRED_BACKTEST_COPY:
-            root_bytes = read_contained(real_out, name)
-            native_bytes = read_contained(run_ref / "artifacts" / "backtest", name)
-            if root_bytes is None and native_bytes is None:
-                continue
-            if root_bytes is None or native_bytes is None:
-                return fail("native backtest bytes mismatch: " + name)
-            if root_bytes != native_bytes:
-                return fail("native backtest bytes mismatch: " + name)
-    # ponytail: bind the provider manifest to the frozen config digest.
-    data = repro_cfg.get("data") if isinstance(repro_cfg, dict) else None
-    if isinstance(data, dict) and "provider_manifest_sha256" in data:
-        if len(providers) != 1:
-            return fail("repro/provider identity mismatch")
-        pm_bytes = read_contained(run_ref / "artifacts", providers[0])
-        if pm_bytes is None:
-            return fail("repro/provider identity mismatch")
-        try:
-            pm_obj = json.loads(pm_bytes.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            return fail("repro/provider identity mismatch")
-        try:
-            compact = json.dumps(pm_obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        except (TypeError, ValueError):
-            return fail("repro/provider identity mismatch")
-        if hashlib.sha256(compact).hexdigest() != data.get("provider_manifest_sha256"):
-            return fail("repro/provider identity mismatch")
-        want_count = data.get("provider_file_count")
-        if not isinstance(want_count, int):
-            return fail("repro/provider identity mismatch")
-        if not isinstance(pm_obj, list) or len(pm_obj) != want_count:
-            return fail("repro/provider identity mismatch")
-    # ponytail: live runs must keep portfolio and trade evidence. Stubs have
-    # no data/strategy section and skip this; live configs carry it.
-    if isinstance(repro_cfg, dict) and ("data" in repro_cfg or "strategy" in repro_cfg):
-        for name in ("portfolio_report.csv", "trade_indicators.csv"):
-            if name not in manifest:
-                return fail("required evidence is missing from the manifest: " + name)
+    # ponytail: share the same live proof as submit. Submit already
+    # enforces this before PASS, so readback never accepts a drift.
+    reason = check_live_evidence(real_out, run_ref, manifest, repro_cfg, providers)
+    if reason is not None:
+        return fail(reason)
     refs = {
         "candidate": CANDIDATE_BLOB_API + str(submit["candidate_blob_sha"]),
         "mlflow_run": str(run_ref),
