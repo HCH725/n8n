@@ -9,10 +9,15 @@ field comes from hashes checked here or files the native run wrote.
 
 ponytail: single-file bridge on purpose. Synchronous subprocess only, one fixed
 results root, one out_dir per frozen executable (a re-submit refuses instead of
-clobbering evidence), single-candidate coverage only. Ceilings: RESULTS_ROOT
-holds at most a few hundred run dirs (readback scans one filename per dir);
-SUBMIT_TIMEOUT bounds one native run; run_inputs/cost ride along as declared
-facts and never steer the frozen entrypoint.
+clobbering evidence), single-candidate coverage only. Submit binds the caller
+hashes to the frozen config formal fields before executing; readback verifies
+every manifest entry plus the native run metadata/params/metrics/artifacts and
+keeps run/experiment identity across stdout, disk, receipt, and native. No-argv
+runs only dispatch a strict SSH_ORIGINAL_COMMAND (one verb, one arg). Ceilings:
+RESULTS_ROOT holds at most a few hundred run dirs (readback scans one filename
+per dir); SUBMIT_TIMEOUT bounds one native run; MAX_ARTIFACTS bounds one native
+inventory walk; run_inputs/cost ride along as declared facts and never steer
+the frozen entrypoint.
 """
 
 import argparse
@@ -63,6 +68,14 @@ RESULTS_ROOT_DEFAULT = "/results/_validation"
 OUT_PREFIX = "n8n-live-"
 SUBMIT_TIMEOUT = 1800
 MAX_SCAN_DIRS = 500
+MAX_ARTIFACTS = 500
+
+# ponytail: the forced-command entry accepts exactly these verbs, one arg each.
+FORCED_VERBS = ("submit", "research-submit", "readback", "research-readback")
+
+# ponytail: readback actually reads these four files, so the manifest must
+# cover them. Other manifest entries are verified when listed, never assumed.
+REQUIRED_MANIFEST = ("mlflow_readback.json", "summary.json", "signals.csv", "events.csv")
 
 
 def fail(reason):
@@ -104,6 +117,39 @@ def under_root(path_value, root):
         return os.path.commonpath([str(real), str(root)]) == str(root)
     except ValueError:
         return False
+
+
+def contained(base, target):
+    """True when target resolves inside base. Used for every readback read."""
+    try:
+        real_base = Path(os.path.realpath(base))
+        real_target = Path(os.path.realpath(target))
+    except (OSError, ValueError):
+        return False
+    try:
+        return os.path.commonpath([str(real_target), str(real_base)]) == str(real_base)
+    except ValueError:
+        return False
+
+
+def safe_rel(name):
+    """True when name is a safe relative evidence path, never absolute."""
+    if not isinstance(name, str) or not name or name.startswith("/"):
+        return False
+    return all(part not in ("", ".", "..") for part in name.split("/"))
+
+
+def read_contained(base, name):
+    """Read base/name bytes only when the resolved path stays inside base."""
+    if not safe_rel(name):
+        return None
+    path = Path(base) / name
+    try:
+        if not contained(str(base), str(path)):
+            return None
+        return path.read_bytes()
+    except OSError:
+        return None
 
 
 def file_sha256(path_value):
@@ -222,6 +268,48 @@ def decode_handoff(payload_b64):
     return obj, None
 
 
+def check_frozen_binding(obj):
+    """Prove the verified config is the frozen config the entrypoint uses.
+
+    The native entrypoint reads its sibling effective_config.json, so bind
+    the caller hashes to that file's formal identity fields before running
+    anything. A substring or note mention never counts. No execution here.
+    """
+    try:
+        raw = Path(obj["effective_config_ref"]).read_bytes().decode("utf-8")
+        cfg = json.loads(raw)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return "effective_config is not readable JSON"
+    if not isinstance(cfg, dict):
+        return "effective_config is not a JSON object"
+    cand = cfg.get("candidate")
+    if not isinstance(cand, dict):
+        return "config/candidate identity is missing"
+    if cand.get("path") != obj["candidate_path"]:
+        return "config/candidate identity mismatch"
+    if cand.get("git_blob_sha") != obj["source_blob_sha"]:
+        return "config/candidate identity mismatch"
+    runtime = cfg.get("runtime")
+    if not isinstance(runtime, dict):
+        return "config/runtime identity is missing"
+    if runtime.get("commit") != obj["qlib_runtime_commit"]:
+        return "config/runtime identity mismatch"
+    execution = cfg.get("execution")
+    if not isinstance(execution, dict):
+        return "config/execution identity is missing"
+    if execution.get("entrypoint") != obj["entrypoint_ref"]:
+        return "config/execution identity mismatch"
+    try:
+        same_dir = Path(os.path.realpath(obj["entrypoint_ref"])).parent == Path(
+            os.path.realpath(obj["effective_config_ref"])
+        ).parent
+    except (OSError, ValueError):
+        return "config/execution identity is not resolvable"
+    if not same_dir:
+        return "config/execution identity mismatch"
+    return None
+
+
 def cmd_submit(payload_b64):
     """Verify one handoff, run the existing native entrypoint, print receipt."""
     obj, reason = decode_handoff(payload_b64)
@@ -245,8 +333,11 @@ def cmd_submit(payload_b64):
     config_digest = file_sha256(obj["effective_config_ref"])
     if config_digest is None or config_digest != obj["effective_config_sha256"]:
         return fail("effective_config hash mismatch")
+    reason = check_frozen_binding(obj)
+    if reason is not None:
+        return fail(reason)
     out_dir = out_dir_for(obj, root)
-    if out_dir.exists():
+    if out_dir.is_symlink() or out_dir.exists():
         return fail("result exists; refuse overwrite: " + out_dir.name)
     env = dict(os.environ)
     env["QLIB_OUT_DIR"] = str(out_dir)
@@ -281,14 +372,18 @@ def cmd_submit(payload_b64):
         return fail("native readback file is missing")
     if disk.get("run_id") != run_id:
         return fail("native run identity mismatch")
+    if str(disk.get("experiment_id")) != experiment_id:
+        return fail("native experiment identity mismatch")
     cost_declared = obj.get("research_cost_model") is not None or obj.get("run_inputs") is not None
     receipt = {
         "candidate_path": obj["candidate_path"],
         "candidate_blob_sha": obj["source_blob_sha"],
+        "source_commit": obj["source_commit"],
         "entrypoint_ref": obj["entrypoint_ref"],
         "entrypoint_sha256": obj["entrypoint_sha256"],
         "effective_config_ref": obj["effective_config_ref"],
         "effective_config_sha256": obj["effective_config_sha256"],
+        "qlib_runtime_commit": obj["qlib_runtime_commit"],
         "run_id": run_id,
         "experiment_id": experiment_id,
         "cost_declared": bool(cost_declared),
@@ -325,7 +420,7 @@ def cmd_submit(payload_b64):
 
 
 def find_run_dir(root, run_id):
-    """Find the one out_dir whose readback names this run id, else None."""
+    """Find the one contained out_dir naming this run id, else None."""
     try:
         entries = list(root.iterdir())
     except OSError:
@@ -334,18 +429,99 @@ def find_run_dir(root, run_id):
         return None
     hits = []
     for entry in entries:
-        readback = entry / "mlflow_readback.json"
-        if not readback.is_file():
+        try:
+            real = Path(os.path.realpath(entry))
+        except (OSError, ValueError):
+            continue
+        if not contained(str(root), str(real)):
+            continue
+        payload = read_contained(real, "mlflow_readback.json")
+        if payload is None:
             continue
         try:
-            payload = json.loads(readback.read_bytes().decode("utf-8"))
-        except (OSError, ValueError, UnicodeDecodeError):
+            data = json.loads(payload.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
             continue
-        if isinstance(payload, dict) and payload.get("run_id") == run_id:
-            hits.append(entry)
+        if isinstance(data, dict) and data.get("run_id") == run_id:
+            hits.append(real)
     if len(hits) != 1:
         return None
     return hits[0]
+
+
+def parse_run_meta(text):
+    """Parse file-store meta.yaml run identity without a YAML library."""
+    run_id = experiment_id = status = None
+    for line in text.splitlines():
+        if line.startswith("run_id:"):
+            run_id = line.split(":", 1)[1].strip()
+        elif line.startswith("experiment_id:"):
+            experiment_id = line.split(":", 1)[1].strip().strip("'\"")
+        elif line.startswith("status:"):
+            status = line.split(":", 1)[1].strip()
+    return run_id, experiment_id, status
+
+
+def read_native_params(run_ref):
+    """Read native params files, or None when the layout is not verifiable."""
+    params = {}
+    pdir = run_ref / "params"
+    try:
+        if not pdir.is_dir():
+            return None
+        for child in sorted(pdir.iterdir()):
+            if child.is_symlink() or not child.is_file():
+                return None
+            if not contained(str(run_ref), str(child)):
+                return None
+            params[child.name] = child.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return params
+
+
+def read_native_metrics(run_ref):
+    """Read latest native metric values, or None when not verifiable."""
+    metrics = {}
+    mdir = run_ref / "metrics"
+    try:
+        if not mdir.is_dir():
+            return None
+        for child in sorted(mdir.iterdir()):
+            if child.is_symlink() or not child.is_file():
+                return None
+            if not contained(str(run_ref), str(child)):
+                return None
+            lines = child.read_text(encoding="utf-8").strip().splitlines()
+            if not lines:
+                return None
+            try:
+                metrics[child.name] = float(lines[-1].split()[1])
+            except (IndexError, ValueError):
+                return None
+    except OSError:
+        return None
+    return metrics
+
+
+def artifact_inventory(run_ref):
+    """List native artifact paths, or None on any symlink/escape/overflow."""
+    adir = run_ref / "artifacts"
+    names = []
+    try:
+        paths = sorted(adir.rglob("*"))
+    except OSError:
+        return None
+    for path in paths:
+        if path.is_symlink():
+            return None
+        if path.is_file():
+            if not contained(str(adir), str(path)):
+                return None
+            names.append(path.relative_to(adir).as_posix())
+            if len(names) > MAX_ARTIFACTS:
+                return None
+    return names
 
 
 def cmd_readback(run_id):
@@ -358,12 +534,21 @@ def cmd_readback(run_id):
     out_dir = find_run_dir(root, run_id)
     if out_dir is None:
         return fail("run_id is unknown or ambiguous")
+    real_out = out_dir
+    readback_bytes = read_contained(real_out, "mlflow_readback.json")
+    manifest_bytes = read_contained(real_out, "manifest.json")
+    submit_bytes = read_contained(real_out, "submit-receipt.json")
+    if readback_bytes is None or manifest_bytes is None or submit_bytes is None:
+        return fail("run evidence is not readable")
     try:
-        readback_bytes = (out_dir / "mlflow_readback.json").read_bytes()
         readback = json.loads(readback_bytes.decode("utf-8"))
-        manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
-        submit = json.loads((out_dir / "submit-receipt.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError, UnicodeDecodeError):
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+        submit = json.loads(submit_bytes.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return fail("run evidence is not readable")
+    if not isinstance(readback, dict) or not isinstance(manifest, dict):
+        return fail("run evidence is not readable")
+    if not isinstance(submit, dict):
         return fail("run evidence is not readable")
     if readback.get("run_id") != run_id or readback.get("status") != "FINISHED":
         return fail("run is not FINISHED")
@@ -376,14 +561,37 @@ def cmd_readback(run_id):
     counts = (len(params), len(metrics), len(artifacts))
     if not all(isinstance(n, int) and n > 0 for n in counts):
         return fail("run evidence is empty")
+    if not isinstance(artifacts, list) or not all(safe_rel(a) for a in artifacts):
+        return fail("artifact inventory has an unsafe path")
+    for name in REQUIRED_MANIFEST:
+        if name not in manifest:
+            return fail("required evidence is missing from the manifest: " + name)
+    for name, entry in manifest.items():
+        if not safe_rel(name):
+            return fail("manifest entry escapes the run: " + str(name))
+        if not isinstance(entry, dict):
+            return fail("manifest/content mismatch: " + str(name))
+        claimed_bytes = entry.get("bytes")
+        claimed_sha = entry.get("sha256")
+        if not isinstance(claimed_bytes, int) or claimed_bytes < 0:
+            return fail("manifest/content mismatch: " + str(name))
+        if not isinstance(claimed_sha, str) or not HEX64.match(claimed_sha):
+            return fail("manifest/content mismatch: " + str(name))
+        actual = read_contained(real_out, name)
+        if actual is None or len(actual) != claimed_bytes:
+            return fail("manifest/content mismatch: " + str(name))
+        if hashlib.sha256(actual).hexdigest() != claimed_sha:
+            return fail("manifest/content mismatch: " + str(name))
     manifest_entry = manifest.get("mlflow_readback.json") or {}
     if manifest_entry.get("sha256") != hashlib.sha256(readback_bytes).hexdigest():
         return fail("manifest/readback identity mismatch")
-    manifest_sha256 = file_sha256(str(out_dir / "manifest.json"))
+    manifest_sha256 = file_sha256(str(real_out / "manifest.json"))
     if manifest_sha256 is None or not HEX64.match(manifest_sha256):
         return fail("manifest identity is invalid")
     if submit.get("run_id") != run_id:
         return fail("submit/run identity mismatch")
+    if str(submit.get("experiment_id")) != experiment_id:
+        return fail("submit/experiment identity mismatch")
     for key in ("entrypoint_ref", "effective_config_ref"):
         ref = submit.get(key)
         if not isinstance(ref, str) or not under_root(ref, root):
@@ -395,20 +603,83 @@ def cmd_readback(run_id):
         digest = file_sha256(submit[ref_key])
         if digest is None or digest != submit.get(sha_key):
             return fail("submit/executable identity mismatch")
-    run_ref = out_dir / "mlruns" / experiment_id / run_id
-    if not run_ref.is_dir():
+    run_ref = real_out / "mlruns" / experiment_id / run_id
+    if not contained(str(real_out), str(run_ref)) or not run_ref.is_dir():
         return fail("mlflow run is missing")
+    meta_bytes = read_contained(run_ref, "meta.yaml")
+    if meta_bytes is None:
+        return fail("native run metadata is missing")
+    try:
+        native_run, native_exp, native_status = parse_run_meta(
+            meta_bytes.decode("utf-8")
+        )
+    except UnicodeDecodeError:
+        return fail("native run metadata is missing")
+    if native_run != run_id or native_exp != experiment_id:
+        return fail("native run identity mismatch")
+    if native_status != "3":
+        return fail("native run is not FINISHED")
+    native_params = read_native_params(run_ref)
+    if native_params is None or native_params != params:
+        return fail("native params mismatch")
+    native_metrics = read_native_metrics(run_ref)
+    if native_metrics is None or set(native_metrics) != set(metrics):
+        return fail("native metrics mismatch")
+    for key, claimed in metrics.items():
+        try:
+            same = float(native_metrics[key]) == float(claimed)
+        except (TypeError, ValueError):
+            same = False
+        if not same:
+            return fail("native metrics mismatch")
+    inventory = artifact_inventory(run_ref)
+    if inventory is None or not set(artifacts) <= set(inventory):
+        return fail("native artifact inventory mismatch")
     repro = [a for a in artifacts if isinstance(a, str) and a.startswith("repro/")]
     configs = [a for a in repro if a.endswith("/effective_config.json")]
     entries = [a for a in repro if a.endswith(".py")]
     providers = [a for a in repro if a.endswith("provider-manifest.json")]
     if len(configs) != 1 or len(entries) != 1 or len(providers) > 1:
         return fail("repro artifacts are ambiguous")
+    repro_cfg_bytes = read_contained(run_ref / "artifacts", configs[0])
+    if repro_cfg_bytes is None:
+        return fail("repro/config identity mismatch")
+    try:
+        repro_cfg = json.loads(repro_cfg_bytes.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return fail("repro/config identity mismatch")
+    if not isinstance(repro_cfg, dict):
+        return fail("repro/config identity mismatch")
+    repro_cand = repro_cfg.get("candidate")
+    if not isinstance(repro_cand, dict):
+        return fail("repro/candidate identity mismatch")
+    if repro_cand.get("path") != submit.get("candidate_path"):
+        return fail("repro/candidate identity mismatch")
+    if repro_cand.get("git_blob_sha") != submit.get("candidate_blob_sha"):
+        return fail("repro/candidate identity mismatch")
+    if "qlib_runtime_commit" in submit:
+        repro_runtime = repro_cfg.get("runtime")
+        if not isinstance(repro_runtime, dict):
+            return fail("repro/runtime identity mismatch")
+        if repro_runtime.get("commit") != submit.get("qlib_runtime_commit"):
+            return fail("repro/runtime identity mismatch")
+    repro_entry = run_ref / "artifacts" / entries[0]
+    if not contained(str(run_ref / "artifacts"), str(repro_entry)):
+        return fail("repro/executable identity mismatch")
+    entry_digest = file_sha256(str(repro_entry))
+    if entry_digest is None or entry_digest != submit.get("entrypoint_sha256"):
+        return fail("repro/executable identity mismatch")
+    repro_cfg_path = run_ref / "artifacts" / configs[0]
+    if not contained(str(run_ref / "artifacts"), str(repro_cfg_path)):
+        return fail("repro/config identity mismatch")
+    cfg_digest = file_sha256(str(repro_cfg_path))
+    if cfg_digest is None or cfg_digest != submit.get("effective_config_sha256"):
+        return fail("repro/config identity mismatch")
     refs = {
         "candidate": CANDIDATE_BLOB_API + str(submit["candidate_blob_sha"]),
         "mlflow_run": str(run_ref),
-        "mlflow_readback": str(out_dir / "mlflow_readback.json"),
-        "manifest": str(out_dir / "manifest.json"),
+        "mlflow_readback": str(real_out / "mlflow_readback.json"),
+        "manifest": str(real_out / "manifest.json"),
         "effective_config": str(run_ref / "artifacts" / configs[0]),
         "entrypoint": str(run_ref / "artifacts" / entries[0]),
     }
@@ -417,19 +688,22 @@ def cmd_readback(run_id):
     for key, ref in refs.items():
         if key == "candidate":
             continue
-        if not Path(ref).exists():
+        if not contained(str(real_out), ref) or not Path(ref).exists():
             return fail("evidence reference is missing")
     blob_sha = str(submit["candidate_blob_sha"])
-    candidate_ok = (
-        HEX40.match(blob_sha) is not None
-        and blob_sha in (run_ref / "artifacts" / configs[0]).read_text(encoding="utf-8", errors="replace")
-        and str(submit["candidate_path"]) in (run_ref / "artifacts" / configs[0]).read_text(encoding="utf-8", errors="replace")
-    )
+    candidate_ok = HEX40.match(blob_sha) is not None
+    if not candidate_ok:
+        return fail("candidate identity is invalid")
     try:
-        summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
-        signals = (out_dir / "signals.csv").read_text(encoding="utf-8").splitlines()
-        events = (out_dir / "events.csv").read_text(encoding="utf-8").splitlines()
-    except (OSError, ValueError, UnicodeDecodeError):
+        summary_bytes = read_contained(real_out, "summary.json")
+        signals_bytes = read_contained(real_out, "signals.csv")
+        events_bytes = read_contained(real_out, "events.csv")
+        if summary_bytes is None or signals_bytes is None or events_bytes is None:
+            return fail("run evidence is not readable")
+        summary = json.loads(summary_bytes.decode("utf-8"))
+        signals = signals_bytes.decode("utf-8").splitlines()
+        events = events_bytes.decode("utf-8").splitlines()
+    except (ValueError, UnicodeDecodeError, OSError):
         return fail("run evidence is not readable")
     data_ok = (
         isinstance(params.get("symbol"), str) and len(params["symbol"]) > 0
@@ -481,8 +755,48 @@ def cmd_readback(run_id):
     return 0
 
 
+def parse_forced_command(value):
+    """Strictly parse SSH_ORIGINAL_COMMAND for the fixed launch shape.
+
+    The restricted key runs this file with no argv; the only command text
+    lives in SSH_ORIGINAL_COMMAND. Accept exactly one known verb plus one
+    argument, with one optional leading "cd / ;". Anything else fails
+    closed. Return (verb, arg) or (None, reason). Never launches a shell.
+    """
+    if not isinstance(value, str) or not value.strip() or len(value) > 8192:
+        return None, "forced-command input is missing or invalid"
+    text = value.strip()
+    if ";" in text:
+        prefix, _, rest = text.partition(";")
+        if prefix.strip() != "cd /" or ";" in rest:
+            return None, "forced-command input is missing or invalid"
+        text = rest
+    tokens = text.strip().split()
+    if len(tokens) != 2:
+        return None, "forced-command input is missing or invalid"
+    verb, arg = tokens
+    if verb not in FORCED_VERBS:
+        return None, "forced-command input is missing or invalid"
+    if verb in ("readback", "research-readback"):
+        if not RUNID.match(arg):
+            return None, "forced-command input is missing or invalid"
+    else:
+        if len(arg) > 65536 or re.fullmatch(r"[A-Za-z0-9+/=]+", arg) is None:
+            return None, "forced-command input is missing or invalid"
+    return (verb, arg), None
+
+
 def main(argv):
     """Parse args and dispatch to one subcommand."""
+    if not argv:
+        forced = os.environ.get("SSH_ORIGINAL_COMMAND")
+        parsed, reason = parse_forced_command(forced)
+        if parsed is None:
+            return fail(reason or "forced-command input is missing or invalid")
+        verb, arg = parsed
+        if verb in ("submit", "research-submit"):
+            return cmd_submit(arg)
+        return cmd_readback(arg)
     parser = argparse.ArgumentParser(description="Bridge a handoff to the native Qlib path.")
     parser.add_argument(
         "cmd",
