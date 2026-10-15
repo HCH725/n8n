@@ -33,6 +33,15 @@ const CANDIDATE_PATH = 'donchian-20-10-breakout-btcusdt-1h-2026-10-06.md';
 const RESULTS_ROOT = '/results/_validation';
 const CELLS_DIR = RESULTS_ROOT + '/formal-cells-round0';
 
+// The frozen transport prints exactly these 10 keys for a submit; it never
+// prints `cost_declared` (that fact rides only in the on-disk submit receipt,
+// research-transport.py). The fixture must reproduce this shape so these checks
+// track the live contract instead of a convenient fiction.
+const FROZEN_NODE04_KEYS = [
+  'candidate_blob_sha', 'candidate_path', 'effective_config_sha256', 'entrypoint_sha256',
+  'experiment_id', 'node04', 'out_dir', 'refs', 'run_id', 'status',
+];
+
 function nodeByName(name) {
   const node = workflow.nodes.find((candidate) => candidate.name === name);
   assert(node, 'missing node: ' + name);
@@ -144,17 +153,24 @@ function campaignManifest(ids) {
 }
 
 function cleanSubmitReceipt(handoff) {
+  const outDir = handoff.evidence_refs.manifest.replace('/manifest.json', '');
+  const runId = hexPad('run:' + handoff.effective_config_sha256, 32);
+  const experimentId = '640215677191042801';
   return {
     node04: 'PASS',
     candidate_path: handoff.candidate_path,
     candidate_blob_sha: handoff.source_blob_sha,
     entrypoint_sha256: handoff.entrypoint_sha256,
     effective_config_sha256: handoff.effective_config_sha256,
-    run_id: hexPad('run:' + handoff.effective_config_sha256, 32),
-    experiment_id: '640215677191042801',
-    out_dir: handoff.evidence_refs.manifest.replace('/manifest.json', ''),
+    run_id: runId,
+    experiment_id: experimentId,
+    out_dir: outDir,
     status: 'FINISHED',
-    cost_declared: true,
+    refs: {
+      mlflow_run: outDir + '/mlruns/' + experimentId + '/' + runId,
+      mlflow_readback: handoff.evidence_refs.mlflow_readback,
+      manifest: handoff.evidence_refs.manifest,
+    },
   };
 }
 
@@ -260,6 +276,39 @@ function main() {
       effective_config_sha256: '7a976cce5a6d418c635af073e9df7f553b6893259c79e59722f49b368c28d1d2',
       qlib_runtime_commit: RUNTIME_COMMIT,
     }) === '8b37e4ca2140');
+
+  // T3b node 05 tracks the frozen Node04 contract. The printed receipt carries
+  // no cost flag, so the cost fact must come from the handoff, under the
+  // transport's own rule (research_cost_model or run_inputs).
+  const fixtureReceipt = cleanSubmitReceipt(campaignManifest(expected).cells[0]);
+  check('clean submit fixture is the frozen 10-key Node04 receipt shape',
+    JSON.stringify(Object.keys(fixtureReceipt).sort()) === JSON.stringify(FROZEN_NODE04_KEYS.slice().sort()),
+    Object.keys(fixtureReceipt));
+  const probeCell = (cellId, mutate) => {
+    const manifestCell = campaignManifest(expected).cells.find((item) => item.cell_id === cellId);
+    mutate(manifestCell);
+    return {
+      cell_id: manifestCell.cell_id, symbol: manifestCell.symbol, timeframe: manifestCell.timeframe,
+      research_leverage: manifestCell.research_leverage, executable_handoff: manifestCell,
+      transport_payload_b64: 'x',
+    };
+  };
+  const runInputsOnly = probeCell(expected[0], (cell) => { delete cell.research_cost_model; });
+  const runInputsOnlyReceipt = cleanSubmitReceipt(runInputsOnly.executable_handoff);
+  const runInputsOnlyOut = runCode('05 · Verify cell submit receipt', contextFor(
+    [{ json: { code: 0, stdout: JSON.stringify(runInputsOnlyReceipt), stderr: '' } }],
+    { '03 · Loop over 42 cells': [{ json: runInputsOnly }] }, {}))[0].json;
+  check('a run_inputs-only handoff passes submit verification',
+    runInputsOnlyOut.qlib_run_id === runInputsOnlyReceipt.run_id, runInputsOnlyOut);
+  const noCostFact = probeCell(expected[1], (cell) => {
+    delete cell.research_cost_model;
+    delete cell.run_inputs;
+  });
+  expectHold('a handoff with no declared cost fact holds at submit verification',
+    () => runCode('05 · Verify cell submit receipt', contextFor(
+      [{ json: { code: 0, stdout: JSON.stringify(cleanSubmitReceipt(noCostFact.executable_handoff)), stderr: '' } }],
+      { '03 · Loop over 42 cells': [{ json: noCostFact }] }, {})),
+    'research cost is not declared');
 
   // T4 clean campaign: 42/42 PASS + declared approved cost -> coverage and claimability
   const clean = runCampaign(campaignManifest(expected));
