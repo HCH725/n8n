@@ -208,7 +208,27 @@ def terminal(outputs: dict) -> tuple[str, dict]:
     return route, payload
 
 
+def run_proof(path: Path) -> int:
+    """Feed a real Hermes answer through the workflow. Return 0 on a clean route."""
+    workflow = Workflow(WORKFLOW)
+    raw = path.read_text(encoding="utf-8").strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+    route, payload = terminal(workflow.execute(patch={"hermes_raw": raw}))
+    decision = payload.get("decision", {})
+    print(f"proof input: {path}")
+    print(f"route: {route}")
+    print(f"reason: {payload.get('reason')}")
+    for key in sorted(decision):
+        print(f"  {key} = {json.dumps(decision[key])}")
+    print(f"analysis_hash: {payload.get('analysis', {}).get('analysis_hash')}")
+    print(f"wiki_ack: {json.dumps(payload.get('wiki_ack'))}")
+    return 0 if route in ("RETEST", "FINALIZE") else 1
+
+
 def main() -> int:
+    if len(sys.argv) == 3 and sys.argv[1] == "--proof":
+        return run_proof(Path(sys.argv[2]))
     workflow = Workflow(WORKFLOW)
     run_key = run_node(
         {"code": workflow.code_of(FIXTURE), "node": FIXTURE, "inputs": [{}], "outputs": {}}
