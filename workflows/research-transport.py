@@ -8,7 +8,11 @@ exit 2 means invalid. This file never fabricates a PASS receipt: every receipt
 field comes from hashes checked here or files the native run wrote.
 
 hermes-forced: a separate restricted key sends one base64 UTF-8 task to the
-fixed host Hermes argv. This mode accepts no Qlib verb and starts no shell.
+fixed host Hermes argv. This mode accepts no Qlib verb and starts no shell. The
+same key serves ``research-materialize``: it asks that argv for one strategy code
+block, checks the block against the engine's own contract, writes one run-scoped
+cell directory and prints the executable handoff. It binds identity and evidence.
+The workflow's readiness gate still decides admission.
 
 ponytail: single-file bridge on purpose. Synchronous subprocess only, one fixed
 results root, one out_dir per frozen executable (a re-submit refuses instead of
@@ -34,6 +38,7 @@ import argparse
 import base64
 import binascii
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -90,7 +95,18 @@ MAX_SCAN_DIRS = 500
 # SSH trust boundary auditable.
 FORCED_VERBS = ("research-submit", "research-readback")
 HERMES_VERB = "research-hermes"
+#: Second host verb on the same restricted key: bind one strategy artifact into
+#: one run-scoped cell directory. It reuses the fixed Hermes argv for the code
+#: block and never starts a shell.
+MATERIALIZE_VERB = "research-materialize"
+HERMES_VERBS = (HERMES_VERB, MATERIALIZE_VERB)
 HERMES_PAYLOAD_LIMIT = 65536
+MATERIALIZE_ROOT_DEFAULT = "/results/_materialize"
+SIGNAL_ARTIFACT_NAME = "strategy_signal.py"
+ENGINE_ENTRYPOINT_NAME = "run_cell.entrypoint.py"
+CONFIG_NAME = "effective_config.json"
+RECEIPT_NAME = "materialization.json"
+SMOKE_TIMEOUT = 120
 
 # ponytail: readback actually reads these four files, so the manifest must
 # cover them. Only existence plus the readback sha correspondence is checked;
@@ -765,6 +781,356 @@ def cmd_hermes(payload_b64):
     return proc.returncode
 
 
+MATERIALIZE_PROMPT = """You write one strategy rule as a python code block.
+Answer with exactly one fenced python block and nothing else.
+
+def signal(*, high, low, close, volume, times, params, window_start, window_end):
+    ...
+
+Rules:
+- Return (rows, entry_ts). rows is one dict for each bar, with at least
+  datetime, high, low, close, entry_transition (0 or 1), exit_transition (0 or 1).
+  entry_ts is the datetime of the first entry inside the window, or None.
+- Standard library only. No file, network, shell, import, print, random or global
+  state. The same bars must give the same rows.
+- Read every parameter from params. Invent no default, size, cost or leverage.
+- A rule that needs volume must stop when volume is None.
+- Implement only the rule the record states. Add no filter, search or portfolio
+  logic.
+
+Frozen record:
+%s
+"""
+
+#: One bounded subprocess. It loads the artifact through the engine's own
+#: hash-bound loader and checks the engine's own row contract, so this file
+#: carries no second copy of the strategy contract.
+ARTIFACT_SMOKE = r'''
+import importlib.util, json, sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+engine_path, artifact_path, params_json = sys.argv[1], sys.argv[2], sys.argv[3]
+spec = importlib.util.spec_from_file_location("cell_engine", engine_path)
+engine = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(engine)
+artifact = Path(artifact_path)
+identity = {"ref": str(artifact), "sha256": engine.hashlib.sha256(artifact.read_bytes()).hexdigest()}
+function = engine.load_signal_artifact(str(artifact.parent), identity)
+start = datetime(2025, 1, 1)
+closes = [100.0 - i * 0.25 for i in range(10)] + [110.0] + [110.0 + i * 0.75 for i in range(1, 21)]
+volumes = [1000.0 + i * 5.0 for i in range(10)] + [8000.0] + [3000.0 + i * 20.0 for i in range(1, 21)]
+times = [start + timedelta(hours=i) for i in range(len(closes))]
+call = {
+    "high": [value * 1.001 for value in closes],
+    "low": [value * 0.999 for value in closes],
+    "close": closes,
+    "volume": volumes,
+    "times": times,
+    "params": json.loads(params_json),
+    "window_start": start - timedelta(days=1),
+    "window_end": times[-1],
+}
+first, second = function(**call), function(**call)
+problems = engine.problems_in_signal_rows(first[0])
+if first[0] != second[0] or first[1] != second[1]:
+    problems.append("artifact is not deterministic on the same bars")
+print(json.dumps({"ok": not problems, "error": "; ".join(problems) or None}))
+'''
+
+FENCE = re.compile(r"```(?:python|py)?[ \t]*\r?\n(.*?)```", re.S)
+STRATEGY_KEYS = ("symbol", "timeframe", "params", "warmup_days", "window_start_utc",
+                 "window_end_utc_inclusive", "force_flat_bar_utc")
+OVERLAY_KEYS = ("base_order_quote_pct", "safety_order_quote_pct", "safety_order_levels",
+                "so_spacing_pct", "take_profit_pct", "stop_loss_pct", "trade_cost",
+                "initial_capital_quote")
+OVERLAY_NUMERIC_KEYS = ("base_order_quote_pct", "safety_order_quote_pct", "safety_order_levels",
+                        "so_spacing_pct", "trade_cost", "initial_capital_quote")
+COST_MODEL_KEYS = ("fees_per_side", "slippage", "funding", "approved")
+
+
+def materialize_problems(request):
+    """Return the fail-closed problems in one materialization request."""
+    if not isinstance(request, dict):
+        return ["materialization request is not a JSON object"]
+    for key in ("source_commit", "candidate_path", "source_blob_sha", "record_text", "strategy",
+                "research_leverage", "runtime", "data", "house_overlay", "research_cost_model",
+                "engine_ref"):
+        if request.get(key) is None:
+            return ["missing field: " + key]
+    if not HEX40.match(str(request["source_commit"])):
+        return ["source_commit has a bad shape"]
+    if not HEX40.match(str(request["source_blob_sha"])):
+        return ["source_blob_sha has a bad shape"]
+    name = request["candidate_path"]
+    if not isinstance(name, str) or "/" in name or ".." in name or not name.endswith(".md") or len(name) > 256:
+        return ["candidate_path has a bad shape"]
+    record = request["record_text"]
+    if not isinstance(record, str) or not record.strip():
+        return ["record_text is empty"]
+    if len(record) > HERMES_PAYLOAD_LIMIT:
+        return ["record_text is too large"]
+    strategy = request["strategy"]
+    if not isinstance(strategy, dict):
+        return ["strategy is not a JSON object"]
+    unknown = [key for key in strategy if key not in STRATEGY_KEYS]
+    if unknown:
+        return ["unknown strategy field: " + str(unknown[0])]
+    if not re.match(r"^[A-Z0-9]{2,20}$", str(strategy.get("symbol"))):
+        return ["strategy symbol is not a usable instrument name"]
+    if not re.match(r"^[0-9]{1,2}[mhd]$", str(strategy.get("timeframe"))):
+        return ["strategy timeframe is not a bar size"]
+    if strategy.get("params") is not None and not isinstance(strategy["params"], dict):
+        return ["strategy params is not a JSON object"]
+    warmup = strategy.get("warmup_days", 0)
+    if not isinstance(warmup, (int, float)) or isinstance(warmup, bool) or warmup < 0:
+        return ["strategy warmup_days is not a non-negative number"]
+    for key in ("window_start_utc", "window_end_utc_inclusive"):
+        if not isinstance(strategy.get(key), str) or not strategy[key]:
+            return ["strategy %s is missing" % key]
+    leverage = request["research_leverage"]
+    if not isinstance(leverage, int) or isinstance(leverage, bool) or leverage <= 0:
+        return ["research_leverage is not a positive integer"]
+    runtime, data = request["runtime"], request["data"]
+    if not isinstance(runtime, dict) or not HEX40.match(str(runtime.get("commit"))):
+        return ["runtime commit is missing or invalid"]
+    if not isinstance(data, dict) or not check_abs_path(data.get("provider_ref")):
+        return ["data provider_ref is missing or invalid"]
+    overlay = request["house_overlay"]
+    if not isinstance(overlay, dict):
+        return ["house_overlay is not a JSON object"]
+    for key in OVERLAY_KEYS:
+        if key not in overlay:
+            return ["house_overlay has no approved value for " + key]
+    for key in OVERLAY_NUMERIC_KEYS:
+        value = overlay.get(key)
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return ["house_overlay.%s is not a usable number" % key]
+    cost = request["research_cost_model"]
+    if not isinstance(cost, dict) or [key for key in COST_MODEL_KEYS if key not in cost]:
+        return ["research_cost_model does not declare every field"]
+    if not check_abs_path(request["engine_ref"]):
+        return ["engine_ref is not an absolute path"]
+    return []
+
+
+def materialize_name(request):
+    """Return the stable run-scoped directory name for one frozen identity."""
+    frozen = {
+        "source_commit": request["source_commit"],
+        "source_blob_sha": request["source_blob_sha"],
+        "record_sha256": hashlib.sha256(request["record_text"].encode("utf-8")).hexdigest(),
+        "strategy": request["strategy"],
+        "research_leverage": request["research_leverage"],
+    }
+    return hashlib.sha256(
+        json.dumps(frozen, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:12]
+
+
+def artifact_source(request):
+    """Return (source, generator, None) or (None, None, reason).
+
+    ``RESEARCH_MATERIALIZE_ARTIFACT`` is a test seam: it supplies the block a
+    generator would return, so the deterministic binding path is testable
+    without a model. The block still passes every check below.
+    """
+    injected = os.environ.get("RESEARCH_MATERIALIZE_ARTIFACT")
+    if injected:
+        try:
+            source = Path(injected).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return None, None, "the injected artifact file is not readable"
+        if not source.strip():
+            return None, None, "the injected artifact file is empty"
+        return source, "artifact-file", None
+    try:
+        proc = subprocess.run(
+            ["hermes", "chat", "--query-file", "-", "--oneshot", "-Q", "--format", "text"],
+            input=MATERIALIZE_PROMPT % request["record_text"], cwd="/",
+            capture_output=True, text=True, timeout=SUBMIT_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None, None, "the Hermes materialization turn did not complete"
+    if proc.returncode != 0:
+        return None, None, "the Hermes materialization turn failed"
+    blocks = [match.group(1) for match in FENCE.finditer(proc.stdout or "")]
+    if len(blocks) != 1 or not blocks[0].strip():
+        return None, None, "the generator reply must carry exactly one python block"
+    return blocks[0].strip() + "\n", "hermes", None
+
+
+def artifact_smoke(engine_ref, artifact_path, params):
+    """Return None when the artifact passes the engine contract, else a reason."""
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", ARTIFACT_SMOKE, str(engine_ref), str(artifact_path),
+             json.dumps(params or {}, sort_keys=True)],
+            capture_output=True, text=True, timeout=SMOKE_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "the artifact smoke did not complete"
+    try:
+        report = json.loads((proc.stdout or "").strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        report = {"ok": False, "error": (proc.stderr or "").strip()[-400:] or "no smoke report"}
+    if not isinstance(report, dict) or not report.get("ok"):
+        return str((report or {}).get("error") or "the artifact smoke failed")
+    return None
+
+
+def cell_config(request, cell_ref, artifact_sha256, generator):
+    """Return effective_config.json for one run-scoped cell."""
+    strategy = dict(request["strategy"])
+    strategy["params"] = dict(strategy.get("params") or {})
+    strategy["warmup_days"] = strategy.get("warmup_days", 0)
+    strategy["artifact"] = {"ref": cell_ref + "/" + SIGNAL_ARTIFACT_NAME, "sha256": artifact_sha256}
+    return {
+        "schema": "qlib-formal-research-cell-v1",
+        "scope": "run-scoped materialized research cell; not Survivor/HB Certified",
+        "candidate": {
+            "path": request["candidate_path"],
+            "source_commit": request["source_commit"],
+            "git_blob_sha": request["source_blob_sha"],
+            "sha256": hashlib.sha256(request["record_text"].encode("utf-8")).hexdigest(),
+        },
+        "runtime": dict(request["runtime"]),
+        "data": dict(request["data"]),
+        "execution": {
+            "engine": "qlib.backtest.research_cell (shared shell via the frozen qlib runtime)",
+            "entrypoint": cell_ref + "/" + ENGINE_ENTRYPOINT_NAME,
+        },
+        "research_leverage": request["research_leverage"],
+        "strategy": strategy,
+        "house_overlay": dict(request["house_overlay"]),
+        "research_cost_model": dict(request["research_cost_model"]),
+        "materialization": {"generator": generator, "engine_ref": request["engine_ref"]},
+        "economics_boundary": {
+            "research_leverage_is_exposure_multiplier": True,
+            "isolated_margin_funding_slippage": "not modeled here; Node13 Hummingbot owns canonical economics",
+        },
+    }
+
+
+def cell_handoff(request, cell_ref, artifact_sha256, engine_sha256, config_sha256):
+    """Return the executable handoff one materialized cell publishes."""
+    config_ref = cell_ref + "/" + CONFIG_NAME
+    return {
+        "source_commit": request["source_commit"],
+        "candidate_path": request["candidate_path"],
+        "source_blob_sha": request["source_blob_sha"],
+        "entrypoint_ref": cell_ref + "/" + ENGINE_ENTRYPOINT_NAME,
+        "entrypoint_sha256": engine_sha256,
+        "effective_config_ref": config_ref,
+        "effective_config_sha256": config_sha256,
+        "qlib_runtime_commit": request["runtime"]["commit"],
+        "capabilities": {key: list(values) for key, values in VERIFIED_PRIMITIVES.items()},
+        "evidence_refs": {
+            "materialization": cell_ref + "/" + RECEIPT_NAME,
+            "effective_config": config_ref,
+            "strategy_artifact": cell_ref + "/" + SIGNAL_ARTIFACT_NAME,
+        },
+        "research_cost_model": dict(request["research_cost_model"]),
+        "run_inputs": {
+            "symbol": request["strategy"]["symbol"],
+            "timeframe": request["strategy"]["timeframe"],
+            "research_leverage": request["research_leverage"],
+            "strategy_artifact_sha256": artifact_sha256,
+        },
+    }
+
+
+def engine_coverage(engine_ref):
+    """Return the engine's own frozen coverage tuples, or None when it declares none.
+
+    The engine owns the research domain. This file reads it instead of keeping a
+    second copy, so materialization cannot widen the domain on its own.
+    """
+    spec = importlib.util.spec_from_file_location("cell_engine_coverage", str(engine_ref))
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return (getattr(module, "CELL_SYMBOLS", None), getattr(module, "CELL_TIMEFRAMES", None),
+            getattr(module, "CELL_LEVERAGES", None))
+
+
+def cmd_materialize(payload_b64):
+    """Resolve or materialize one run-scoped executable handoff. No shell."""
+    request, reason = decode_handoff(payload_b64)
+    if request is None:
+        return fail(reason)
+    problems = materialize_problems(request)
+    if problems:
+        return fail("; ".join(problems))
+    root = os.environ.get("RESEARCH_MATERIALIZE_ROOT", MATERIALIZE_ROOT_DEFAULT)
+    if not check_abs_path(root):
+        return fail("the materialize root is not an absolute path")
+    cell = Path(root) / materialize_name(request)
+    cell_ref = root + "/" + cell.name
+    engine_ref = Path(request["engine_ref"])
+    if not engine_ref.is_file():
+        return fail("engine_ref is not readable")
+    symbols, timeframes, leverages = engine_coverage(engine_ref) or (None, None, None)
+    if symbols:
+        identity = (request["strategy"]["symbol"], request["strategy"]["timeframe"],
+                    request["research_leverage"])
+        if identity[0] not in symbols or identity[1] not in timeframes or identity[2] not in leverages:
+            return fail("the strategy identity is outside the engine's frozen coverage")
+    if cell.is_dir():
+        # ponytail: a retry must not overwrite evidence. An existing cell is
+        # resolved only while its own bytes still match the declared hashes.
+        try:
+            config = json.loads((cell / CONFIG_NAME).read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError):
+            return fail("the existing cell config is not readable")
+        declared = ((config.get("strategy") or {}).get("artifact") or {}).get("sha256")
+        if file_sha256(cell / SIGNAL_ARTIFACT_NAME) != declared:
+            return fail("the existing cell artifact does not match its declared hash")
+        handoff = cell_handoff(request, cell_ref, declared,
+                               file_sha256(cell / ENGINE_ENTRYPOINT_NAME), file_sha256(cell / CONFIG_NAME))
+        reason = check_handoff(handoff)
+        if reason:
+            return fail("the existing cell handoff is not executable: " + reason)
+        print(json.dumps({"ok": True, "generator": "existing", "handoff": handoff}, sort_keys=True))
+        return 0
+    if cell.exists():
+        return fail("the materialize path exists and is not a cell directory")
+    source, generator, reason = artifact_source(request)
+    if source is None:
+        return fail(reason)
+    try:
+        cell.mkdir(parents=True)
+    except OSError:
+        return fail("the cell directory could not be created")
+    artifact_path = cell / SIGNAL_ARTIFACT_NAME
+    artifact_path.write_text(source, encoding="utf-8")
+    smoke = artifact_smoke(engine_ref, artifact_path, request["strategy"].get("params"))
+    if smoke is not None:
+        shutil.rmtree(cell, ignore_errors=True)
+        return fail("the materialized artifact is not runnable: " + smoke)
+    shutil.copyfile(engine_ref, cell / ENGINE_ENTRYPOINT_NAME)
+    config = cell_config(request, cell_ref, file_sha256(artifact_path), generator)
+    (cell / CONFIG_NAME).write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    handoff = cell_handoff(request, cell_ref, config["strategy"]["artifact"]["sha256"],
+                           file_sha256(cell / ENGINE_ENTRYPOINT_NAME), file_sha256(cell / CONFIG_NAME))
+    reason = check_handoff(handoff)
+    if reason:
+        return fail("the materialized handoff is not executable: " + reason)
+    (cell / RECEIPT_NAME).write_text(json.dumps({
+        "schema": "qlib-strategy-materialization-v1",
+        "generator": generator,
+        "record_sha256": config["candidate"]["sha256"],
+        "engine_ref": request["engine_ref"],
+        "strategy_artifact_sha256": handoff["run_inputs"]["strategy_artifact_sha256"],
+        "effective_config_sha256": handoff["effective_config_sha256"],
+        "smoke": "engine loader plus engine row contract on the built-in bar fixture",
+        "handoff": handoff,
+    }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(json.dumps({"ok": True, "generator": generator, "handoff": handoff}, sort_keys=True))
+    return 0
+
+
 def parse_forced_command(value, hermes=False):
     """Parse SSH_ORIGINAL_COMMAND for the fixed launch shape.
 
@@ -786,7 +1152,7 @@ def parse_forced_command(value, hermes=False):
     if len(tokens) != 2:
         return None, "forced-command input is missing or invalid"
     verb, arg = tokens
-    if verb not in ((HERMES_VERB,) if hermes else FORCED_VERBS):
+    if verb not in (HERMES_VERBS if hermes else FORCED_VERBS):
         return None, "forced-command input is missing or invalid"
     if verb == "research-readback":
         if not RUNID.match(arg):
@@ -926,6 +1292,8 @@ def main(argv):
         # ponytail: a separate restricted key enables only this host verb.
         # Keep the Qlib key and container forwarding unchanged.
         if argv:
+            if verb == MATERIALIZE_VERB:
+                return cmd_materialize(arg)
             return cmd_hermes(arg)
         # ponytail: host launches with no /results use the fixed runtime.
         if should_forward_host():

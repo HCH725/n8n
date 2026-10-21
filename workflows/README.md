@@ -50,7 +50,29 @@ Only `WF-Research-01-12.json` is a deploy target. The component fixtures keep th
 frozen transport bytes that the single workflow must reproduce; the targeted test
 `workflows/tests/test_wf_research_01_12_single.py` runs exported Code-node contracts
 with Node.js. It checks graph edges and compares the carried 01-05 parameters against
-`WF-Research-01-03-manual-preflight.json` byte for byte.
+`WF-Research-01-03-manual-preflight.json` for every node except the two the on-demand
+lane extends (`01 Select candidate`, `03 Engineering readiness`) and the one edge it
+rewires (`02 Read pinned record`).
+
+### On-demand strategy materialization (IMPLEMENTATION_NEEDED)
+
+HB_READY admission is the only strategy admission. A selected candidate that has no
+executable recipe for this run does not stop at a human endpoint: `02c Handoff
+request` builds one resolve-or-materialize request from the pinned record plus the
+`materialize_policy` run input (strategy identity, params, warmup, window, leverage,
+runtime, data, approved house overlay, cost model, engine path). `02d` sends it to the
+host `research-materialize` verb on the restricted Hermes key. The host reuses an
+existing cell or asks the fixed Hermes argv for one python code block, checks it
+against the engine's own loader and row contract, writes the run-scoped cell
+directory, and returns one executable handoff. `02e Handoff envelope` passes that
+handoff into the same `03 Engineering readiness` gate, so the lane continues at 04
+without a second admission, a `QLIB_READY` flag or an Alpha write-back.
+
+`03h HOLD lane gate` and `03i HOLD endpoint` make every non-ready route observable
+(`IMPLEMENTATION_NEEDED`, `ENGINEERING_HOLD`, `NEEDS_REVIEW`, `WAITING_DATA`). A
+materialization failure holds that run only. The strategy artifact is a run artifact
+and evidence, not an admission record: this lane never batch-generates strategies and
+never adds a Markdown-to-Qlib compiler, registry or second control plane.
 
 Live credentials stay operator placeholders (never stored here): `Hermes Host SSH`
 (restricted SSH, Node06 Hermes CLI turn), GitHub (`githubApi` predefined credential for
@@ -63,13 +85,20 @@ shape. Replace the placeholders with trusted absolute paths and the public key:
 
     restrict,command="<PYTHON> <TRANSPORT>/research-transport.py hermes-forced" ssh-ed25519 <PUBLIC_KEY>
 
-The fixed command accepts only `research-hermes <base64 UTF-8 task>`, with the
-native SSH node's optional `cd / ;` prefix. The encoded task limit is 65,536
-characters. The host must resolve `hermes` through a trusted PATH. Do not permit
-client environment overrides. The handler sends the decoded task through stdin
-to this fixed argv, with a 1,800-second process timeout:
+The fixed command accepts only `research-hermes <base64 UTF-8 task>` and
+`research-materialize <base64 JSON request>`, with the native SSH node's optional
+`cd / ;` prefix. The encoded argument limit is 65,536 characters. The host must
+resolve `hermes` through a trusted PATH. Do not permit client environment overrides.
+The handler sends the decoded task through stdin to this fixed argv, with a
+1,800-second process timeout:
 
     hermes chat --query-file - --oneshot -Q --format stream-json -t wiki_brain
+
+`research-materialize` uses the same argv without a toolset and with `--format text`,
+because the turn only returns one code block. The verb writes one directory per frozen
+identity under `/results/_materialize` (`RESEARCH_MATERIALIZE_ROOT` overrides it), and
+it refuses to overwrite. It starts no shell and runs no Qlib verb. The artifact smoke
+runs in one bounded subprocess against the engine's own loader and row contract.
 
 The existing no-argument Qlib forced command still accepts only `research-submit`
 and `research-readback`. The Hermes key accepts neither. No key, listener or host

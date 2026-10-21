@@ -49,6 +49,12 @@
               "name": "market_data_ready",
               "type": "boolean",
               "value": true
+            },
+            {
+              "id": "materialize-policy",
+              "name": "materialize_policy",
+              "type": "string",
+              "value": ""
             }
           ]
         },
@@ -104,6 +110,58 @@
       }
     },
     {
+      "id": "handoff-request",
+      "name": "02c · Handoff request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1170,
+        420
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Build one resolve-or-materialize request for the selected candidate.\n// ponytail: no strategy semantics here. The frozen record text and the approved\n// policy values ride along verbatim; the host reuses an existing executable\n// handoff or materializes a new run-scoped one. engine_ref pins the shared\n// shell by path; the host copies it and binds its sha256 into the handoff.\nconst file = $input.first().json;\nconst pin = $('02 · Pin Alpha main').first().json;\nconst sel = $('01 · Select candidate').first().json;\nconst base = {\n  origin: 'manual',\n  source_commit: pin.sha,\n  candidate_path: sel.candidate_path,\n  source_ref: 'HCH725/alpha-strategy-research@' + pin.sha + '/' + sel.candidate_path,\n  source_blob_sha: file.sha || null,\n  qlib_run_id: null,\n  run_state: 'NOT_SUBMITTED'\n};\nconst parseObject = (value) => {\n  if (value == null || value === '') return null;\n  if (typeof value === 'object' && !Array.isArray(value)) return value;\n  if (typeof value !== 'string') return null;\n  try {\n    const parsed = JSON.parse(value);\n    return (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) ? parsed : null;\n  } catch { return null; }\n};\nconst held = parseObject(sel.executable_handoff) || parseObject(sel.handoff_ref);\nlet request = null;\nlet problem = null;\nlet kind = 'materialize';\nif (held) {\n  kind = 'existing';\n  request = {\n    source_commit: pin.sha,\n    candidate_path: sel.candidate_path,\n    source_blob_sha: file.sha || null,\n    existing_handoff: held\n  };\n} else {\n  const policy = parseObject(sel.materialize_policy);\n  let record = null;\n  if (!policy) problem = 'no executable handoff and no materialize_policy run input is declared';\n  else if (file.type !== 'file' || typeof file.content !== 'string') problem = 'the pinned record content is not readable';\n  else {\n    try { record = Buffer.from(file.content.replace(/\\s/g, ''), 'base64').toString('utf8'); }\n    catch { record = null; }\n    if (!record) problem = 'the pinned record content is not decodable';\n  }\n  if (!problem) {\n    request = {\n      source_commit: pin.sha,\n      candidate_path: sel.candidate_path,\n      source_blob_sha: file.sha,\n      record_text: record,\n      strategy: policy.strategy,\n      research_leverage: policy.research_leverage,\n      runtime: policy.runtime,\n      data: policy.data,\n      house_overlay: policy.house_overlay,\n      research_cost_model: policy.research_cost_model,\n      engine_ref: policy.engine_ref\n    };\n  }\n}\nconst request_b64 = request ? Buffer.from(JSON.stringify(request), 'utf8').toString('base64') : null;\nreturn [{ json: { ...base, request_kind: kind, request_b64, request_problem: problem } }];\n"
+      }
+    },
+    {
+      "id": "handoff-materialize-ssh",
+      "name": "02d · Materialize or resolve handoff (Hermes SSH)",
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        1290,
+        420
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "sshPrivateKey": {
+          "id": "hermes-host-ssh",
+          "name": "Hermes Host SSH"
+        }
+      },
+      "parameters": {
+        "authentication": "privateKey",
+        "resource": "command",
+        "operation": "execute",
+        "command": "={{ 'research-materialize ' + $json.request_b64 }}",
+        "cwd": "/"
+      }
+    },
+    {
+      "id": "handoff-envelope",
+      "name": "02e · Handoff envelope",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1410,
+        420
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Turn the host reply into one handoff envelope for the readiness gate.\n// Fail closed: no handoff means Node03 routes IMPLEMENTATION_NEEDED and the\n// HOLD lane surfaces it. HB_READY is never touched here.\nconst request = $('02c · Handoff request').first().json;\nconst reply = $input.first().json || {};\nconst text = typeof reply.stdout === 'string' ? reply.stdout : '';\nlet payload = null;\nfor (const line of text.split('\\n').reverse()) {\n  const trimmed = line.trim();\n  if (!trimmed || trimmed.charAt(0) !== '{') continue;\n  try {\n    const parsed = JSON.parse(trimmed);\n    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) { payload = parsed; break; }\n  } catch { /* keep scanning: the host prints one JSON report */ }\n}\nlet handoff = null;\nlet materialize = { status: 'failed', reason: request.request_problem || 'the materialization reply is not readable' };\nif (payload && payload.ok === true && payload.handoff && typeof payload.handoff === 'object' && !Array.isArray(payload.handoff)) {\n  handoff = payload.handoff;\n  materialize = { status: payload.generator === 'existing' ? 'existing' : 'materialized', generator: payload.generator || null, reason: null };\n} else if (payload && payload.ok === false && payload.error) {\n  materialize = { status: 'failed', reason: String(payload.error).slice(0, 400) };\n} else if (reply.error) {\n  materialize = { status: 'failed', reason: ('the host materialization call failed: ' + String(reply.error)).slice(0, 400) };\n}\nreturn [{ json: { ...request, executable_handoff: handoff, materialize } }];\n"
+      }
+    },
+    {
       "id": "read-only-gate",
       "name": "03 · Engineering readiness",
       "type": "n8n-nodes-base.code",
@@ -114,7 +172,7 @@
       ],
       "parameters": {
         "mode": "runOnceForAllItems",
-        "jsCode": "const file = $input.first().json;\nconst pin = $('02 · Pin Alpha main').first().json;\nconst sel = $('01 · Select candidate').first().json;\nconst sourceCommit = pin.sha;\nconst candidatePath = sel.candidate_path;\nconst base = {\n  origin: 'manual',\n  source_commit: sourceCommit,\n  candidate_path: candidatePath,\n  source_ref: 'HCH725/alpha-strategy-research@' + sourceCommit + '/' + candidatePath,\n  source_blob_sha: file.sha || null,\n  qlib_run_id: null,\n  run_state: 'NOT_SUBMITTED'\n};\nconst readField = (fm, k) => {\n  const m = fm.match(new RegExp('^' + k + ':\\\\s*(.*?)\\\\s*$', 'm'));\n  return m ? m[1].trim().replace(/^[\"']|[\"']$/g, '') : null;\n};\nif (file.type !== 'file' || typeof file.content !== 'string')\n  return [{ json: { ...base, route: 'NEEDS_REVIEW', reason: 'GitHub record content is not readable' } }];\nlet record;\ntry {\n  record = Buffer.from(file.content.replace(/\\s/g, ''), 'base64').toString('utf8');\n} catch {\n  return [{ json: { ...base, route: 'NEEDS_REVIEW', reason: 'GitHub record content is not decodable' } }];\n}\nif (!record.startsWith('---\\n'))\n  return [{ json: { ...base, route: 'NEEDS_REVIEW', reason: 'GitHub record has no readable YAML frontmatter' } }];\nconst end = record.indexOf('\\n---', 4);\nif (end < 0)\n  return [{ json: { ...base, route: 'NEEDS_REVIEW', reason: 'Unterminated YAML frontmatter' } }];\nconst fm = record.slice(4, end);\nconst schema = readField(fm, 'schema');\nconst hb = readField(fm, 'hb_ready_status');\nconst impl = readField(fm, 'implementation_status');\n// ponytail: admission checks schema + HB_READY PASS only. implementation_status stays informational.\nif (schema !== 'strategy-research-record-v1' || hb !== 'PASS')\n  return [{ json: { ...base, schema, hb_ready_status: hb, implementation_status: impl, route: 'NEEDS_REVIEW', reason: 'Invalid schema or HB_READY not PASS' } }];\n// A. Market data is not ready for this run.\nconst fmData = readField(fm, 'market_data_ready') || readField(fm, 'data_ready');\nconst dataFalse = (v) => v === false || v === 'false' || v === 'no' || v === '0';\nif (dataFalse(sel.market_data_ready) || dataFalse(fmData))\n  return [{ json: { ...base, schema, hb_ready_status: hb, implementation_status: impl, route: 'WAITING_DATA', reason: 'Market data is not ready for this run', market_data_ready: false } }];\n// B. Load the per-run executable handoff. It lives in this run input only.\nconst loadHandoff = (v) => {\n  if (v == null || v === '') return null;\n  if (typeof v === 'object' && !Array.isArray(v)) return v;\n  if (typeof v === 'string') {\n    try {\n      const o = JSON.parse(v);\n      return (o && typeof o === 'object' && !Array.isArray(o)) ? o : null;\n    } catch { return null; }\n  }\n  return null;\n};\nlet handoff = loadHandoff(sel.executable_handoff);\nlet refOnly = false;\nif (!handoff && typeof sel.handoff_ref === 'string' && sel.handoff_ref.trim() !== '') {\n  handoff = loadHandoff(sel.handoff_ref.trim());\n  if (!handoff) refOnly = true;\n}\nif (!handoff)\n  return [{ json: { ...base, schema, hb_ready_status: hb, implementation_status: impl, route: 'IMPLEMENTATION_NEEDED', reason: refOnly ? 'IMPLEMENTATION_NEEDED: admitted strategy lacks executable materialization for this run (handoff_ref pointer only, no materialized handoff content)' : 'IMPLEMENTATION_NEEDED: admitted strategy lacks executable materialization for this run', market_data_ready: null } }];\n// C. Verify frozen identity, refs, and hashes.\nconst isHex = (v, n) => typeof v === 'string' && new RegExp('^[a-f0-9]{' + n + '}$').test(v);\nconst isAbsPath = (v) => typeof v === 'string' && /^\\/[A-Za-z0-9_@+./-]{1,511}$/.test(v) && !v.includes('..');\nconst bad = (d) => ({ json: { ...base, schema, hb_ready_status: hb, implementation_status: impl, route: 'NEEDS_REVIEW', reason: 'Handoff identity check failed: ' + d } });\nif (handoff.source_commit !== sourceCommit) return [bad('source_commit does not match pinned Alpha main')];\nif (handoff.candidate_path !== candidatePath) return [bad('candidate_path does not match selected candidate')];\nif (handoff.source_blob_sha !== file.sha) return [bad('source_blob_sha does not match pinned blob')];\nif (!isAbsPath(handoff.entrypoint_ref) || !isHex(handoff.entrypoint_sha256, 64)) return [bad('entrypoint ref or hash is invalid')];\nif (!isAbsPath(handoff.effective_config_ref) || !isHex(handoff.effective_config_sha256, 64)) return [bad('effective_config ref or hash is invalid')];\nif (!isHex(handoff.qlib_runtime_commit, 40)) return [bad('qlib_runtime_commit is invalid')];\nif (handoff.research_cost_model == null && handoff.run_inputs == null) return [bad('declared cost or run inputs are missing')];\nif (!handoff.evidence_refs || typeof handoff.evidence_refs !== 'object' || Array.isArray(handoff.evidence_refs) || Object.keys(handoff.evidence_refs).length === 0) return [bad('evidence refs are missing')];\n// D/E. Capability check passes only on verified primitives.\nconst VERIFIED = {\n  execution: ['qlib-native-backtest'],\n  data: ['btcusdt-1h'],\n  timing: ['bar-close-1h']\n};\nconst gap = [];\nconst bucketed = (handoff.capabilities && typeof handoff.capabilities === 'object' && !Array.isArray(handoff.capabilities)) ? handoff.capabilities : null;\nlet declaredCount = 0;\nif (bucketed) {\n  for (const k of Object.keys(VERIFIED)) {\n    const v = bucketed[k];\n    const vals = Array.isArray(v) ? v : (typeof v === 'string' ? [v] : []);\n    for (const x of vals) {\n      if (typeof x !== 'string') { gap.push(k + ':non-string'); continue; }\n      declaredCount += 1;\n      if (!VERIFIED[k].includes(x)) gap.push(k + ':' + x);\n    }\n  }\n  for (const k of Object.keys(bucketed)) {\n    if (!(k in VERIFIED)) {\n      const v = bucketed[k];\n      const vals = Array.isArray(v) ? v : [v];\n      for (const x of vals) { declaredCount += 1; gap.push(k + ':' + String(x)); }\n    }\n  }\n}\nif (Array.isArray(handoff.capability_declaration)) {\n  for (const c of handoff.capability_declaration) {\n    if (typeof c !== 'string' || c.indexOf(':') < 0) { gap.push('malformed:' + String(c)); continue; }\n    const i = c.indexOf(':');\n    const bucket = c.slice(0, i);\n    const val = c.slice(i + 1);\n    declaredCount += 1;\n    if (!(bucket in VERIFIED) || !VERIFIED[bucket].includes(val)) gap.push(c);\n  }\n}\nif (declaredCount === 0) return [bad('capability declaration is missing')];\nif (gap.length > 0)\n  return [{ json: { ...base, schema, hb_ready_status: hb, implementation_status: impl, route: 'ENGINEERING_HOLD', reason: 'New unverified capability: ' + gap.join(', '), capability_gap: gap, executable_handoff: handoff } }];\nconst transport_payload_b64 = Buffer.from(JSON.stringify(handoff), 'utf8').toString('base64');\nreturn [{ json: { ...base, schema, hb_ready_status: hb, implementation_status: impl, route: 'READY', reason: 'HB_READY admission with verified executable handoff and verified capabilities', market_data_ready: true, executable_handoff: handoff, capability_gap: [], transport_payload_b64 } }];\n"
+        "jsCode": "const file = $('02 · Read pinned record').first().json;\nconst pin = $('02 · Pin Alpha main').first().json;\nconst sel = $('02e · Handoff envelope').first().json;\nconst sourceCommit = pin.sha;\nconst candidatePath = sel.candidate_path;\nconst base = {\n  origin: 'manual',\n  source_commit: sourceCommit,\n  candidate_path: candidatePath,\n  source_ref: 'HCH725/alpha-strategy-research@' + sourceCommit + '/' + candidatePath,\n  source_blob_sha: file.sha || null,\n  qlib_run_id: null,\n  run_state: 'NOT_SUBMITTED'\n};\nconst readField = (fm, k) => {\n  const m = fm.match(new RegExp('^' + k + ':\\\\s*(.*?)\\\\s*$', 'm'));\n  return m ? m[1].trim().replace(/^[\"']|[\"']$/g, '') : null;\n};\nif (file.type !== 'file' || typeof file.content !== 'string')\n  return [{ json: { ...base, route: 'NEEDS_REVIEW', reason: 'GitHub record content is not readable' } }];\nlet record;\ntry {\n  record = Buffer.from(file.content.replace(/\\s/g, ''), 'base64').toString('utf8');\n} catch {\n  return [{ json: { ...base, route: 'NEEDS_REVIEW', reason: 'GitHub record content is not decodable' } }];\n}\nif (!record.startsWith('---\\n'))\n  return [{ json: { ...base, route: 'NEEDS_REVIEW', reason: 'GitHub record has no readable YAML frontmatter' } }];\nconst end = record.indexOf('\\n---', 4);\nif (end < 0)\n  return [{ json: { ...base, route: 'NEEDS_REVIEW', reason: 'Unterminated YAML frontmatter' } }];\nconst fm = record.slice(4, end);\nconst schema = readField(fm, 'schema');\nconst hb = readField(fm, 'hb_ready_status');\nconst impl = readField(fm, 'implementation_status');\n// ponytail: admission checks schema + HB_READY PASS only. implementation_status stays informational.\nif (schema !== 'strategy-research-record-v1' || hb !== 'PASS')\n  return [{ json: { ...base, schema, hb_ready_status: hb, implementation_status: impl, route: 'NEEDS_REVIEW', reason: 'Invalid schema or HB_READY not PASS' } }];\n// A. Market data is not ready for this run.\nconst fmData = readField(fm, 'market_data_ready') || readField(fm, 'data_ready');\nconst dataFalse = (v) => v === false || v === 'false' || v === 'no' || v === '0';\nif (dataFalse(sel.market_data_ready) || dataFalse(fmData))\n  return [{ json: { ...base, schema, hb_ready_status: hb, implementation_status: impl, route: 'WAITING_DATA', reason: 'Market data is not ready for this run', market_data_ready: false } }];\n// B. Read the handoff envelope. The host reused an existing executable handoff\n// or materialized one for this selected candidate. Nothing is decided here.\nconst materialized = sel.materialize && typeof sel.materialize === 'object' ? sel.materialize : null;\nconst handoff = (sel.executable_handoff && typeof sel.executable_handoff === 'object' && !Array.isArray(sel.executable_handoff))\n  ? sel.executable_handoff : null;\nif (!handoff)\n  return [{ json: { ...base, schema, hb_ready_status: hb, implementation_status: impl, route: 'IMPLEMENTATION_NEEDED', reason: 'IMPLEMENTATION_NEEDED: ' + (materialized && materialized.reason ? String(materialized.reason) : 'admitted strategy lacks executable materialization for this run'), market_data_ready: null, materialize: materialized } }];\n// C. Verify frozen identity, refs, and hashes.\nconst isHex = (v, n) => typeof v === 'string' && new RegExp('^[a-f0-9]{' + n + '}$').test(v);\nconst isAbsPath = (v) => typeof v === 'string' && /^\\/[A-Za-z0-9_@+./-]{1,511}$/.test(v) && !v.includes('..');\nconst bad = (d) => ({ json: { ...base, schema, hb_ready_status: hb, implementation_status: impl, route: 'NEEDS_REVIEW', reason: 'Handoff identity check failed: ' + d } });\nif (handoff.source_commit !== sourceCommit) return [bad('source_commit does not match pinned Alpha main')];\nif (handoff.candidate_path !== candidatePath) return [bad('candidate_path does not match selected candidate')];\nif (handoff.source_blob_sha !== file.sha) return [bad('source_blob_sha does not match pinned blob')];\nif (!isAbsPath(handoff.entrypoint_ref) || !isHex(handoff.entrypoint_sha256, 64)) return [bad('entrypoint ref or hash is invalid')];\nif (!isAbsPath(handoff.effective_config_ref) || !isHex(handoff.effective_config_sha256, 64)) return [bad('effective_config ref or hash is invalid')];\nif (!isHex(handoff.qlib_runtime_commit, 40)) return [bad('qlib_runtime_commit is invalid')];\nif (handoff.research_cost_model == null && handoff.run_inputs == null) return [bad('declared cost or run inputs are missing')];\nif (!handoff.evidence_refs || typeof handoff.evidence_refs !== 'object' || Array.isArray(handoff.evidence_refs) || Object.keys(handoff.evidence_refs).length === 0) return [bad('evidence refs are missing')];\n// D/E. Capability check passes only on verified primitives.\n// ponytail: the verified primitives are reusable names, never a symbol or a\n// timeframe. A per-symbol entry would turn this gate into a one-candidate\n// allowlist. A value outside the set is ENGINEERING_HOLD, not a strategy verdict.\nconst VERIFIED = {\n  execution: ['qlib-native-backtest'],\n  data: ['binance-usdm-ohlcv'],\n  timing: ['bar-close']\n};\nconst gap = [];\nconst bucketed = (handoff.capabilities && typeof handoff.capabilities === 'object' && !Array.isArray(handoff.capabilities)) ? handoff.capabilities : null;\nlet declaredCount = 0;\nif (bucketed) {\n  for (const k of Object.keys(VERIFIED)) {\n    const v = bucketed[k];\n    const vals = Array.isArray(v) ? v : (typeof v === 'string' ? [v] : []);\n    for (const x of vals) {\n      if (typeof x !== 'string') { gap.push(k + ':non-string'); continue; }\n      declaredCount += 1;\n      if (!VERIFIED[k].includes(x)) gap.push(k + ':' + x);\n    }\n  }\n  for (const k of Object.keys(bucketed)) {\n    if (!(k in VERIFIED)) {\n      const v = bucketed[k];\n      const vals = Array.isArray(v) ? v : [v];\n      for (const x of vals) { declaredCount += 1; gap.push(k + ':' + String(x)); }\n    }\n  }\n}\nif (Array.isArray(handoff.capability_declaration)) {\n  for (const c of handoff.capability_declaration) {\n    if (typeof c !== 'string' || c.indexOf(':') < 0) { gap.push('malformed:' + String(c)); continue; }\n    const i = c.indexOf(':');\n    const bucket = c.slice(0, i);\n    const val = c.slice(i + 1);\n    declaredCount += 1;\n    if (!(bucket in VERIFIED) || !VERIFIED[bucket].includes(val)) gap.push(c);\n  }\n}\nif (declaredCount === 0) return [bad('capability declaration is missing')];\nif (gap.length > 0)\n  return [{ json: { ...base, schema, hb_ready_status: hb, implementation_status: impl, route: 'ENGINEERING_HOLD', reason: 'New unverified capability: ' + gap.join(', '), capability_gap: gap, executable_handoff: handoff } }];\nconst transport_payload_b64 = Buffer.from(JSON.stringify(handoff), 'utf8').toString('base64');\nreturn [{ json: { ...base, schema, hb_ready_status: hb, implementation_status: impl, route: 'READY', reason: 'HB_READY admission with verified executable handoff and verified capabilities', market_data_ready: true, executable_handoff: handoff, capability_gap: [], transport_payload_b64 } }];\n"
       }
     },
     {
@@ -130,6 +188,31 @@
         "mode": "runOnceForAllItems",
         "jsCode": "const x = $input.first().json;\nreturn x.route === 'READY' ? [{ json: x }] : [];\n"
       }
+    },
+    {
+      "id": "ready-hold-gate",
+      "name": "03h · HOLD lane gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1500,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Everything the readiness gate did not accept is a HOLD lane item. It is not a\n// status flag and never rewrites Alpha: it only makes the stop observable.\nconst x = $input.first().json;\nreturn x.route === 'READY' ? [] : [{ json: x }];\n"
+      }
+    },
+    {
+      "id": "ready-hold-endpoint",
+      "name": "03i · HOLD endpoint",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1620,
+        300
+      ],
+      "parameters": {}
     },
     {
       "id": "node04-ssh",
@@ -1435,7 +1518,7 @@
       "main": [
         [
           {
-            "node": "03 · Engineering readiness",
+            "node": "02c · Handoff request",
             "type": "main",
             "index": 0
           }
@@ -1447,6 +1530,11 @@
         [
           {
             "node": "03b · READY gate",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "03h · HOLD lane gate",
             "type": "main",
             "index": 0
           }
@@ -2283,6 +2371,50 @@
         [
           {
             "node": "12 · Node13 boundary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "02c · Handoff request": {
+      "main": [
+        [
+          {
+            "node": "02d · Materialize or resolve handoff (Hermes SSH)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "02d · Materialize or resolve handoff (Hermes SSH)": {
+      "main": [
+        [
+          {
+            "node": "02e · Handoff envelope",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "02e · Handoff envelope": {
+      "main": [
+        [
+          {
+            "node": "03 · Engineering readiness",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "03h · HOLD lane gate": {
+      "main": [
+        [
+          {
+            "node": "03i · HOLD endpoint",
             "type": "main",
             "index": 0
           }

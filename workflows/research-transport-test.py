@@ -28,6 +28,61 @@ TRANSPORT = HERE / "research-transport.py"
 RUN_ID = "ab" * 16
 EXP_ID = "123456"
 
+#: Minimal stand-in for the shared engine. The transport must call the engine
+#: for the artifact contract instead of carrying its own copy.
+STUB_ENGINE = """
+import hashlib
+
+CELL_SYMBOLS = ("BTCUSDT", "ETHUSDT")
+CELL_TIMEFRAMES = ("1h", "4h", "1d")
+CELL_LEVERAGES = (3, 5)
+
+
+def load_signal_artifact(cell_dir, artifact):
+    path = artifact["ref"]
+    with open(path, "rb") as handle:
+        digest = hashlib.sha256(handle.read()).hexdigest()
+    if digest != artifact["sha256"]:
+        raise SystemExit("HOLD: hash mismatch")
+    namespace = {}
+    with open(path, encoding="utf-8") as handle:
+        exec(compile(handle.read(), path, "exec"), namespace)
+    return namespace["signal"]
+
+
+def problems_in_signal_rows(rows):
+    if not rows:
+        return ["no rows"]
+    for row in rows:
+        for key in ("datetime", "high", "low", "close", "entry_transition", "exit_transition"):
+            if key not in row:
+                return ["missing " + key]
+    return []
+"""
+
+ARTIFACT = """
+def signal(*, high, low, close, volume, times, params, window_start, window_end):
+    length = params.get("entry_len")
+    if not isinstance(length, int) or length <= 0:
+        raise ValueError("entry_len must be a positive integer")
+    rows, entry_ts, state = [], None, False
+    for i in range(len(close)):
+        prior = max(high[i - length:i]) if i >= length else None
+        inside = window_start <= times[i] <= window_end
+        up = prior is not None and close[i] > prior
+        entry = False
+        if not state and inside and up:
+            state, entry, entry_ts = True, True, times[i]
+        rows.append({"datetime": times[i], "high": float(high[i]), "low": float(low[i]),
+                     "close": float(close[i]), "entry_transition": int(entry), "exit_transition": 0})
+    return rows, entry_ts
+"""
+
+EMPTY_ARTIFACT = """
+def signal(*, high, low, close, volume, times, params, window_start, window_end):
+    return [], None
+"""
+
 STUB_ENTRYPOINT = """\
 import hashlib, json, os, sys
 from pathlib import Path
@@ -392,6 +447,113 @@ def main():
     with patch.object(_t.subprocess, "run", side_effect=subprocess.TimeoutExpired("hermes", 1800)):
         check("T14i timeout fails closed", _t.cmd_hermes(encoded) == 2)
     check("T14j Hermes verb is never forwarded", _t.build_forward_command(_t.HERMES_VERB, encoded) is None)
+
+    # T15 materialize: bind one artifact into one run-scoped cell directory.
+    engine_dir = Path(tempfile.mkdtemp(prefix="transport-engine-"))
+    engine = engine_dir / "research_cell.py"
+    engine.write_text(STUB_ENGINE)
+    source = Path(tempfile.mkdtemp(prefix="transport-artifact-")) / "strategy_signal.py"
+    source.write_text(ARTIFACT)
+    matroot = Path(tempfile.mkdtemp(prefix="transport-materialize-"))
+
+    def request_for(**over):
+        request = {
+            "source_commit": "b" * 40,
+            "candidate_path": "demo-candidate.md",
+            "source_blob_sha": "a" * 40,
+            "record_text": "---\nschema: strategy-research-record-v1\nhb_ready_status: PASS\n---\nbody\n",
+            "strategy": {"symbol": "BTCUSDT", "timeframe": "1h", "params": {"entry_len": 5},
+                         "warmup_days": 5, "window_start_utc": "2025-01-01 00:00:00",
+                         "window_end_utc_inclusive": "2025-12-31 00:00:00"},
+            "research_leverage": 3,
+            "runtime": {"commit": "c" * 40},
+            "data": {"provider_ref": "/results/_validation/provider"},
+            "house_overlay": {"base_order_quote_pct": 0.06, "safety_order_quote_pct": 0.06,
+                              "safety_order_levels": 2, "so_spacing_pct": 0.04, "take_profit_pct": 0.05,
+                              "stop_loss_pct": 0.2, "trade_cost": 0.001, "initial_capital_quote": 1000},
+            "research_cost_model": {"approved": False, "fees_per_side": 0.001, "slippage": 0.0005,
+                                    "funding": 0.0},
+            "engine_ref": str(engine),
+        }
+        request.update(over)
+        return request
+
+    def materialize(request, artifact=source, root=matroot):
+        env = dict(os.environ, RESEARCH_MATERIALIZE_ROOT=str(root),
+                   RESEARCH_MATERIALIZE_ARTIFACT=str(artifact),
+                   SSH_ORIGINAL_COMMAND="research-materialize " + b64(request))
+        proc = subprocess.run([sys.executable, str(TRANSPORT), "hermes-forced"], env=env,
+                              capture_output=True, text=True, timeout=120)
+        return proc.returncode, proc.stdout.strip()
+
+    rc, out = materialize(request_for())
+    check("T15a materialize binds one cell", rc == 0 and json.loads(out)["ok"] is True, out)
+    report = json.loads(out) if rc == 0 else {}
+    handoff = report.get("handoff", {})
+    check("T15b the handoff names the run-scoped cell",
+          handoff.get("entrypoint_ref", "").startswith(str(matroot))
+          and handoff.get("effective_config_ref", "").startswith(str(matroot)), handoff)
+    cell = Path(handoff.get("effective_config_ref", "/nonexistent")).parent
+    files = sorted(item.name for item in cell.glob("*")) if cell.is_dir() else []
+    check("T15c the cell carries artifact, engine, config and receipt",
+          files == ["effective_config.json", "materialization.json", "run_cell.entrypoint.py", "strategy_signal.py"], files)
+    config = json.loads((cell / "effective_config.json").read_text())
+    check("T15d the artifact identity is the written bytes",
+          config["strategy"]["artifact"] == {"ref": str(cell / "strategy_signal.py"),
+                                             "sha256": sha(cell / "strategy_signal.py")},
+          config["strategy"]["artifact"])
+    check("T15e the handoff hashes are the on-disk hashes",
+          handoff["entrypoint_sha256"] == sha(cell / "run_cell.entrypoint.py")
+          and handoff["effective_config_sha256"] == sha(cell / "effective_config.json"),
+          handoff)
+    check("T15f the approved overlay rides along unchanged",
+          config["house_overlay"] == request_for()["house_overlay"], config["house_overlay"])
+    check("T15g source identity is frozen into the config",
+          config["candidate"]["git_blob_sha"] == "a" * 40
+          and config["candidate"]["path"] == "demo-candidate.md"
+          and config["strategy"]["symbol"] == "BTCUSDT", config["candidate"])
+    check("T15h the artifact bytes are the injected block", (cell / "strategy_signal.py").read_text() == ARTIFACT)
+    rc, out = materialize(request_for())
+    check("T15i a retry resolves the existing cell instead of rewriting it",
+          rc == 0 and json.loads(out)["generator"] == "existing", out)
+    check("T15j the resolved cell keeps one directory",
+          len([item for item in matroot.iterdir() if item.is_dir()]) == 1, sorted(p.name for p in matroot.iterdir()))
+
+    (cell / "strategy_signal.py").write_text(ARTIFACT + "\n# tampered\n")
+    rc, out = materialize(request_for())
+    check("T15k a tampered artifact fails closed", rc == 2 and "declared hash" in out, out)
+
+    fresh = Path(tempfile.mkdtemp(prefix="transport-materialize-"))
+    rc, out = materialize(request_for(), root=fresh)
+    check("T15l the same identity materializes again in a fresh root", rc == 0, out)
+    broken = Path(tempfile.mkdtemp(prefix="transport-artifact-")) / "strategy_signal.py"
+    broken.write_text(EMPTY_ARTIFACT)
+    fresh2 = Path(tempfile.mkdtemp(prefix="transport-materialize-"))
+    rc, out = materialize(request_for(), artifact=broken, root=fresh2)
+    check("T15m an artifact that breaks the engine contract fails closed",
+          rc == 2 and "not runnable" in out, out)
+    check("T15n a failed materialization leaves no cell behind",
+          not [item for item in fresh2.iterdir() if item.is_dir()], sorted(p.name for p in fresh2.iterdir()))
+    for label, over in (("missing field", {"record_text": None}),
+                        ("bad commit", {"source_commit": "zz"}),
+                        ("bad symbol", {"strategy": dict(request_for()["strategy"], symbol="btc/usdt")}),
+                        ("unknown strategy field", {"strategy": dict(request_for()["strategy"], family="S01509")}),
+                        ("unapproved overlay", {"house_overlay": {"base_order_quote_pct": 0.06}}),
+                        ("outsider symbol", {"strategy": dict(request_for()["strategy"], symbol="ADAUSDT")}),
+                        ("unreadable engine", {"engine_ref": "/nonexistent/engine.py"})):
+        rc, out = materialize(request_for(**over), root=Path(tempfile.mkdtemp(prefix="transport-materialize-")))
+        check("T15o fails closed: " + label, rc == 2, out)
+    rc, out = materialize(request_for(), artifact=Path("/nonexistent/artifact.py"))
+    check("T15p an unreadable injected artifact fails closed", rc == 2, out)
+    encoded = b64(request_for())
+    check("T15q the Qlib key does not accept the materialize verb",
+          _t.parse_forced_command("research-materialize " + encoded)[0] is None)
+    check("T15r the Hermes key accepts the materialize verb",
+          _t.parse_forced_command("research-materialize " + encoded, hermes=True) == ((_t.MATERIALIZE_VERB, encoded), None))
+    check("T15s the materialize verb is never forwarded to the fixed runtime",
+          _t.build_forward_command(_t.MATERIALIZE_VERB, encoded) is None)
+    check("T15t the Qlib verb set is unchanged",
+          set(_t.FORCED_VERBS) == {"research-submit", "research-readback"}, str(_t.FORCED_VERBS))
 
     print("ALL THIN CHECKS PASSED")
 
