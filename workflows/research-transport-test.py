@@ -85,8 +85,8 @@ def make_handoff(root, entry, config, blob="a" * 40, caps=None, cost=True):
     }
     handoff["capabilities"] = caps or {
         "execution": ["qlib-native-backtest"],
-        "data": ["btcusdt-1h"],
-        "timing": ["bar-close-1h"],
+        "data": ["binance-usdm-ohlcv"],
+        "timing": ["bar-close"],
     }
     if cost:
         handoff["run_inputs"] = {"symbol": "BTCUSDT"}
@@ -147,10 +147,39 @@ def main():
     check("T2c bad hash shape fails closed", rc == 2, out)
 
     bad = make_handoff(tmp, entry, config,
-                        caps={"execution": ["future-engine"], "data": ["btcusdt-1h"], "timing": ["bar-close-1h"]})
+                        caps={"execution": ["future-engine"], "data": ["binance-usdm-ohlcv"],
+                              "timing": ["bar-close"]})
     rc, out = run("research-submit", b64(bad), root=tmp)
     check("T3 unknown capability holds without executing",
           rc == 2 and "ENGINEERING_HOLD" in out and not list(tmp.glob("n8n-live-*")), out)
+
+    for label, caps in (
+        ("unknown data primitive", {"execution": ["qlib-native-backtest"],
+                                    "data": ["coinbase-spot-1m"], "timing": ["bar-close"]}),
+        ("unknown timing primitive", {"execution": ["qlib-native-backtest"],
+                                     "data": ["binance-usdm-ohlcv"], "timing": ["bar-close-1m"]}),
+        ("the retired per-cell data name", {"execution": ["qlib-native-backtest"],
+                                            "data": ["btcusdt-1h"], "timing": ["bar-close"]}),
+        ("the retired per-cell timing name", {"execution": ["qlib-native-backtest"],
+                                              "data": ["binance-usdm-ohlcv"], "timing": ["bar-close-1h"]}),
+        ("a per-cell identity name", {"execution": ["qlib-native-backtest"],
+                                      "data": ["dogeusdt-1d"], "timing": ["bar-close"]}),
+    ):
+        bad = make_handoff(tmp, entry, config, caps=caps)
+        rc, out = run("research-submit", b64(bad), root=tmp)
+        check("T3b " + label + " fails closed",
+              rc == 2 and "ENGINEERING_HOLD" in out and not list(tmp.glob("n8n-live-*")), out)
+
+    # The gate is one reusable primitive for every covered cell, so a non-BTC/1h
+    # cell must reach the native submit path without a new declaration.
+    doge = Path(tempfile.mkdtemp(prefix="transport-doge-"))
+    dentry, dconfig = write_stub_files(doge, blob="d" * 40)
+    handoff = make_handoff(doge, dentry, dconfig, blob="d" * 40)
+    handoff["run_inputs"] = {"symbol": "DOGEUSDT", "timeframe": "1d", "research_leverage": 5}
+    rc, out = run("research-submit", b64(handoff), root=doge)
+    receipt = json.loads(out) if rc == 0 else {}
+    check("T3c a non-BTC/1h cell passes the reusable capability gate",
+          rc == 0 and receipt.get("node04") == "PASS", out)
 
     bad = make_handoff(tmp, entry, config)
     bad["entrypoint_sha256"] = "0" * 64
