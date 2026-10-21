@@ -1110,6 +1110,48 @@ def main() -> int:
 
     cases.append(case)
 
+    # Case 10. The run input's market-data flag must survive the handoff lane.
+    # Both request kinds run the real transport over a real frozen cell; the
+    # envelope may not drop a false/'false'/'no'/'0' selection, and an explicit
+    # false in the Alpha record still holds the same gate.
+    case = Case("10 market_data_ready survives both handoff request kinds")
+    record_ready = record_file
+    record_false_text = "---\nschema: strategy-research-record-v1\nhb_ready_status: PASS\nmarket_data_ready: false\n---\nbody\n"
+    record_false = {"type": "file", "sha": BLOB_SHA,
+                    "content": _b64.b64encode(record_false_text.encode()).decode()}
+
+    def readiness_with(env_item, rec):
+        outs = workflow.codes([READY_03], [env_item],
+                              dict(fixed, **{read_02: [rec], ENVELOPE_03E: [env_item]}))
+        return outs[READY_03][0]
+
+    resolved_once = json.loads(host_run(
+        workflow.codes([REQUEST_03C], [record_ready],
+                       dict(fixed, **{"01 \u00b7 Select candidate": [dict(selection, handoff_policy=policy)]})
+                       )[REQUEST_03C][0]["request_b64"])["stdout"])["handoff"]
+
+    for label, extra in (("handoff_policy", {"handoff_policy": policy}),
+                         ("executable_handoff", {"executable_handoff": resolved_once})):
+        for raw in (False, "false", "no", "0"):
+            request, env_item = envelope(dict(selection, **extra, market_data_ready=raw))
+            case.check("market_data_ready" in env_item,
+                       label + " envelope keeps the selection flag")
+            case.equal(env_item.get("market_data_ready"), raw, label + " keeps the raw value " + repr(raw))
+            route = readiness_with(env_item, record_ready)
+            case.equal(route["route"], "WAITING_DATA", label + " " + repr(raw) + " waits for data")
+            case.equal(route["reason"], "Market data is not ready for this run",
+                       label + " " + repr(raw) + " data reason")
+        request, env_item = envelope(dict(selection, **extra, market_data_ready=True))
+        case.equal(readiness_with(env_item, record_ready)["route"], "READY",
+                   label + " with market data ready still reaches READY")
+
+    request, env_item = envelope(dict(selection, handoff_policy=policy, market_data_ready=True))
+    record_route = readiness_with(env_item, record_false)
+    case.equal(record_route["route"], "WAITING_DATA", "an explicit false in the Alpha record waits for data")
+    case.equal(record_route["reason"], "Market data is not ready for this run", "record data reason")
+
+    cases.append(case)
+
     failed = 0
     for case in cases:
         status = "PASS" if not case.failures else "FAIL"
