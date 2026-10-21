@@ -138,7 +138,7 @@ function cellManifestEntry(cellId) {
     effective_config_ref: configRef,
     effective_config_sha256: frozen.effective_config_sha256,
     qlib_runtime_commit: RUNTIME_COMMIT,
-    capabilities: { execution: ['qlib-native-backtest'], data: ['btcusdt-1h'], timing: ['bar-close-1h'] },
+    capabilities: { execution: ['qlib-native-backtest'], data: ['binance-usdm-ohlcv'], timing: ['bar-close'] },
     evidence_refs: {
       candidate: 'https://api.github.com/repos/HCH725/alpha-strategy-research/git/blobs/' + SOURCE_BLOB_SHA,
       manifest: outDir + '/manifest.json',
@@ -398,9 +398,11 @@ function main() {
     () => runCampaign(unverifiedDeclaration), 'capability');
 
   // A valid declaration does not excuse an invalid second form.
-  const declaration = ['execution:qlib-native-backtest', 'data:btcusdt-1h', 'timing:bar-close-1h'];
+  const declaration = ['execution:qlib-native-backtest', 'data:binance-usdm-ohlcv', 'timing:bar-close'];
   for (const capabilities of [null, [], 'qlib-native-backtest', {}, { execution: [] },
-    { execution: 1 }, { execution: ['future-engine'] }, { toString: ['qlib-native-backtest'] }]) {
+    { execution: 1 }, { execution: ['future-engine'] }, { toString: ['qlib-native-backtest'] },
+    { data: ['coinbase-spot-1m'] }, { timing: ['bar-close-1m'] },
+    { data: ['btcusdt-1h'] }, { timing: ['bar-close-1h'] }, { data: ['dogeusdt-1d'] }]) {
     const manifest = campaignManifest(expected);
     manifest.cells[41].capabilities = capabilities;
     manifest.cells[41].capability_declaration = declaration;

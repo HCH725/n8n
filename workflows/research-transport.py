@@ -65,12 +65,16 @@ OPTIONAL = [
     "evidence_refs",
 ]
 
-# ponytail: same three verified primitives as the Node03 contract. Reuse only;
-# any value outside these fails closed here and routes to ENGINEERING_HOLD.
+# ponytail: verified primitives, one reusable name for each capability. A
+# symbol or timeframe combination is not a new capability. One Binance USD-M
+# OHLCV read at bar close serves every covered cell. Do not add a per-cell
+# entry here. Coverage is a measured provider-readiness fact on the campaign.
+# A value outside this set fails closed to ENGINEERING_HOLD. A new primitive
+# needs one representative validation first.
 VERIFIED_PRIMITIVES = {
     "execution": ["qlib-native-backtest"],
-    "data": ["btcusdt-1h"],
-    "timing": ["bar-close-1h"],
+    "data": ["binance-usdm-ohlcv"],
+    "timing": ["bar-close"],
 }
 
 CANDIDATE_BLOB_API = "https://api.github.com/repos/HCH725/alpha-strategy-research/git/blobs/"
