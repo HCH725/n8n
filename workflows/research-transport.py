@@ -8,7 +8,13 @@ exit 2 means invalid. This file never fabricates a PASS receipt: every receipt
 field comes from hashes checked here or files the native run wrote.
 
 hermes-forced: a separate restricted key sends one base64 UTF-8 task to the
-fixed host Hermes argv. This mode accepts no Qlib verb and starts no shell.
+fixed host Hermes argv. This mode accepts no Qlib verb and starts no shell. The
+same key serves ``research-handoff``: it resolves one already-frozen engineering
+cell against its own manifest, verifies every byte against the frozen digests and
+prints the executable handoff. It generates nothing, writes nothing, imports no
+strategy artifact and starts no subprocess. The engineering cell itself is
+produced by the existing Hermes/Kanban flow. The workflow's readiness gate still
+decides admission.
 
 ponytail: single-file bridge on purpose. Synchronous subprocess only, one fixed
 results root, one out_dir per frozen executable (a re-submit refuses instead of
@@ -75,6 +81,9 @@ VERIFIED_PRIMITIVES = {
     "execution": ["qlib-native-backtest"],
     "data": ["binance-usdm-ohlcv"],
     "timing": ["bar-close"],
+    #: The shared shell opens one long leg. A declared short side is a genuine
+    #: capability gap and routes ENGINEERING_HOLD instead of being accepted.
+    "sides": ["long"],
 }
 
 CANDIDATE_BLOB_API = "https://api.github.com/repos/HCH725/alpha-strategy-research/git/blobs/"
@@ -90,6 +99,10 @@ MAX_SCAN_DIRS = 500
 # SSH trust boundary auditable.
 FORCED_VERBS = ("research-submit", "research-readback")
 HERMES_VERB = "research-hermes"
+#: Second host verb on the same restricted key: resolve one frozen engineering
+#: cell and print its executable handoff. It never generates, writes or imports.
+HANDOFF_VERB = "research-handoff"
+HERMES_VERBS = (HERMES_VERB, HANDOFF_VERB)
 HERMES_PAYLOAD_LIMIT = 65536
 
 # ponytail: readback actually reads these four files, so the manifest must
@@ -765,6 +778,380 @@ def cmd_hermes(payload_b64):
     return proc.returncode
 
 
+# ---------------------------------------------------------------------------
+# One frozen-cell handoff verb: fixed request in, fixed reply out.
+#
+# The strategy artifact is produced by the existing engineering flow. A Qlib
+# ``materialize()`` run writes one frozen cell directory per identity plus the
+# campaign manifest that binds every digest. This file never generates code,
+# never writes a file, never imports the strategy artifact and never starts a
+# subprocess. It verifies one existing cell against its own frozen evidence and
+# prints the executable handoff the readiness gate already expects.
+# ---------------------------------------------------------------------------
+
+HANDOFF_KIND_RESOLVE = "handoff-resolve-v1"
+HANDOFF_KIND_VERIFY = "handoff-verify-v1"
+MANIFEST_NAME = "campaign-manifest.json"
+MANIFEST_SCHEMA = "qlib-formal-campaign-manifest-v1"
+STRATEGY_KEYS = ("symbol", "timeframe", "family", "sides", "params", "warmup_days",
+                 "window_start_utc", "window_end_utc_inclusive", "force_flat_bar_utc")
+STRATEGY_REQUIRED = ("symbol", "timeframe", "window_start_utc", "window_end_utc_inclusive")
+OVERLAY_KEYS = ("base_order_quote_pct", "safety_order_quote_pct", "safety_order_levels",
+                "so_spacing_pct", "take_profit_pct", "stop_loss_pct", "trade_cost",
+                "initial_capital_quote")
+OVERLAY_NUMERIC_KEYS = ("base_order_quote_pct", "safety_order_quote_pct", "safety_order_levels",
+                        "so_spacing_pct", "trade_cost", "initial_capital_quote")
+COST_MODEL_KEYS = ("fees_per_side", "slippage", "funding", "approved")
+#: Every cell digest pair the manifest binds. Bytes are hashed only to be
+#: compared with the frozen declaration; this file never re-signs them.
+CELL_EVIDENCE = (("effective_config_ref", "effective_config_sha256"),
+                 ("entrypoint_ref", "entrypoint_sha256"),
+                 ("strategy_artifact_ref", "strategy_artifact_sha256"))
+HANDOFF_MATCH_KEYS = ("source_commit", "candidate_path", "source_blob_sha", "entrypoint_ref",
+                      "entrypoint_sha256", "effective_config_sha256", "qlib_runtime_commit")
+
+
+def _read_json(path_value):
+    """Return (object, None) or (None, reason) for one JSON file. Never writes."""
+    try:
+        return json.loads(Path(path_value).read_bytes().decode("utf-8")), None
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None, "not readable JSON"
+
+
+def _identity_digest(identity):
+    """Return a stable 12-hex digest of one full effective identity."""
+    return hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:12]
+
+
+def _identity_problems(identity):
+    """Return the fail-closed problems in one full effective identity."""
+    if not isinstance(identity, dict):
+        return ["identity is not a JSON object"]
+    unknown = [key for key in identity
+               if key not in ("strategy", "research_leverage", "runtime", "data",
+                              "house_overlay", "research_cost_model")]
+    if unknown:
+        return ["unknown identity field: " + str(unknown[0])]
+    strategy = identity.get("strategy")
+    if not isinstance(strategy, dict):
+        return ["identity.strategy is not a JSON object"]
+    extra = [key for key in strategy if key not in STRATEGY_KEYS]
+    if extra:
+        return ["unknown strategy field: " + str(extra[0])]
+    for key in STRATEGY_REQUIRED:
+        if not isinstance(strategy.get(key), str) or not strategy[key]:
+            return ["strategy %s is missing" % key]
+    # A strategy must state which execution sides it implements. The shell only
+    # executes one long leg, so a two-sided strategy cannot be accepted here.
+    sides = strategy.get("sides")
+    if not isinstance(sides, list) or not sides or [s for s in sides if not isinstance(s, str)]:
+        return ["strategy execution sides are not declared"]
+    if strategy.get("params") is not None and not isinstance(strategy["params"], dict):
+        return ["strategy params is not a JSON object"]
+    warmup = strategy.get("warmup_days", 0)
+    if not isinstance(warmup, (int, float)) or isinstance(warmup, bool) or warmup < 0:
+        return ["strategy warmup_days is not a non-negative number"]
+    leverage = identity.get("research_leverage")
+    if not isinstance(leverage, int) or isinstance(leverage, bool) or leverage <= 0:
+        return ["research_leverage is not a positive integer"]
+    runtime = identity.get("runtime")
+    if not isinstance(runtime, dict) or not HEX40.match(str(runtime.get("commit"))):
+        return ["runtime commit is missing or invalid"]
+    data = identity.get("data")
+    if not isinstance(data, dict) or not check_abs_path(data.get("provider_ref")):
+        return ["data provider_ref is missing or invalid"]
+    overlay = identity.get("house_overlay")
+    if not isinstance(overlay, dict):
+        return ["house_overlay is not a JSON object"]
+    for key in OVERLAY_KEYS:
+        if key not in overlay:
+            return ["house_overlay has no approved value for " + key]
+    for key in OVERLAY_NUMERIC_KEYS:
+        value = overlay.get(key)
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return ["house_overlay.%s is not a usable number" % key]
+    cost = identity.get("research_cost_model")
+    if not isinstance(cost, dict) or [key for key in COST_MODEL_KEYS if key not in cost]:
+        return ["research_cost_model does not declare every field"]
+    if not isinstance(cost.get("approved"), bool):
+        return ["research_cost_model.approved is not a boolean"]
+    return []
+
+
+def _request_problems(request):
+    """Return the fail-closed problems in one handoff request."""
+    if not isinstance(request, dict):
+        return ["handoff request is not a JSON object"]
+    kind = request.get("request")
+    if kind not in (HANDOFF_KIND_RESOLVE, HANDOFF_KIND_VERIFY):
+        return ["handoff request kind is not supported"]
+    allowed = {"request", "source_commit", "candidate_path", "source_blob_sha"}
+    allowed |= {"identity", "evidence_root"} if kind == HANDOFF_KIND_RESOLVE else {"handoff"}
+    unknown = [key for key in request if key not in allowed]
+    if unknown:
+        return ["unknown field: " + str(unknown[0])]
+    for key in ("source_commit", "candidate_path", "source_blob_sha"):
+        if request.get(key) is None:
+            return ["missing field: " + key]
+    if not HEX40.match(str(request["source_commit"])):
+        return ["source_commit has a bad shape"]
+    name = request["candidate_path"]
+    if (not isinstance(name, str) or "/" in name or ".." in name
+            or not name.endswith(".md") or len(name) > 256):
+        return ["candidate_path has a bad shape"]
+    if not HEX40.match(str(request["source_blob_sha"])):
+        return ["source_blob_sha has a bad shape"]
+    if kind == HANDOFF_KIND_RESOLVE:
+        if not check_abs_path(request.get("evidence_root")):
+            return ["evidence_root is not an absolute path"]
+        return _identity_problems(request.get("identity"))
+    reason = check_handoff(request.get("handoff"))
+    return [reason] if reason else []
+
+
+def _manifest_cells(evidence_root):
+    """Return (cells, None) or (None, reason) from one frozen evidence root."""
+    manifest, why = _read_json(str(Path(evidence_root) / MANIFEST_NAME))
+    if manifest is None:
+        return None, "the evidence root has no readable " + MANIFEST_NAME
+    if not isinstance(manifest, dict) or manifest.get("schema") != MANIFEST_SCHEMA:
+        return None, "the evidence manifest schema is not " + MANIFEST_SCHEMA
+    cells = manifest.get("cells")
+    if not isinstance(cells, list) or not cells:
+        return None, "the evidence manifest carries no cell"
+    return [cell for cell in cells if isinstance(cell, dict)], None
+
+
+def _evidence_root_for(config_ref):
+    """Walk up from one frozen config to the manifest that binds it."""
+    path = Path(config_ref)
+    for _ in range(4):
+        path = path.parent
+        if (path / MANIFEST_NAME).is_file():
+            return str(path)
+    return None
+
+
+def _cell_byte_problems(cell, evidence_root):
+    """Compare the bytes on disk with the digests the manifest already froze."""
+    problems = []
+    for ref_key, sha_key in CELL_EVIDENCE:
+        ref, want = cell.get(ref_key), cell.get(sha_key)
+        if not isinstance(ref, str) or not HEX64.match(str(want or "")):
+            problems.append("cell evidence is incomplete: " + ref_key)
+            continue
+        if not check_abs_path(ref) or not contained(evidence_root, ref):
+            problems.append("cell evidence is outside the evidence root: " + ref_key)
+            continue
+        if not Path(ref).is_file():
+            problems.append("cell evidence is missing on disk: " + ref_key)
+            continue
+        if file_sha256(ref) != want:
+            problems.append("cell evidence bytes do not match the frozen manifest digest: " + ref_key)
+    return problems
+
+
+def _identity_gap(cell, config, identity, request):
+    """List every effective-identity field that differs from the frozen config.
+
+    A cell is reusable only for exactly the identity it was frozen with. A
+    changed policy, runtime, data or engine identity is a different identity,
+    never the same cell with a new label.
+    """
+    gap = []
+
+    def differ(name, got, want):
+        if got != want:
+            gap.append("%s: %r != %r" % (name, got, want))
+
+    candidate = config.get("candidate") if isinstance(config.get("candidate"), dict) else {}
+    differ("candidate.path", candidate.get("path"), request["candidate_path"])
+    differ("candidate.source_commit", candidate.get("source_commit"), request["source_commit"])
+    differ("candidate.git_blob_sha", candidate.get("git_blob_sha"), request["source_blob_sha"])
+    runtime = config.get("runtime") if isinstance(config.get("runtime"), dict) else {}
+    differ("runtime.commit", runtime.get("commit"), identity["runtime"]["commit"])
+    data = config.get("data") if isinstance(config.get("data"), dict) else {}
+    differ("data.provider_ref", data.get("provider_ref"), identity["data"]["provider_ref"])
+    execution = config.get("execution") if isinstance(config.get("execution"), dict) else {}
+    differ("execution.entrypoint", execution.get("entrypoint"), cell.get("entrypoint_ref"))
+    differ("research_leverage", config.get("research_leverage"), identity["research_leverage"])
+    strategy = config.get("strategy") if isinstance(config.get("strategy"), dict) else {}
+    for key in STRATEGY_KEYS:
+        differ("strategy." + key, strategy.get(key), identity["strategy"].get(key))
+    overlay = config.get("house_overlay") if isinstance(config.get("house_overlay"), dict) else {}
+    for key in OVERLAY_KEYS:
+        differ("house_overlay." + key, overlay.get(key), identity["house_overlay"].get(key))
+    cost = config.get("research_cost_model") if isinstance(config.get("research_cost_model"), dict) else {}
+    for key in COST_MODEL_KEYS:
+        differ("research_cost_model." + key, cost.get(key), identity["research_cost_model"].get(key))
+    return gap
+
+
+def _handoff_from_cell(cell, config, evidence_root):
+    """Build the executable handoff from the verified evidence, never the request."""
+    refs = {"manifest": str(Path(evidence_root) / MANIFEST_NAME),
+            "effective_config": cell["effective_config_ref"],
+            "strategy_artifact": cell["strategy_artifact_ref"]}
+    extra = cell.get("evidence_refs")
+    if isinstance(extra, dict):
+        for key, value in extra.items():
+            if isinstance(value, str) and value and key not in refs:
+                refs[key] = value
+    return {
+        "source_commit": cell.get("source_commit"),
+        "candidate_path": cell.get("candidate_path"),
+        "source_blob_sha": cell.get("source_blob_sha"),
+        "entrypoint_ref": cell.get("entrypoint_ref"),
+        "entrypoint_sha256": cell.get("entrypoint_sha256"),
+        "effective_config_ref": cell.get("effective_config_ref"),
+        "effective_config_sha256": cell.get("effective_config_sha256"),
+        "qlib_runtime_commit": cell.get("qlib_runtime_commit"),
+        "capabilities": config["capabilities"],
+        "evidence_refs": refs,
+        "research_cost_model": dict(config.get("research_cost_model") or {}),
+        "run_inputs": {
+            "symbol": cell.get("symbol"),
+            "timeframe": cell.get("timeframe"),
+            "research_leverage": cell.get("research_leverage"),
+            "strategy_artifact_sha256": cell.get("strategy_artifact_sha256"),
+        },
+    }
+
+
+def _ready_report(cell, config, evidence_root):
+    """Return (report, None) or (None, reason) for one fully verified cell."""
+    # ponytail: bind declarations to the evidence already checked by both paths.
+    # Strategy semantics stay with engineering review. Do not import code here.
+    strategy = config.get("strategy") if isinstance(config.get("strategy"), dict) else {}
+    sides = strategy.get("sides")
+    if (not isinstance(sides, list) or not sides
+            or any(not isinstance(side, str) or not side for side in sides)):
+        return None, "the frozen strategy.sides must be a non-empty list of side names"
+    capabilities = config.get("capabilities")
+    declared = capabilities.get("sides") if isinstance(capabilities, dict) else None
+    if (not isinstance(declared, list) or any(not isinstance(side, str) for side in declared)
+            or set(sides) != set(declared)):
+        return None, "the frozen capabilities.sides do not match strategy.sides"
+    artifact = strategy.get("artifact")
+    if not isinstance(artifact, dict):
+        return None, "the frozen strategy.artifact declaration is missing"
+    ref = artifact.get("ref")
+    if (not isinstance(ref, str) or not check_abs_path(ref) or not contained(evidence_root, ref)
+            or os.path.realpath(ref) != os.path.realpath(cell["strategy_artifact_ref"])):
+        return None, "the frozen strategy.artifact.ref does not match the manifest artifact"
+    if artifact.get("sha256") != cell["strategy_artifact_sha256"]:
+        return None, "the frozen strategy.artifact.sha256 does not match the manifest digest"
+    handoff = _handoff_from_cell(cell, config, evidence_root)
+    reason = check_handoff(handoff)
+    if reason:
+        return None, "the frozen handoff is not executable: " + reason
+    return {"ok": True, "status": "ready", "source": "frozen-cell", "handoff": handoff}, None
+
+
+def resolve_frozen_handoff(request):
+    """Return (report, None) or (None, reason) for one resolve request.
+
+    Zero writes. A missing cell is an expected answer (implementation_needed),
+    not an error; a present cell that does not carry the requested identity, or
+    whose bytes no longer match the frozen manifest, fails closed.
+    """
+    evidence_root = request["evidence_root"]
+    cells, reason = _manifest_cells(evidence_root)
+    if cells is None:
+        return None, reason
+    matched = [cell for cell in cells
+               if cell.get("candidate_path") == request["candidate_path"]
+               and cell.get("source_commit") == request["source_commit"]
+               and cell.get("source_blob_sha") == request["source_blob_sha"]]
+    if not matched:
+        return {"ok": True, "status": "implementation_needed", "source": "none",
+                "identity_digest": _identity_digest(request["identity"]),
+                "reason": ("no frozen engineering cell exists for this candidate; "
+                           "the existing engineering flow must produce one")}, None
+    conflicts, broken = [], []
+    for cell in matched:
+        problems = _cell_byte_problems(cell, evidence_root)
+        if problems:
+            broken.extend(problems)
+            continue
+        config, why = _read_json(cell["effective_config_ref"])
+        if config is None:
+            broken.append("the frozen effective config is " + str(why))
+            continue
+        gap = _identity_gap(cell, config, request["identity"], request)
+        if gap:
+            conflicts.extend(gap)
+            continue
+        return _ready_report(cell, config, evidence_root)
+    # Byte integrity beats an identity mismatch: a rewritten file is evidence
+    # corruption, not a different (and possibly acceptable) identity.
+    if broken:
+        return None, "the frozen cell evidence is not intact: " + "; ".join(
+            sorted(set(broken))[:4])
+    if conflicts:
+        return None, ("the frozen cell does not carry the requested effective identity: "
+                      + "; ".join(sorted(set(conflicts))[:4]))
+
+
+def verify_frozen_handoff(request):
+    """Verify one supplied handoff against the frozen evidence. Zero writes.
+
+    The reply is always rebuilt from the evidence, so a caller cannot hand in a
+    handoff whose cost model, approved flag or capabilities differ from the
+    config the cell was frozen with.
+    """
+    handoff = request["handoff"]
+    evidence_root = _evidence_root_for(handoff["effective_config_ref"])
+    if evidence_root is None:
+        return None, "the handoff does not point at a frozen evidence root"
+    cells, reason = _manifest_cells(evidence_root)
+    if cells is None:
+        return None, reason
+    matched = [cell for cell in cells
+               if cell.get("effective_config_ref") == handoff["effective_config_ref"]]
+    if not matched:
+        return None, "no frozen cell matches the supplied handoff"
+    for cell in matched:
+        problems = _cell_byte_problems(cell, evidence_root)
+        if problems:
+            return None, "; ".join(problems[:4])
+        config, why = _read_json(cell["effective_config_ref"])
+        if config is None:
+            return None, "the frozen effective config is " + str(why)
+        gap = [key for key in HANDOFF_MATCH_KEYS if handoff.get(key) != cell.get(key)]
+        gap += ["pinned:" + key for key in ("source_commit", "candidate_path", "source_blob_sha")
+                if request.get(key) != cell.get(key)]
+        run_inputs = handoff.get("run_inputs") if isinstance(handoff.get("run_inputs"), dict) else {}
+        declared_artifact = run_inputs.get("strategy_artifact_sha256")
+        if declared_artifact is not None and declared_artifact != cell.get("strategy_artifact_sha256"):
+            gap.append("run_inputs.strategy_artifact_sha256")
+        if gap:
+            return None, "the handoff does not match the frozen cell: " + ", ".join(gap)
+        return _ready_report(cell, config, evidence_root)
+    return None, "no frozen cell matches the supplied handoff"
+
+
+def cmd_handoff(payload_b64):
+    """Verify or resolve one frozen cell and print the handoff. No writes."""
+    request, reason = decode_handoff(payload_b64)
+    if request is None:
+        return fail(reason)
+    problems = _request_problems(request)
+    if problems:
+        return fail("; ".join(problems))
+    if request["request"] == HANDOFF_KIND_RESOLVE:
+        report, reason = resolve_frozen_handoff(request)
+    else:
+        report, reason = verify_frozen_handoff(request)
+    if report is None:
+        return fail(reason)
+    print(json.dumps(report, sort_keys=True))
+    return 0
+
+
 def parse_forced_command(value, hermes=False):
     """Parse SSH_ORIGINAL_COMMAND for the fixed launch shape.
 
@@ -786,7 +1173,7 @@ def parse_forced_command(value, hermes=False):
     if len(tokens) != 2:
         return None, "forced-command input is missing or invalid"
     verb, arg = tokens
-    if verb not in ((HERMES_VERB,) if hermes else FORCED_VERBS):
+    if verb not in (HERMES_VERBS if hermes else FORCED_VERBS):
         return None, "forced-command input is missing or invalid"
     if verb == "research-readback":
         if not RUNID.match(arg):
@@ -926,6 +1313,8 @@ def main(argv):
         # ponytail: a separate restricted key enables only this host verb.
         # Keep the Qlib key and container forwarding unchanged.
         if argv:
+            if verb == HANDOFF_VERB:
+                return cmd_handoff(arg)
             return cmd_hermes(arg)
         # ponytail: host launches with no /results use the fixed runtime.
         if should_forward_host():

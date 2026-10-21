@@ -15,7 +15,9 @@ escape, identity mismatch, receipt mismatch.
 """
 
 import base64
+import contextlib
 import hashlib
+import io
 import json
 import os
 import subprocess
@@ -27,6 +29,61 @@ HERE = Path(__file__).resolve().parent
 TRANSPORT = HERE / "research-transport.py"
 RUN_ID = "ab" * 16
 EXP_ID = "123456"
+
+#: Minimal stand-in for the shared engine. The transport must call the engine
+#: for the artifact contract instead of carrying its own copy.
+STUB_ENGINE = """
+import hashlib
+
+CELL_SYMBOLS = ("BTCUSDT", "ETHUSDT")
+CELL_TIMEFRAMES = ("1h", "4h", "1d")
+CELL_LEVERAGES = (3, 5)
+
+
+def load_signal_artifact(cell_dir, artifact):
+    path = artifact["ref"]
+    with open(path, "rb") as handle:
+        digest = hashlib.sha256(handle.read()).hexdigest()
+    if digest != artifact["sha256"]:
+        raise SystemExit("HOLD: hash mismatch")
+    namespace = {}
+    with open(path, encoding="utf-8") as handle:
+        exec(compile(handle.read(), path, "exec"), namespace)
+    return namespace["signal"]
+
+
+def problems_in_signal_rows(rows):
+    if not rows:
+        return ["no rows"]
+    for row in rows:
+        for key in ("datetime", "high", "low", "close", "entry_transition", "exit_transition"):
+            if key not in row:
+                return ["missing " + key]
+    return []
+"""
+
+ARTIFACT = """
+def signal(*, high, low, close, volume, times, params, window_start, window_end):
+    length = params.get("entry_len")
+    if not isinstance(length, int) or length <= 0:
+        raise ValueError("entry_len must be a positive integer")
+    rows, entry_ts, state = [], None, False
+    for i in range(len(close)):
+        prior = max(high[i - length:i]) if i >= length else None
+        inside = window_start <= times[i] <= window_end
+        up = prior is not None and close[i] > prior
+        entry = False
+        if not state and inside and up:
+            state, entry, entry_ts = True, True, times[i]
+        rows.append({"datetime": times[i], "high": float(high[i]), "low": float(low[i]),
+                     "close": float(close[i]), "entry_transition": int(entry), "exit_transition": 0})
+    return rows, entry_ts
+"""
+
+EMPTY_ARTIFACT = """
+def signal(*, high, low, close, volume, times, params, window_start, window_end):
+    return [], None
+"""
 
 STUB_ENTRYPOINT = """\
 import hashlib, json, os, sys
@@ -392,6 +449,287 @@ def main():
     with patch.object(_t.subprocess, "run", side_effect=subprocess.TimeoutExpired("hermes", 1800)):
         check("T14i timeout fails closed", _t.cmd_hermes(encoded) == 2)
     check("T14j Hermes verb is never forwarded", _t.build_forward_command(_t.HERMES_VERB, encoded) is None)
+
+    # T15 frozen-cell resolve: verify one existing engineering cell and print
+    # its handoff. The transport must never generate, write or import anything.
+    overlay = {
+        "base_order_quote_pct": 0.06, "safety_order_quote_pct": 0.06,
+        "safety_order_levels": 2, "so_spacing_pct": 0.04,
+        "take_profit_pct": 0.05, "stop_loss_pct": None,
+        "trade_cost": 0.0004, "initial_capital_quote": 100000.0,
+    }
+    cost_model = {"fees_per_side": 0.0004, "slippage": 0.0, "funding": "not_modeled", "approved": False}
+    identity = {
+        "strategy": {"symbol": "BTCUSDT", "timeframe": "1h", "sides": ["long"],
+                     "params": {"entry_len": 5}, "warmup_days": 5,
+                     "window_start_utc": "2025-01-01 00:00:00",
+                     "window_end_utc_inclusive": "2025-12-31 00:00:00"},
+        "research_leverage": 3,
+        "runtime": {"commit": "c" * 40},
+        "data": {"provider_ref": "/results/_validation/provider"},
+        "house_overlay": overlay,
+        "research_cost_model": cost_model,
+    }
+
+    def frozen_root(marker=None):
+        """Write one frozen cell plus manifest, the way Qlib materialize() does."""
+        root = Path(tempfile.mkdtemp(prefix="transport-evidence-"))
+        cell_dir = root / "btcusdt-1h-3x"
+        cell_dir.mkdir()
+        entry = cell_dir / "run_cell.entrypoint.py"
+        entry.write_text("#!/usr/bin/env python3\n# frozen engine copy\n")
+        artifact = cell_dir / "strategy_signal.py"
+        body = "def signal(**kwargs):\n    return [], None\n"
+        if marker is not None:
+            body = "from pathlib import Path\nPath(%r).write_text('imported')\n\n" % str(marker) + body
+        artifact.write_text(body)
+        config = {
+            "schema": "qlib-formal-research-cell-v1",
+            "candidate": {"path": "demo-candidate.md", "source_commit": "b" * 40,
+                          "git_blob_sha": "a" * 40},
+            "runtime": {"commit": "c" * 40},
+            "data": {"provider_ref": "/results/_validation/provider"},
+            "execution": {"entrypoint": str(entry)},
+            "research_leverage": 3,
+            "strategy": {"symbol": "BTCUSDT", "timeframe": "1h", "sides": ["long"],
+                         "params": {"entry_len": 5}, "warmup_days": 5,
+                         "window_start_utc": "2025-01-01 00:00:00",
+                         "window_end_utc_inclusive": "2025-12-31 00:00:00",
+                         "artifact": {"ref": str(artifact), "sha256": sha(artifact)}},
+            "capabilities": {"execution": ["qlib-native-backtest"], "data": ["binance-usdm-ohlcv"],
+                             "timing": ["bar-close"], "sides": ["long"]},
+            "house_overlay": dict(overlay),
+            "research_cost_model": dict(cost_model),
+        }
+        config_path = cell_dir / "effective_config.json"
+        config_path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
+        cell = {
+            "cell_id": "btcusdt-1h-3x", "symbol": "BTCUSDT", "timeframe": "1h",
+            "research_leverage": 3,
+            "source_commit": "b" * 40, "candidate_path": "demo-candidate.md",
+            "source_blob_sha": "a" * 40,
+            "entrypoint_ref": str(entry), "entrypoint_sha256": sha(entry),
+            "strategy_artifact_ref": str(artifact),
+            "strategy_artifact_sha256": sha(artifact),
+            "effective_config_ref": str(config_path),
+            "effective_config_sha256": sha(config_path),
+            "qlib_runtime_commit": "c" * 40,
+            "capabilities": dict(config["capabilities"]),
+            "evidence_refs": {"manifest": str(root / "campaign-manifest.json")},
+            "research_cost_model": dict(cost_model),
+        }
+        (root / "campaign-manifest.json").write_text(json.dumps(
+            {"schema": "qlib-formal-campaign-manifest-v1", "cell_count": 1, "cells": [cell]},
+            indent=2, sort_keys=True) + "\n")
+        return root
+
+    def resolve_request(root, **over):
+        request = {
+            "request": "handoff-resolve-v1",
+            "source_commit": "b" * 40,
+            "candidate_path": "demo-candidate.md",
+            "source_blob_sha": "a" * 40,
+            "evidence_root": str(root),
+            "identity": json.loads(json.dumps(identity)),
+        }
+        for key, value in over.items():
+            if key in ("identity",):
+                request["identity"].update(value)
+            else:
+                request[key] = value
+        return request
+
+    def handoff_call(forced_command):
+        """Run one handoff command the way the restricted Hermes key does."""
+        env = dict(os.environ, SSH_ORIGINAL_COMMAND=forced_command)
+        proc = subprocess.run([sys.executable, str(TRANSPORT), "hermes-forced"], env=env,
+                              capture_output=True, text=True, timeout=120)
+        return proc.returncode, proc.stdout.strip()
+
+    def handoff_resolve(request):
+        return handoff_call("research-handoff " + b64(request))
+
+    def snapshot(root):
+        return sorted((str(p.relative_to(root)), p.stat().st_size, p.stat().st_mtime_ns)
+                      for p in Path(root).rglob("*"))
+
+    root = frozen_root()
+    before = snapshot(root)
+    rc, out = handoff_resolve(resolve_request(root))
+    report = json.loads(out) if out.startswith("{") else {}
+    check("T15a resolve returns the frozen handoff", rc == 0 and report.get("status") == "ready", out)
+    check("T15b the handoff is built from the frozen evidence",
+          report["handoff"]["effective_config_sha256"] == sha(root / "btcusdt-1h-3x/effective_config.json")
+          and report["handoff"]["entrypoint_sha256"] == sha(root / "btcusdt-1h-3x/run_cell.entrypoint.py")
+          and report["handoff"]["source_blob_sha"] == "a" * 40, out)
+    check("T15c the handoff carries the frozen cost model and capability set",
+          report["handoff"]["research_cost_model"]["approved"] is False
+          and report["handoff"]["capabilities"]["sides"] == ["long"], out)
+    check("T15d resolve writes nothing", snapshot(root) == before)
+
+    marker = Path(tempfile.mkdtemp(prefix="transport-marker-")) / "marker.txt"
+    root2 = frozen_root(marker=marker)
+    rc, out = handoff_resolve(resolve_request(root2))
+    check("T15e resolve reads the artifact but never imports it", rc == 0 and not marker.exists(), out)
+
+    rc, out = handoff_resolve(resolve_request(root, identity={"house_overlay": dict(overlay, trade_cost=0.01234)}))
+    check("T15f a changed trade_cost is an identity conflict, not a silent reuse",
+          rc == 2 and "house_overlay.trade_cost" in out, out)
+    rc, out = handoff_resolve(resolve_request(root, identity={"research_cost_model": dict(cost_model, approved=True)}))
+    check("T15g a changed approved flag is an identity conflict",
+          rc == 2 and "research_cost_model.approved" in out, out)
+    rc, out = handoff_resolve(resolve_request(root, identity={"runtime": {"commit": "d" * 40}}))
+    check("T15h a different runtime is a different identity", rc == 2 and "runtime.commit" in out, out)
+    rc, out = handoff_resolve(resolve_request(root, evidence_root=str(Path(tempfile.mkdtemp(prefix="transport-empty-")))))
+    check("T15i a missing evidence manifest fails closed", rc == 2, out)
+    rc, out = handoff_resolve(resolve_request(root, candidate_path="other-candidate.md"))
+    check("T15j an absent cell is implementation_needed, not a pass",
+          rc == 0 and json.loads(out).get("status") == "implementation_needed", out)
+    rc, out = handoff_resolve(resolve_request(root, candidate_path=""))
+    check("T15k a bad candidate path fails closed", rc == 2, out)
+    bad = resolve_request(root)
+    bad["record_text"] = "anything"
+    rc, out = handoff_resolve(bad)
+    check("T15l there is no record_text path at all", rc == 2 and "unknown field" in out, out)
+
+    # The frozen evidence is immutable: changing the bytes on disk is a mismatch
+    # against the manifest digest, never a new self-signed hash.
+    tampered = frozen_root()
+    config_path = tampered / "btcusdt-1h-3x/effective_config.json"
+    cfg = json.loads(config_path.read_text())
+    cfg["candidate"].pop("source_commit")
+    config_path.write_text(json.dumps(cfg, indent=2, sort_keys=True) + "\n")
+    rc, out = handoff_resolve(resolve_request(tampered))
+    check("T15m a rewritten config fails against the frozen manifest digest",
+          rc == 2 and "frozen manifest digest" in out, out)
+    tampered_artifact = frozen_root()
+    (tampered_artifact / "btcusdt-1h-3x/strategy_signal.py").write_text("def signal(**kwargs):\n    return [{}], None\n")
+    rc, out = handoff_resolve(resolve_request(tampered_artifact))
+    check("T15n a rewritten artifact fails against the frozen manifest digest",
+          rc == 2 and "frozen manifest digest" in out, out)
+
+    # T16 verify: a handoff carried in the run input is re-derived from evidence.
+    root = frozen_root()
+    canonical = json.loads(handoff_resolve(resolve_request(root))[1])["handoff"]
+    verify = {"request": "handoff-verify-v1", "source_commit": "b" * 40,
+              "candidate_path": "demo-candidate.md", "source_blob_sha": "a" * 40,
+              "handoff": dict(canonical, research_cost_model=dict(cost_model, approved=True))}
+    rc, out = handoff_call("research-handoff " + b64(verify))
+    report = json.loads(out) if out.startswith("{") else {}
+    check("T16a a supplied handoff is rebuilt from the frozen evidence",
+          rc == 0 and report["handoff"]["research_cost_model"]["approved"] is False, out)
+    forged = dict(verify)
+    forged["handoff"] = dict(canonical, entrypoint_sha256="e" * 64)
+    rc, out = handoff_call("research-handoff " + b64(forged))
+    check("T16b a forged entrypoint hash fails closed", rc == 2 and "entrypoint_sha256" in out, out)
+    forged = dict(verify)
+    forged["source_blob_sha"] = "f" * 40
+    rc, out = handoff_call("research-handoff " + b64(forged))
+    check("T16c a handoff for another pinned blob fails closed", rc == 2, out)
+    forged = dict(verify)
+    forged["handoff"] = dict(canonical, effective_config_ref="/nowhere/effective_config.json")
+    rc, out = handoff_call("research-handoff " + b64(forged))
+    check("T16d a handoff without frozen evidence fails closed", rc == 2, out)
+    unknown = dict(verify)
+    unknown["existing_handoff"] = canonical
+    rc, out = handoff_call("research-handoff " + b64(unknown))
+    check("T16e an unknown request field fails closed", rc == 2, out)
+
+    # Freeze each declaration into a valid manifest. These checks must reject
+    # inconsistent fields, not just a changed config digest.
+    invalid = (
+        ("two sides with long-only capabilities", "capabilities.sides",
+         lambda cfg: cfg["strategy"].update(sides=["long", "short"])),
+        ("missing strategy sides", "strategy.sides", lambda cfg: cfg["strategy"].pop("sides")),
+        ("empty strategy sides", "strategy.sides", lambda cfg: cfg["strategy"].update(sides=[])),
+        ("non-list strategy sides", "strategy.sides", lambda cfg: cfg["strategy"].update(sides="long")),
+        ("non-string strategy side", "strategy.sides", lambda cfg: cfg["strategy"].update(sides=[1])),
+        ("missing capability sides", "capabilities.sides", lambda cfg: cfg["capabilities"].pop("sides")),
+        ("missing config capabilities", "capabilities.sides", lambda cfg: cfg.pop("capabilities")),
+        ("non-list capability sides", "capabilities.sides", lambda cfg: cfg["capabilities"].update(sides="long")),
+        ("non-string capability side", "capabilities.sides", lambda cfg: cfg["capabilities"].update(sides=[1])),
+        ("missing artifact ref", "strategy.artifact.ref", lambda cfg: cfg["strategy"]["artifact"].pop("ref")),
+        ("missing artifact file", "strategy.artifact.ref", lambda cfg: cfg["strategy"]["artifact"].update(
+            ref=str(Path(cfg["strategy"]["artifact"]["ref"]).with_name("unchecked_signal.py")))),
+        ("different artifact with identical bytes", "strategy.artifact.ref", lambda cfg: cfg["strategy"]["artifact"].update(
+            ref=str(Path(cfg["strategy"]["artifact"]["ref"]).with_name("same_bytes.py")))),
+        ("artifact ref outside the root", "strategy.artifact.ref", lambda cfg: cfg["strategy"]["artifact"].update(ref=__file__)),
+        ("different artifact digest", "strategy.artifact.sha256", lambda cfg: cfg["strategy"]["artifact"].update(sha256="0" * 64)),
+        ("missing artifact digest", "strategy.artifact.sha256", lambda cfg: cfg["strategy"]["artifact"].pop("sha256")),
+    )
+    for label, field, change in invalid:
+        root = frozen_root()
+        canonical = json.loads(handoff_resolve(resolve_request(root))[1])["handoff"]
+        config_path = Path(canonical["effective_config_ref"])
+        cfg = json.loads(config_path.read_text())
+        artifact_path = Path(cfg["strategy"]["artifact"]["ref"])
+        artifact_path.with_name("same_bytes.py").write_bytes(artifact_path.read_bytes())
+        change(cfg)
+        config_path.write_text(json.dumps(cfg, indent=2, sort_keys=True) + "\n")
+        manifest_path = root / "campaign-manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["cells"][0]["effective_config_sha256"] = sha(config_path)
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        canonical["effective_config_sha256"] = sha(config_path)
+        request = resolve_request(root)
+        if label == "two sides with long-only capabilities":
+            request["identity"]["strategy"]["sides"] = ["long", "short"]
+        verify = {"request": "handoff-verify-v1", "source_commit": "b" * 40,
+                  "candidate_path": "demo-candidate.md", "source_blob_sha": "a" * 40,
+                  "handoff": canonical}
+        for kind, payload in (("resolve", request), ("verify", verify)):
+            rc, out = handoff_resolve(payload)
+            check("T16f " + kind + " rejects " + label,
+                  rc == 2 and field in out and json.loads(out).get("status") != "ready", out)
+
+    # A genuine short requirement stays visible to the existing capability gate.
+    # Order does not change which sides the strategy declares.
+    root = frozen_root()
+    config_path = root / "btcusdt-1h-3x/effective_config.json"
+    cfg = json.loads(config_path.read_text())
+    cfg["strategy"]["sides"] = ["long", "short"]
+    cfg["capabilities"]["sides"] = ["short", "long"]
+    ref = cfg["strategy"]["artifact"]["ref"]
+    cfg["strategy"]["artifact"]["ref"] = str(Path(ref).parent) + "/./strategy_signal.py"
+    config_path.write_text(json.dumps(cfg, indent=2, sort_keys=True) + "\n")
+    manifest_path = root / "campaign-manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["cells"][0]["effective_config_sha256"] = sha(config_path)
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    request = resolve_request(root)
+    request["identity"]["strategy"]["sides"] = ["long", "short"]
+    rc, out = handoff_resolve(request)
+    report = json.loads(out)
+    check("T16g matching sides and a normalized artifact path keep the short capability gap",
+          rc == 0 and _t.capability_gap(report.get("handoff", {})) == ["sides:short"], out)
+    verify = {"request": "handoff-verify-v1", "source_commit": "b" * 40,
+              "candidate_path": "demo-candidate.md", "source_blob_sha": "a" * 40,
+              "handoff": report["handoff"]}
+    verify["handoff"]["capabilities"] = dict(cfg["capabilities"], sides=["long"])
+    rc, out = handoff_resolve(verify)
+    report = json.loads(out)
+    check("T16h verify derives sides from the frozen config, not the caller",
+          rc == 0 and report["handoff"]["capabilities"]["sides"] == ["short", "long"]
+          and _t.capability_gap(report["handoff"]) == ["sides:short"], out)
+
+    # T17 verb surface: one fixed verb on the restricted Hermes key only.
+    encoded = b64(resolve_request(frozen_root()))
+    check("T17a the Qlib key does not accept the handoff verb",
+          _t.parse_forced_command("research-handoff " + encoded)[0] is None)
+    check("T17b the Hermes key accepts the handoff verb",
+          _t.parse_forced_command("research-handoff " + encoded, hermes=True)
+          == ((_t.HANDOFF_VERB, encoded), None))
+    check("T17c the handoff verb is never forwarded to the fixed runtime",
+          _t.build_forward_command(_t.HANDOFF_VERB, encoded) is None)
+    check("T17d the Qlib verb set is unchanged",
+          set(_t.FORCED_VERBS) == {"research-submit", "research-readback"}, str(_t.FORCED_VERBS))
+    check("T17e the transport imports no strategy code and starts no subprocess",
+          not hasattr(_t, "cmd_materialize") and not hasattr(_t, "artifact_source")
+          and not hasattr(_t, "ARTIFACT_SMOKE") and "importlib" not in Path(_t.__file__).read_text())
+    with patch.object(_t.subprocess, "run", side_effect=AssertionError("no child process allowed")):
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = _t.cmd_handoff(encoded)
+        check("T17f resolve starts no child process", rc == 0)
 
     print("ALL THIN CHECKS PASSED")
 
