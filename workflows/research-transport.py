@@ -107,6 +107,7 @@ ENGINE_ENTRYPOINT_NAME = "run_cell.entrypoint.py"
 CONFIG_NAME = "effective_config.json"
 RECEIPT_NAME = "materialization.json"
 SMOKE_TIMEOUT = 120
+MATERIALIZE_RECORD_LIMIT = 32768
 
 # ponytail: readback actually reads these four files, so the manifest must
 # cover them. Only existence plus the readback sha correspondence is checked;
@@ -868,7 +869,9 @@ def materialize_problems(request):
     record = request["record_text"]
     if not isinstance(record, str) or not record.strip():
         return ["record_text is empty"]
-    if len(record) > HERMES_PAYLOAD_LIMIT:
+    # The forced-command token carries base64, so the decoded record must stay
+    # well below HERMES_PAYLOAD_LIMIT or the SSH handler refuses the whole call.
+    if len(record) > MATERIALIZE_RECORD_LIMIT:
         return ["record_text is too large"]
     strategy = request["strategy"]
     if not isinstance(strategy, dict):
