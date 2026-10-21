@@ -635,6 +635,83 @@ def main():
     rc, out = handoff_call("research-handoff " + b64(unknown))
     check("T16e an unknown request field fails closed", rc == 2, out)
 
+    # Freeze each declaration into a valid manifest. These checks must reject
+    # inconsistent fields, not just a changed config digest.
+    invalid = (
+        ("two sides with long-only capabilities", "capabilities.sides",
+         lambda cfg: cfg["strategy"].update(sides=["long", "short"])),
+        ("missing strategy sides", "strategy.sides", lambda cfg: cfg["strategy"].pop("sides")),
+        ("empty strategy sides", "strategy.sides", lambda cfg: cfg["strategy"].update(sides=[])),
+        ("non-list strategy sides", "strategy.sides", lambda cfg: cfg["strategy"].update(sides="long")),
+        ("non-string strategy side", "strategy.sides", lambda cfg: cfg["strategy"].update(sides=[1])),
+        ("missing capability sides", "capabilities.sides", lambda cfg: cfg["capabilities"].pop("sides")),
+        ("missing config capabilities", "capabilities.sides", lambda cfg: cfg.pop("capabilities")),
+        ("non-list capability sides", "capabilities.sides", lambda cfg: cfg["capabilities"].update(sides="long")),
+        ("non-string capability side", "capabilities.sides", lambda cfg: cfg["capabilities"].update(sides=[1])),
+        ("missing artifact ref", "strategy.artifact.ref", lambda cfg: cfg["strategy"]["artifact"].pop("ref")),
+        ("missing artifact file", "strategy.artifact.ref", lambda cfg: cfg["strategy"]["artifact"].update(
+            ref=str(Path(cfg["strategy"]["artifact"]["ref"]).with_name("unchecked_signal.py")))),
+        ("different artifact with identical bytes", "strategy.artifact.ref", lambda cfg: cfg["strategy"]["artifact"].update(
+            ref=str(Path(cfg["strategy"]["artifact"]["ref"]).with_name("same_bytes.py")))),
+        ("artifact ref outside the root", "strategy.artifact.ref", lambda cfg: cfg["strategy"]["artifact"].update(ref=__file__)),
+        ("different artifact digest", "strategy.artifact.sha256", lambda cfg: cfg["strategy"]["artifact"].update(sha256="0" * 64)),
+        ("missing artifact digest", "strategy.artifact.sha256", lambda cfg: cfg["strategy"]["artifact"].pop("sha256")),
+    )
+    for label, field, change in invalid:
+        root = frozen_root()
+        canonical = json.loads(handoff_resolve(resolve_request(root))[1])["handoff"]
+        config_path = Path(canonical["effective_config_ref"])
+        cfg = json.loads(config_path.read_text())
+        artifact_path = Path(cfg["strategy"]["artifact"]["ref"])
+        artifact_path.with_name("same_bytes.py").write_bytes(artifact_path.read_bytes())
+        change(cfg)
+        config_path.write_text(json.dumps(cfg, indent=2, sort_keys=True) + "\n")
+        manifest_path = root / "campaign-manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["cells"][0]["effective_config_sha256"] = sha(config_path)
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        canonical["effective_config_sha256"] = sha(config_path)
+        request = resolve_request(root)
+        if label == "two sides with long-only capabilities":
+            request["identity"]["strategy"]["sides"] = ["long", "short"]
+        verify = {"request": "handoff-verify-v1", "source_commit": "b" * 40,
+                  "candidate_path": "demo-candidate.md", "source_blob_sha": "a" * 40,
+                  "handoff": canonical}
+        for kind, payload in (("resolve", request), ("verify", verify)):
+            rc, out = handoff_resolve(payload)
+            check("T16f " + kind + " rejects " + label,
+                  rc == 2 and field in out and json.loads(out).get("status") != "ready", out)
+
+    # A genuine short requirement stays visible to the existing capability gate.
+    # Order does not change which sides the strategy declares.
+    root = frozen_root()
+    config_path = root / "btcusdt-1h-3x/effective_config.json"
+    cfg = json.loads(config_path.read_text())
+    cfg["strategy"]["sides"] = ["long", "short"]
+    cfg["capabilities"]["sides"] = ["short", "long"]
+    ref = cfg["strategy"]["artifact"]["ref"]
+    cfg["strategy"]["artifact"]["ref"] = str(Path(ref).parent) + "/./strategy_signal.py"
+    config_path.write_text(json.dumps(cfg, indent=2, sort_keys=True) + "\n")
+    manifest_path = root / "campaign-manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["cells"][0]["effective_config_sha256"] = sha(config_path)
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    request = resolve_request(root)
+    request["identity"]["strategy"]["sides"] = ["long", "short"]
+    rc, out = handoff_resolve(request)
+    report = json.loads(out)
+    check("T16g matching sides and a normalized artifact path keep the short capability gap",
+          rc == 0 and _t.capability_gap(report.get("handoff", {})) == ["sides:short"], out)
+    verify = {"request": "handoff-verify-v1", "source_commit": "b" * 40,
+              "candidate_path": "demo-candidate.md", "source_blob_sha": "a" * 40,
+              "handoff": report["handoff"]}
+    verify["handoff"]["capabilities"] = dict(cfg["capabilities"], sides=["long"])
+    rc, out = handoff_resolve(verify)
+    report = json.loads(out)
+    check("T16h verify derives sides from the frozen config, not the caller",
+          rc == 0 and report["handoff"]["capabilities"]["sides"] == ["short", "long"]
+          and _t.capability_gap(report["handoff"]) == ["sides:short"], out)
+
     # T17 verb surface: one fixed verb on the restricted Hermes key only.
     encoded = b64(resolve_request(frozen_root()))
     check("T17a the Qlib key does not accept the handoff verb",

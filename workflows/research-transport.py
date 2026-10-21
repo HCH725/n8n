@@ -981,8 +981,6 @@ def _identity_gap(cell, config, identity, request):
     strategy = config.get("strategy") if isinstance(config.get("strategy"), dict) else {}
     for key in STRATEGY_KEYS:
         differ("strategy." + key, strategy.get(key), identity["strategy"].get(key))
-    artifact = strategy.get("artifact") if isinstance(strategy.get("artifact"), dict) else {}
-    differ("strategy.artifact.sha256", artifact.get("sha256"), cell.get("strategy_artifact_sha256"))
     overlay = config.get("house_overlay") if isinstance(config.get("house_overlay"), dict) else {}
     for key in OVERLAY_KEYS:
         differ("house_overlay." + key, overlay.get(key), identity["house_overlay"].get(key))
@@ -1002,9 +1000,6 @@ def _handoff_from_cell(cell, config, evidence_root):
         for key, value in extra.items():
             if isinstance(value, str) and value and key not in refs:
                 refs[key] = value
-    capabilities = config.get("capabilities")
-    if not isinstance(capabilities, dict):
-        capabilities = cell.get("capabilities")
     return {
         "source_commit": cell.get("source_commit"),
         "candidate_path": cell.get("candidate_path"),
@@ -1014,7 +1009,7 @@ def _handoff_from_cell(cell, config, evidence_root):
         "effective_config_ref": cell.get("effective_config_ref"),
         "effective_config_sha256": cell.get("effective_config_sha256"),
         "qlib_runtime_commit": cell.get("qlib_runtime_commit"),
-        "capabilities": capabilities,
+        "capabilities": config["capabilities"],
         "evidence_refs": refs,
         "research_cost_model": dict(config.get("research_cost_model") or {}),
         "run_inputs": {
@@ -1028,6 +1023,27 @@ def _handoff_from_cell(cell, config, evidence_root):
 
 def _ready_report(cell, config, evidence_root):
     """Return (report, None) or (None, reason) for one fully verified cell."""
+    # ponytail: bind declarations to the evidence already checked by both paths.
+    # Strategy semantics stay with engineering review. Do not import code here.
+    strategy = config.get("strategy") if isinstance(config.get("strategy"), dict) else {}
+    sides = strategy.get("sides")
+    if (not isinstance(sides, list) or not sides
+            or any(not isinstance(side, str) or not side for side in sides)):
+        return None, "the frozen strategy.sides must be a non-empty list of side names"
+    capabilities = config.get("capabilities")
+    declared = capabilities.get("sides") if isinstance(capabilities, dict) else None
+    if (not isinstance(declared, list) or any(not isinstance(side, str) for side in declared)
+            or set(sides) != set(declared)):
+        return None, "the frozen capabilities.sides do not match strategy.sides"
+    artifact = strategy.get("artifact")
+    if not isinstance(artifact, dict):
+        return None, "the frozen strategy.artifact declaration is missing"
+    ref = artifact.get("ref")
+    if (not isinstance(ref, str) or not check_abs_path(ref) or not contained(evidence_root, ref)
+            or os.path.realpath(ref) != os.path.realpath(cell["strategy_artifact_ref"])):
+        return None, "the frozen strategy.artifact.ref does not match the manifest artifact"
+    if artifact.get("sha256") != cell["strategy_artifact_sha256"]:
+        return None, "the frozen strategy.artifact.sha256 does not match the manifest digest"
     handoff = _handoff_from_cell(cell, config, evidence_root)
     reason = check_handoff(handoff)
     if reason:
