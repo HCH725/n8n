@@ -596,7 +596,9 @@ def cmd_readback(run_id):
     experiment_id = str(readback.get("experiment_id") or "")
     if not re.match(r"^[0-9]+$", experiment_id):
         return fail("experiment reference is invalid")
-    params = readback.get("params") or {}
+    params = readback.get("params")
+    if not isinstance(params, dict):
+        return fail("native identity params are not a JSON object")
     metrics = readback.get("metrics") or {}
     artifacts = readback.get("artifact_names") or []
     counts = (len(params), len(metrics), len(artifacts))
@@ -634,6 +636,18 @@ def cmd_readback(run_id):
         digest = file_sha256(submit[ref_key])
         if digest is None or digest != submit.get(sha_key):
             return fail("submit/executable identity mismatch")
+    for key in ("symbol", "frequency"):
+        value = params.get(key)
+        if not isinstance(value, str) or not value.strip():
+            return fail("native identity has an invalid " + key)
+    leverage = params.get("research_leverage")
+    if type(leverage) not in (str, int, float) or leverage not in ("3", "5", 3, 5):
+        return fail("native identity has an invalid research_leverage")
+    native_identity = {
+        "symbol": params["symbol"],
+        "frequency": params["frequency"],
+        "research_leverage": int(leverage),
+    }
     # ponytail: the native run directory must exist. Existence only; meta.yaml
     # and params/metrics file formats belong to MLflow, not to this bridge.
     run_ref = real_out / "mlruns" / experiment_id / run_id
@@ -706,6 +720,8 @@ def cmd_readback(run_id):
                 "experiment_id": experiment_id,
                 "candidate_path": submit["candidate_path"],
                 "candidate_blob_sha": blob_sha,
+                "native_identity": native_identity,
+                "effective_config_sha256": submit["effective_config_sha256"],
                 "status": "FINISHED",
                 "params_count": counts[0],
                 "metrics_count": counts[1],

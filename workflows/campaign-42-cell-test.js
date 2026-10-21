@@ -32,6 +32,7 @@ const RUNTIME_COMMIT = 'bee09f23d938b96c2c1ef82d891aa0abfa171cd0';
 const CANDIDATE_PATH = 'donchian-20-10-breakout-btcusdt-1h-2026-10-06.md';
 const RESULTS_ROOT = '/results/_validation';
 const CELLS_DIR = RESULTS_ROOT + '/formal-cells-round0';
+const QLIB_FREQ = { '1h': '60min', '4h': '240min', '1d': 'day' };
 
 // The frozen transport prints exactly these 10 keys for a submit; it never
 // prints `cost_declared` (that fact rides only in the on-disk submit receipt,
@@ -182,6 +183,12 @@ function cleanReadbackReceipt(shell, handoff) {
     experiment_id: submitted.experiment_id,
     candidate_path: handoff.candidate_path,
     candidate_blob_sha: handoff.source_blob_sha,
+    native_identity: {
+      symbol: handoff.run_inputs.symbol,
+      frequency: QLIB_FREQ[handoff.run_inputs.timeframe],
+      research_leverage: handoff.run_inputs.research_leverage,
+    },
+    effective_config_sha256: handoff.effective_config_sha256,
     status: 'FINISHED',
     params_count: 6,
     metrics_count: 3,
@@ -310,7 +317,7 @@ function main() {
       { '03 · Loop over 42 cells': [{ json: noCostFact }] }, {})),
     'research cost is not declared');
 
-  // T4 clean receipts prove coverage mechanics, not native executed cell identity.
+  // T4 synthetic receipts test native binding and claimability, not a live campaign.
   const clean = runCampaign(campaignManifest(expected));
   check('clean campaign bounds 42 cells', clean.bound.length === 42, clean.bound.length);
   check('bound handoffs are unique run locations',
@@ -318,16 +325,47 @@ function main() {
   check('clean campaign records 42 cells', clean.sd.campaign_records.length === 42, clean.sd.campaign_records.length);
   check('clean campaign coverage is complete', clean.campaign.coverage_complete === true, clean.campaign);
   check('clean campaign evidence is complete', clean.campaign.evidence_complete === true);
-  check('clean receipt coverage cannot make performance claims', clean.campaign.performance_claimable === false, clean.campaign);
-  check('clean receipt coverage holds with a named native identity gap',
-    clean.campaign.route === 'HOLD'
-    && clean.campaign.gaps.includes('native executed cell identity is not verified for the frozen effective_config hash'));
+  check('verified native identities and approved cost permit synthetic claimability',
+    clean.campaign.performance_claimable === true && clean.campaign.route === 'PASS', clean.campaign);
+  check('42 verified native identities remove the identity gap',
+    clean.sd.campaign_records.every((record) => record.native_identity_verified === true)
+    && clean.campaign.gaps.length === 0, clean.campaign.gaps);
   const record = clean.sd.campaign_records[0];
   for (const key of ['symbol', 'timeframe', 'research_leverage', 'effective_config_sha256', 'qlib_run_id', 'experiment_id'])
     check('cell record exposes ' + key, record[key] !== undefined && record[key] !== null);
   check('cell record carries the Node05 PASS fact', record.node05_pass === true);
-  expectHold('clean receipt coverage holds at the campaign gate',
-    () => runCode('09 · Campaign gate', contextFor([{ json: clean.campaign }], {}, clean.sd)), 'not claimable');
+  check('the synthetic campaign passes the final gate after all checks',
+    runCode('09 · Campaign gate', contextFor([{ json: clean.campaign }], {}, clean.sd))[0].json === clean.campaign);
+
+  for (const native of [undefined, null, [], 'identity', {},
+    { symbol: 'LINKUSDT', frequency: 'day' },
+    { symbol: 'LINKUSDT', research_leverage: 5 },
+    { frequency: 'day', research_leverage: 5 }]) {
+    expectHold('native identity rejects ' + JSON.stringify(native),
+      () => runCampaign(campaignManifest(expected), (readback, shell) => {
+        if (shell.cell_id === expected[41]) readback.native_identity = native;
+      }), 'native identity mismatch');
+  }
+  for (const [field, value] of [['symbol', 'ADAUSDT'], ['symbol', ''],
+    ['frequency', '60min'], ['frequency', '1d'], ['research_leverage', 3],
+    ['research_leverage', '5'], ['research_leverage', null]]) {
+    expectHold('native ' + field + ' mismatch holds: ' + JSON.stringify(value),
+      () => runCampaign(campaignManifest(expected), (readback, shell) => {
+        if (shell.cell_id === expected[41]) readback.native_identity[field] = value;
+      }), 'native identity mismatch');
+  }
+  for (const timeframe of ['1h', '4h', '1d']) {
+    expectHold('native frequency must use the Qlib value for ' + timeframe,
+      () => runCampaign(campaignManifest(expected), (readback, shell) => {
+        if (shell.timeframe === timeframe) readback.native_identity.frequency = timeframe;
+      }), 'native identity mismatch');
+  }
+  for (const hash of [undefined, null, '0'.repeat(64)]) {
+    expectHold('readback config hash must match the frozen handoff: ' + JSON.stringify(hash),
+      () => runCampaign(campaignManifest(expected), (readback, shell) => {
+        if (shell.cell_id === expected[41]) readback.effective_config_sha256 = hash;
+      }), 'effective_config binding mismatch');
+  }
 
   // T5 held campaigns
   expectHold('41 cells hold at binding', () => runCampaign(campaignManifest(expected.slice(0, 41))), 'covers 41 of 42');
@@ -396,7 +434,7 @@ function main() {
     }
     const result = runCampaign(manifest);
     check('verified capability_declaration completes receipt coverage with bucketed=' + bucketed,
-      result.campaign.coverage_complete === true && result.campaign.performance_claimable === false);
+      result.campaign.coverage_complete === true && result.campaign.performance_claimable === true);
     check('capability declarations are preserved with bucketed=' + bucketed,
       result.bound.every((item, index) => {
         const handoff = item.json.executable_handoff;
@@ -408,8 +446,8 @@ function main() {
         }
         return true;
       }));
-    expectHold('complete receipts hold at the campaign gate with bucketed=' + bucketed,
-      () => runCode('09 · Campaign gate', contextFor([{ json: result.campaign }], {}, result.sd)), 'not claimable');
+    check('verified native receipts pass the campaign gate with bucketed=' + bucketed,
+      runCode('09 · Campaign gate', contextFor([{ json: result.campaign }], {}, result.sd))[0].json === result.campaign);
   }
 
   const sharedRun = campaignManifest(expected);
@@ -441,6 +479,23 @@ function main() {
     'not claimable');
 
   // T6 aggregate-level rejection of an incomplete or duplicated ledger
+  for (const verified of [undefined, false, null, 'true', 1]) {
+    const ledger = { ...clean.sd, campaign_records: clean.sd.campaign_records.map((record) => ({ ...record })) };
+    ledger.campaign_records[41].native_identity_verified = verified;
+    const campaign = runCode('08 · Campaign coverage aggregate', contextFor([{ json: {} }], {}, ledger))[0].json;
+    check('aggregate requires 42 exact native verification flags: ' + JSON.stringify(verified),
+      campaign.coverage_complete === true && campaign.performance_claimable === false && campaign.route === 'HOLD'
+      && campaign.gaps.includes('native executed cell identity is not verified for the frozen effective_config hash'), campaign);
+    expectHold('an unverified native record holds at the final gate',
+      () => runCode('09 · Campaign gate', contextFor([{ json: campaign }], {}, ledger)), 'not claimable');
+  }
+  for (const flag of ['node05_pass', 'evidence_complete', 'cost_declared', 'cost_model_approved']) {
+    const ledger = { ...clean.sd, campaign_records: clean.sd.campaign_records.map((record) => ({ ...record })) };
+    ledger.campaign_records[41][flag] = false;
+    const campaign = runCode('08 · Campaign coverage aggregate', contextFor([{ json: {} }], {}, ledger))[0].json;
+    check('native verification does not bypass ' + flag,
+      campaign.performance_claimable === false && campaign.route === 'HOLD', campaign);
+  }
   const partial = runCampaign(campaignManifest(expected));
   partial.sd.campaign_records.pop();
   const partialCampaign = runCode('08 · Campaign coverage aggregate', contextFor([{ json: {} }], {}, partial.sd))[0].json;

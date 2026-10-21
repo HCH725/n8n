@@ -39,7 +39,7 @@ if out.exists():
 (out / "signals.csv").write_text("a\\n" + "1\\n")
 (out / "events.csv").write_text("a\\n" + "1\\n")
 readback = {"tracking_uri": "file://x", "experiment_id": EXP, "run_id": RUN,
-            "status": "FINISHED", "params": {"qlib_version": "t", "symbol": "s", "frequency": "f"},
+            "status": "FINISHED", "params": {"qlib_version": "t", "symbol": "BTCUSDT", "frequency": "60min", "research_leverage": "3"},
             "metrics": {"m": 1.0}, "artifact_names": ["summary.json", "signals.csv", "events.csv"]}
 (out / "mlflow_readback.json").write_text(json.dumps(readback, sort_keys=True))
 manifest = {}
@@ -184,6 +184,78 @@ def main():
           and back["refs"]["candidate"].endswith("/git/blobs/" + "a" * 40)
           and Path(back["refs"]["effective_config"]).is_file()
           and Path(back["refs"]["entrypoint"]).is_file(), out)
+
+    check("T6 readback returns the native identity and verified config hash",
+          back.get("native_identity") == {
+              "symbol": "BTCUSDT", "frequency": "60min", "research_leverage": 3,
+          } and back.get("effective_config_sha256") == good["effective_config_sha256"], out)
+
+    readback_path = out_dir / "mlflow_readback.json"
+    manifest_path = out_dir / "manifest.json"
+    original_readback = readback_path.read_bytes()
+    original_manifest = manifest_path.read_bytes()
+    native_readback = json.loads(original_readback)
+
+    def write_params(params):
+        changed = dict(native_readback, params=params)
+        raw = json.dumps(changed, sort_keys=True).encode()
+        readback_path.write_bytes(raw)
+        manifest = json.loads(original_manifest)
+        manifest["mlflow_readback.json"] = {
+            "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
+        }
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True))
+
+    for leverage in ("3", "5", 3, 5, 3.0, 5.0):
+        write_params(dict(native_readback["params"], research_leverage=leverage))
+        rc, out = run("research-readback", RUN_ID, root=tmp)
+        identity = json.loads(out).get("native_identity", {})
+        check("T6 native leverage is an exact integer: " + repr(leverage),
+              rc == 0 and type(identity.get("research_leverage")) is int
+              and identity["research_leverage"] == int(leverage), out)
+    for key in ("symbol", "frequency", "research_leverage"):
+        missing = dict(native_readback["params"])
+        del missing[key]
+        write_params(missing)
+        rc, out = run("research-readback", RUN_ID, root=tmp)
+        check("T6 missing native " + key + " fails closed",
+              rc == 2 and "native identity" in out and key in out, out)
+    for key in ("symbol", "frequency"):
+        for value in (None, "", " \t", 3, [], {}):
+            params = dict(native_readback["params"])
+            params[key] = value
+            write_params(params)
+            rc, out = run("research-readback", RUN_ID, root=tmp)
+            check("T6 invalid native " + key + ": " + repr(value),
+                  rc == 2 and "native identity" in out and key in out, out)
+    for leverage in (None, "", "3x", "3.5", 3.5, 0, 4, 6, True, False, [], {}, "03"):
+        write_params(dict(native_readback["params"], research_leverage=leverage))
+        rc, out = run("research-readback", RUN_ID, root=tmp)
+        check("T6 invalid native leverage: " + repr(leverage),
+              rc == 2 and "native identity" in out and "research_leverage" in out, out)
+    for params in (None, [], ["symbol"], "params", 1, True):
+        write_params(params)
+        rc, out = run("research-readback", RUN_ID, root=tmp)
+        check("T6 native params must be an object: " + repr(params),
+              rc == 2 and "native identity params" in out, out)
+    readback_path.write_bytes(original_readback)
+    manifest_path.write_bytes(original_manifest)
+
+    original_config = config.read_bytes()
+    config.write_bytes(original_config + b" ")
+    rc, out = run("research-readback", RUN_ID, root=tmp)
+    check("T6 changed config bytes fail closed",
+          rc == 2 and "submit/executable identity mismatch" in out, out)
+    config.write_bytes(original_config)
+    submit_path = out_dir / "submit-receipt.json"
+    original_submit = submit_path.read_bytes()
+    submit = json.loads(original_submit)
+    submit["effective_config_sha256"] = "0" * 64
+    submit_path.write_text(json.dumps(submit))
+    rc, out = run("research-readback", RUN_ID, root=tmp)
+    check("T6 config hash must match the submit receipt",
+          rc == 2 and "submit/executable identity mismatch" in out, out)
+    submit_path.write_bytes(original_submit)
 
     rc, out = run("research-readback", "zz", root=tmp)
     check("T7a malformed run_id fails closed", rc == 2, out)
