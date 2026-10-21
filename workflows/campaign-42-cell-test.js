@@ -310,7 +310,7 @@ function main() {
       { '03 · Loop over 42 cells': [{ json: noCostFact }] }, {})),
     'research cost is not declared');
 
-  // T4 clean campaign: 42/42 PASS + declared approved cost -> coverage and claimability
+  // T4 clean receipts prove coverage mechanics, not native executed cell identity.
   const clean = runCampaign(campaignManifest(expected));
   check('clean campaign bounds 42 cells', clean.bound.length === 42, clean.bound.length);
   check('bound handoffs are unique run locations',
@@ -318,13 +318,16 @@ function main() {
   check('clean campaign records 42 cells', clean.sd.campaign_records.length === 42, clean.sd.campaign_records.length);
   check('clean campaign coverage is complete', clean.campaign.coverage_complete === true, clean.campaign);
   check('clean campaign evidence is complete', clean.campaign.evidence_complete === true);
-  check('clean campaign is performance claimable', clean.campaign.performance_claimable === true, clean.campaign);
-  check('clean campaign passes the gate', clean.campaign.route === 'PASS' && clean.campaign.gaps.length === 0);
+  check('clean receipt coverage cannot make performance claims', clean.campaign.performance_claimable === false, clean.campaign);
+  check('clean receipt coverage holds with a named native identity gap',
+    clean.campaign.route === 'HOLD'
+    && clean.campaign.gaps.includes('native executed cell identity is not verified for the frozen effective_config hash'));
   const record = clean.sd.campaign_records[0];
   for (const key of ['symbol', 'timeframe', 'research_leverage', 'effective_config_sha256', 'qlib_run_id', 'experiment_id'])
     check('cell record exposes ' + key, record[key] !== undefined && record[key] !== null);
   check('cell record carries the Node05 PASS fact', record.node05_pass === true);
-  runCode('09 · Campaign gate', contextFor([{ json: clean.campaign }], {}, clean.sd));
+  expectHold('clean receipt coverage holds at the campaign gate',
+    () => runCode('09 · Campaign gate', contextFor([{ json: clean.campaign }], {}, clean.sd)), 'not claimable');
 
   // T5 held campaigns
   expectHold('41 cells hold at binding', () => runCampaign(campaignManifest(expected.slice(0, 41))), 'covers 41 of 42');
@@ -392,8 +395,8 @@ function main() {
       if (!bucketed) delete cell.capabilities;
     }
     const result = runCampaign(manifest);
-    check('verified capability_declaration passes with bucketed=' + bucketed,
-      result.campaign.route === 'PASS' && result.campaign.coverage_complete === true);
+    check('verified capability_declaration completes receipt coverage with bucketed=' + bucketed,
+      result.campaign.coverage_complete === true && result.campaign.performance_claimable === false);
     check('capability declarations are preserved with bucketed=' + bucketed,
       result.bound.every((item, index) => {
         const handoff = item.json.executable_handoff;
@@ -405,7 +408,8 @@ function main() {
         }
         return true;
       }));
-    runCode('09 · Campaign gate', contextFor([{ json: result.campaign }], {}, result.sd));
+    expectHold('complete receipts hold at the campaign gate with bucketed=' + bucketed,
+      () => runCode('09 · Campaign gate', contextFor([{ json: result.campaign }], {}, result.sd)), 'not claimable');
   }
 
   const sharedRun = campaignManifest(expected);
