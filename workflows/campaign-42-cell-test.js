@@ -337,6 +337,77 @@ function main() {
   mismatched.cells[6].symbol = 'ADAUSDT';
   expectHold('identity mismatch holds', () => runCampaign(mismatched), 'identity mismatch');
 
+  const mismatchedInputs = campaignManifest(expected);
+  for (const cell of mismatchedInputs.cells)
+    cell.run_inputs = { symbol: 'ADAUSDT', timeframe: '1m', research_leverage: 99 };
+  expectHold('run_inputs must match the frozen cell identity',
+    () => runCampaign(mismatchedInputs), 'run_inputs identity mismatch');
+
+  const missingCapabilities = campaignManifest(expected);
+  for (const cell of missingCapabilities.cells) delete cell.capabilities;
+  expectHold('cells must provide a capability declaration',
+    () => runCampaign(missingCapabilities), 'capability declaration');
+
+  const unverifiedDeclaration = campaignManifest(expected);
+  for (const cell of unverifiedDeclaration.cells) {
+    delete cell.capabilities;
+    cell.capability_declaration = ['execution:unverified-review-probe'];
+  }
+  expectHold('declared capabilities must use verified values',
+    () => runCampaign(unverifiedDeclaration), 'capability');
+
+  // A valid declaration does not excuse an invalid second form.
+  const declaration = ['execution:qlib-native-backtest', 'data:btcusdt-1h', 'timing:bar-close-1h'];
+  for (const capabilities of [null, [], 'qlib-native-backtest', {}, { execution: [] },
+    { execution: 1 }, { execution: ['future-engine'] }, { toString: ['qlib-native-backtest'] }]) {
+    const manifest = campaignManifest(expected);
+    manifest.cells[41].capabilities = capabilities;
+    manifest.cells[41].capability_declaration = declaration;
+    expectHold('bucketed capabilities reject ' + JSON.stringify(capabilities),
+      () => runCampaign(manifest), 'capability');
+  }
+  for (const capabilityDeclaration of [null, {}, [], 'execution:qlib-native-backtest',
+    [1], ['execution'], ['execution:qlib-native-backtest:extra'], ['execution:future-engine']]) {
+    const manifest = campaignManifest(expected);
+    manifest.cells[41].capability_declaration = capabilityDeclaration;
+    expectHold('capability_declaration rejects ' + JSON.stringify(capabilityDeclaration),
+      () => runCampaign(manifest), 'capability');
+  }
+  for (const runInputs of [undefined, null, [], 'BTCUSDT', {},
+    { ...clean.bound[41].json.executable_handoff.run_inputs, symbol: 'ADAUSDT' },
+    { ...clean.bound[41].json.executable_handoff.run_inputs, timeframe: '1m' },
+    { ...clean.bound[41].json.executable_handoff.run_inputs, research_leverage: 99 },
+    { ...clean.bound[41].json.executable_handoff.run_inputs, research_leverage: '5' }]) {
+    const manifest = campaignManifest(expected);
+    manifest.cells[41].run_inputs = runInputs;
+    expectHold('run_inputs reject ' + JSON.stringify(runInputs),
+      () => runCampaign(manifest), 'run_inputs');
+  }
+
+  // Both transport declaration forms must survive the encoded handoff.
+  for (const bucketed of [false, true]) {
+    const manifest = campaignManifest(expected);
+    for (const cell of manifest.cells) {
+      cell.capability_declaration = declaration;
+      if (!bucketed) delete cell.capabilities;
+    }
+    const result = runCampaign(manifest);
+    check('verified capability_declaration passes with bucketed=' + bucketed,
+      result.campaign.route === 'PASS' && result.campaign.coverage_complete === true);
+    check('capability declarations are preserved with bucketed=' + bucketed,
+      result.bound.every((item, index) => {
+        const handoff = item.json.executable_handoff;
+        const payload = JSON.parse(Buffer.from(item.json.transport_payload_b64, 'base64').toString('utf8'));
+        for (const key of ['capabilities', 'capability_declaration', 'run_inputs']) {
+          assert.deepStrictEqual(handoff[key], manifest.cells[index][key]);
+          assert.deepStrictEqual(payload[key], manifest.cells[index][key]);
+          assert.strictEqual(Object.hasOwn(payload, key), Object.hasOwn(manifest.cells[index], key));
+        }
+        return true;
+      }));
+    runCode('09 · Campaign gate', contextFor([{ json: result.campaign }], {}, result.sd));
+  }
+
   const sharedRun = campaignManifest(expected);
   sharedRun.cells[1].effective_config_sha256 = sharedRun.cells[0].effective_config_sha256;
   expectHold('two cells sharing one run location hold', () => runCampaign(sharedRun), 'shares one run location');
