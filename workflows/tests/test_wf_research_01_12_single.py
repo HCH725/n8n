@@ -34,7 +34,7 @@ HOLD_05B = "06 \u00b7 IS_READY HOLD endpoint"
 TASK_06 = "06 \u00b7 Hermes task payload"
 SSH_06 = "06 \u00b7 Hermes research (SSH)"
 REQUEST_03C = "02c \u00b7 Handoff request"
-SSH_MATERIALIZE = "02d \u00b7 Materialize or resolve handoff (Hermes SSH)"
+SSH_MATERIALIZE = "02d \u00b7 Frozen-cell handoff (Hermes SSH)"
 ENVELOPE_03E = "02e \u00b7 Handoff envelope"
 HOLD_GATE_03H = "03h \u00b7 HOLD lane gate"
 HOLD_03I = "03i \u00b7 HOLD endpoint"
@@ -279,6 +279,7 @@ def ready_03(config_sha: str = CONFIG_SHA, allowlist: list | None = None) -> dic
         "route": "READY",
         "market_data_ready": True,
         "executable_handoff": handoff,
+        "resolution": {"status": "ready", "source": "frozen-cell", "reason": None},
         "capability_gap": [],
         "transport_payload_b64": "e30=",
     }
@@ -594,12 +595,15 @@ def static_checks(workflow: Workflow, case: Case) -> None:
     ssh = [node for node in workflow.raw["nodes"] if node["type"] == "n8n-nodes-base.ssh"]
     case.equal(len(ssh), 4, "ssh nodes: two frozen 01-05 plus two Hermes host verbs")
     materialize_ssh = [node for node in ssh if node["name"] == SSH_MATERIALIZE]
-    case.equal(len(materialize_ssh), 1, "one host materialization SSH node")
-    case.equal(materialize_ssh[0]["parameters"]["command"], "={{ 'research-materialize ' + $json.request_b64 }}",
-               "fixed materialize verb and payload only")
-    case.equal(materialize_ssh[0]["parameters"]["cwd"], "/", "materialize restricted-key working directory")
+    case.equal(len(materialize_ssh), 1, "one frozen-cell handoff SSH node")
+    case.equal(materialize_ssh[0]["parameters"]["command"], "={{ 'research-handoff ' + $json.request_b64 }}",
+               "fixed handoff verb and payload only")
+    case.equal(materialize_ssh[0]["parameters"]["cwd"], "/", "handoff restricted-key working directory")
     case.equal(materialize_ssh[0]["credentials"]["sshPrivateKey"]["name"], "Hermes Host SSH",
-               "materialize reuses the Hermes host credential")
+               "the handoff reuses the Hermes host credential")
+    case.check("record_text" not in blob, "the workflow sends no record text to the host")
+    case.check("handoff_policy" in blob and "evidence_root" in blob,
+               "the run input names the effective identity and the frozen evidence root")
     hermes = [node for node in ssh if node["name"] == SSH_06]
     case.equal(len(hermes), 1, "one Hermes host SSH node")
     case.equal(hermes[0]["credentials"]["sshPrivateKey"]["name"], "Hermes Host SSH", "Hermes host credential placeholder")
@@ -917,92 +921,193 @@ def main() -> int:
     case.equal(outs["12 \u00b7 SHEETS_ACK lane gate"], [], "no Node13 without ACK")
     cases.append(case)
 
-    # Case 9. Readiness materializes a missing implementation; failure holds.
-    # The synthetic route runs the real Code nodes. The SSH node is a boundary,
-    # so its reply is a fixture, exactly like the Hermes reply fixture in case 3.
-    case = Case("9 missing implementation materializes -> READY; failure holds")
+    # Case 9. The handoff lane resolves one frozen engineering cell.
+    # The SSH node is a real boundary, so this case runs the real transport file
+    # over the real 02c request instead of inventing a successful reply.
+    case = Case("9 frozen cell resolves -> READY; missing or mismatched evidence holds")
     import base64 as _b64
+    import hashlib as _hashlib
+    import os as _os
+    import tempfile as _tempfile
 
     read_02 = "02 \u00b7 Read pinned record"
     record_text = "---\nschema: strategy-research-record-v1\nhb_ready_status: PASS\n---\nbody\n"
-    record_file = {"type": "file", "sha": BLOB_SHA, "content": _b64.b64encode(record_text.encode()).decode()}
-    pin = {"sha": HANDOFF["source_commit"]}
-    selection = {
-        "origin": "manual",
-        "candidate_path": HANDOFF["candidate_path"],
-        "market_data_ready": True,
-    }
-    policy = {
-        "strategy": {"symbol": "BTCUSDT", "timeframe": "1h", "params": {"entry_len": 20, "exit_len": 10},
-                     "warmup_days": 20, "window_start_utc": "2025-04-19 16:00:00",
-                     "window_end_utc_inclusive": "2026-04-19 16:00:00"},
-        "research_leverage": 3,
-        "runtime": {"commit": HANDOFF["qlib_runtime_commit"]},
-        "data": {"provider_ref": "/results/_validation/formal-cells-round0/provider"},
-        "house_overlay": {"base_order_quote_pct": 0.06, "safety_order_quote_pct": 0.06,
-                          "safety_order_levels": 2, "so_spacing_pct": 0.04, "take_profit_pct": 0.05,
-                          "stop_loss_pct": 0.2, "trade_cost": 0.001, "initial_capital_quote": 1000},
-        "research_cost_model": {"approved": False, "fees_per_side": 0.001, "slippage": 0.0005,
-                                "funding": 0.0},
-        "engine_ref": "/results/_validation/formal-cells-round0/research_cell.py",
-    }
-    fixed = {"02 \u00b7 Pin Alpha main": [pin]}
+    record_file = {"type": "file", "sha": BLOB_SHA,
+                   "content": _b64.b64encode(record_text.encode()).decode()}
+    fixed = {"02 \u00b7 Pin Alpha main": [{"sha": HANDOFF["source_commit"]}]}
+    overlay = {"base_order_quote_pct": 0.06, "safety_order_quote_pct": 0.06,
+               "safety_order_levels": 2, "so_spacing_pct": 0.04, "take_profit_pct": 0.05,
+               "stop_loss_pct": 0.2, "trade_cost": 0.001, "initial_capital_quote": 1000}
+    cost_model = {"approved": False, "fees_per_side": 0.001, "slippage": 0.0005, "funding": 0.0}
+    selection = {"origin": "manual", "candidate_path": HANDOFF["candidate_path"], "market_data_ready": True}
 
-    def envelope(reply: dict, sel: dict, outputs: dict | None = None) -> dict:
-        """Run 02c and 02e over one selection and one host reply fixture."""
+    def fsha(path):
+        return _hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+    def frozen_root():
+        """Write one frozen cell and manifest the way Qlib materialize() does."""
+        root = Path(_tempfile.mkdtemp(prefix="wf-handoff-evidence-"))
+        cell = root / "btcusdt-1h-3x"
+        cell.mkdir()
+        entry = cell / "run_cell.entrypoint.py"
+        entry.write_text("#!/usr/bin/env python3\n")
+        artifact = cell / "strategy_signal.py"
+        artifact.write_text("def signal(**kwargs):\n    return [], None\n")
+        config = {
+            "schema": "qlib-formal-research-cell-v1",
+            "candidate": {"path": HANDOFF["candidate_path"],
+                          "source_commit": HANDOFF["source_commit"], "git_blob_sha": BLOB_SHA},
+            "runtime": {"commit": HANDOFF["qlib_runtime_commit"]},
+            "data": {"provider_ref": "/results/_validation/formal-cells-round0/provider"},
+            "execution": {"entrypoint": str(entry)},
+            "research_leverage": 3,
+            "strategy": {"symbol": "BTCUSDT", "timeframe": "1h", "sides": ["long"],
+                         "params": {"entry_len": 20, "exit_len": 10}, "warmup_days": 20,
+                         "window_start_utc": "2025-04-19 16:00:00",
+                         "window_end_utc_inclusive": "2026-04-19 16:00:00",
+                         "artifact": {"ref": str(artifact), "sha256": fsha(artifact)}},
+            "capabilities": {"execution": ["qlib-native-backtest"], "data": ["binance-usdm-ohlcv"],
+                             "timing": ["bar-close"], "sides": ["long"]},
+            "house_overlay": dict(overlay),
+            "research_cost_model": dict(cost_model),
+        }
+        config_path = cell / "effective_config.json"
+        config_path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
+        manifest = {"schema": "qlib-formal-campaign-manifest-v1", "cell_count": 1, "cells": [{
+            "cell_id": "btcusdt-1h-3x", "symbol": "BTCUSDT", "timeframe": "1h",
+            "research_leverage": 3,
+            "source_commit": HANDOFF["source_commit"], "candidate_path": HANDOFF["candidate_path"],
+            "source_blob_sha": BLOB_SHA,
+            "entrypoint_ref": str(entry), "entrypoint_sha256": fsha(entry),
+            "strategy_artifact_ref": str(artifact), "strategy_artifact_sha256": fsha(artifact),
+            "effective_config_ref": str(config_path), "effective_config_sha256": fsha(config_path),
+            "qlib_runtime_commit": HANDOFF["qlib_runtime_commit"],
+            "capabilities": dict(config["capabilities"]),
+            "evidence_refs": {"manifest": str(root / "campaign-manifest.json")},
+            "research_cost_model": dict(cost_model),
+        }]}
+        (root / "campaign-manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        return root, config_path
+
+    transport = HERE.parent / "research-transport.py"
+
+    def host_run(request_b64):
+        """Run the real transport the way the restricted Hermes key would."""
+        if request_b64 is None:
+            return {"code": 2, "stdout": json.dumps({"ok": False, "error": "no request"})}
+        env = dict(_os.environ, SSH_ORIGINAL_COMMAND="research-handoff " + request_b64)
+        proc = subprocess.run([sys.executable, str(transport), "hermes-forced"], env=env,
+                              capture_output=True, text=True, timeout=120)
+        return {"code": proc.returncode, "stdout": proc.stdout.strip()}
+
+    def envelope(sel, reply=None):
         outs = workflow.codes([REQUEST_03C], [record_file],
-                              dict(outputs or {}, **fixed, **{"01 \u00b7 Select candidate": [sel]}))
-        outs[SSH_MATERIALIZE] = [reply]
-        return workflow.codes([ENVELOPE_03E], outs[SSH_MATERIALIZE][:1], outs)
+                              dict(fixed, **{"01 \u00b7 Select candidate": [sel]}))
+        request = outs[REQUEST_03C][0]
+        host = reply if reply is not None else host_run(request["request_b64"])
+        outs[SSH_MATERIALIZE] = [host]
+        env = workflow.codes([ENVELOPE_03E], [host], outs)
+        return request, env[ENVELOPE_03E][0]
 
-    def readiness(env: dict) -> dict:
-        """Run the readiness gate on one envelope, as the live graph does."""
+    def readiness(env):
         outs = workflow.codes([READY_03], [env],
                               dict(fixed, **{read_02: [record_file], ENVELOPE_03E: [env]}))
         return outs[READY_03][0]
 
-    held = envelope({"code": 0, "stdout": json.dumps({"ok": False, "error": "the materialized artifact is not runnable: no rows"})},
-                    dict(selection, materialize_policy=policy))
-    case.equal(held[ENVELOPE_03E][0]["executable_handoff"], None, "a failed materializer yields no handoff")
-    route = readiness(held[ENVELOPE_03E][0])
-    case.equal(route["route"], "IMPLEMENTATION_NEEDED", "a failed materializer routes IMPLEMENTATION_NEEDED")
-    case.check("not runnable" in route["reason"], "the failure reason rides along")
+    def ok_reply(handoff, status="ready"):
+        return {"code": 0, "stdout": json.dumps({"ok": True, "status": status,
+                                                 "source": "frozen-cell", "handoff": handoff})}
+
+    command = workflow.nodes[SSH_MATERIALIZE]["parameters"]["command"]
+    case.check("research-handoff" in command, "02d sends the frozen-cell handoff verb")
+
+    root, config_path = frozen_root()
+    policy = {"evidence_root": str(root),
+              "strategy": {"symbol": "BTCUSDT", "timeframe": "1h", "sides": ["long"],
+                           "params": {"entry_len": 20, "exit_len": 10}, "warmup_days": 20,
+                           "window_start_utc": "2025-04-19 16:00:00",
+                           "window_end_utc_inclusive": "2026-04-19 16:00:00"},
+              "research_leverage": 3,
+              "runtime": {"commit": HANDOFF["qlib_runtime_commit"]},
+              "data": {"provider_ref": "/results/_validation/formal-cells-round0/provider"},
+              "house_overlay": dict(overlay),
+              "research_cost_model": dict(cost_model)}
+
+    request, env = envelope(dict(selection, handoff_policy=policy))
+    case.equal(request["request_kind"], "resolve", "a policy run resolves a frozen cell")
+    case.equal(env["resolution"]["status"], "ready", "the real host resolves the frozen cell")
+    route = readiness(env)
+    case.equal(route["route"], "READY", "a verified frozen handoff reaches the same readiness")
+    case.equal(route["executable_handoff"]["effective_config_sha256"], fsha(config_path),
+               "the handoff binds the frozen config bytes")
+    case.equal(route["executable_handoff"]["research_cost_model"]["approved"], False,
+               "the approved flag comes from the frozen config, not the request")
+    case.equal(json.loads(_b64.b64decode(route["transport_payload_b64"]).decode()),
+               route["executable_handoff"], "the payload 04 submits is that handoff")
+
+    absent = dict(selection, candidate_path="another-candidate.md", handoff_policy=policy)
+    _, env = envelope(absent)
+    case.equal(env["resolution"]["status"], "implementation_needed",
+               "a candidate without a frozen cell is implementation_needed")
+    route = readiness(env)
+    case.equal(route["route"], "IMPLEMENTATION_NEEDED", "a missing cell holds instead of passing")
     hold_lane = workflow.codes([HOLD_GATE_03H], [route])
-    case.equal(len(hold_lane[HOLD_GATE_03H]), 1, "the HOLD lane surfaces the failure, not a dead drop")
-    case.equal(hold_lane[HOLD_GATE_03H][0]["route"], "IMPLEMENTATION_NEEDED", "the HOLD item keeps its route")
+    case.equal(len(hold_lane[HOLD_GATE_03H]), 1, "the HOLD lane surfaces the missing implementation")
 
-    materialized = envelope({"code": 0, "stdout": json.dumps({"ok": True, "generator": "hermes", "handoff": HANDOFF})},
-                            dict(selection, materialize_policy=policy))
-    case.equal(materialized[REQUEST_03C][0]["request_kind"], "materialize", "no handoff means materialize")
-    case.equal(materialized[ENVELOPE_03E][0]["materialize"]["status"], "materialized", "the materialization is recorded")
-    route = readiness(materialized[ENVELOPE_03E][0])
-    case.equal(route["route"], "READY", "a materialized handoff passes the same readiness gate")
-    case.equal(json.loads(_b64.b64decode(route["transport_payload_b64"]).decode()), HANDOFF,
-               "the handoff that 04 submits is the materialized one")
+    for label, over in (("trade_cost", {"house_overlay": dict(overlay, trade_cost=0.01234)}),
+                        ("approved", {"research_cost_model": dict(cost_model, approved=True)})):
+        _, env = envelope(dict(selection, handoff_policy=dict(policy, **over)))
+        case.equal(env["resolution"]["status"], "failed",
+                   "a changed " + label + " is refused by the host")
+        case.equal(readiness(env)["route"], "IMPLEMENTATION_NEEDED",
+                   "a changed " + label + " never reaches READY")
 
-    existing = envelope({"code": 0, "stdout": json.dumps({"ok": True, "generator": "existing", "handoff": HANDOFF})},
-                        dict(selection, executable_handoff=HANDOFF))
-    case.equal(existing[REQUEST_03C][0]["request_kind"], "existing", "a run-input handoff is resolved, not rebuilt")
-    case.equal(readiness(existing[ENVELOPE_03E][0])["route"], "READY", "the resolved handoff reaches READY")
-    case.equal(existing[REQUEST_03C][0]["request_b64"] is not None, True, "the resolve request is bound")
+    resolved = json.loads(host_run(
+        workflow.codes([REQUEST_03C], [record_file],
+                       dict(fixed, **{"01 \u00b7 Select candidate": [dict(selection, handoff_policy=policy)]})
+                       )[REQUEST_03C][0]["request_b64"])["stdout"])["handoff"]
+    request, env = envelope(dict(selection, executable_handoff=resolved))
+    case.equal(request["request_kind"], "verify", "a run-input handoff is verified, not trusted")
+    case.equal(env["resolution"]["status"], "ready", "the real host verifies the supplied handoff")
+    case.equal(readiness(env)["route"], "READY", "the verified handoff reaches the same readiness")
 
-    stripped = dict(selection, materialize_policy=None)
-    no_policy = envelope({"code": 0, "stdout": ""}, stripped)
-    case.equal(no_policy[REQUEST_03C][0]["request_problem"] is not None, True, "no policy is a declared problem")
-    case.equal(readiness(no_policy[ENVELOPE_03E][0])["route"], "IMPLEMENTATION_NEEDED", "no policy holds, never guesses")
+    smuggle = json.loads(json.dumps(resolved))
+    smuggle["research_cost_model"] = dict(cost_model, approved=True)
+    _, env = envelope(dict(selection, executable_handoff=smuggle))
+    case.equal(env["resolution"]["status"], "ready", "a smuggled cost model still resolves")
+    case.equal(env["executable_handoff"]["research_cost_model"]["approved"], False,
+               "the rebuilt handoff keeps the frozen approved flag")
+    forged = json.loads(json.dumps(resolved))
+    forged["entrypoint_sha256"] = "e" * 64
+    _, env = envelope(dict(selection, executable_handoff=forged))
+    case.equal(env["resolution"]["status"], "failed", "a forged entrypoint hash fails closed")
+    case.equal(readiness(env)["route"], "IMPLEMENTATION_NEEDED", "a forged handoff never reaches READY")
 
-    unknown = json.loads(json.dumps(HANDOFF))
-    unknown["capabilities"] = {"data": ["btcusdt-1h"], "execution": ["qlib-native-backtest"], "timing": ["bar-close"]}
-    wrong = envelope({"code": 0, "stdout": json.dumps({"ok": True, "generator": "hermes", "handoff": unknown})},
-                     dict(selection, materialize_policy=policy))
-    route = readiness(wrong[ENVELOPE_03E][0])
+    two_sided = json.loads(json.dumps(resolved))
+    two_sided["capabilities"] = dict(two_sided["capabilities"], sides=["long", "short"])
+    _, env = envelope(dict(selection, handoff_policy=policy), reply=ok_reply(two_sided))
+    route = readiness(env)
+    case.equal(route["route"], "ENGINEERING_HOLD", "a short side is a genuine capability gap")
+    case.equal(route["capability_gap"], ["sides:short"], "the gap names the primitive")
+
+    unknown = json.loads(json.dumps(resolved))
+    unknown["capabilities"] = {"data": ["btcusdt-1h"], "execution": ["qlib-native-backtest"],
+                               "timing": ["bar-close"], "sides": ["long"]}
+    _, env = envelope(dict(selection, handoff_policy=policy), reply=ok_reply(unknown))
+    route = readiness(env)
     case.equal(route["route"], "ENGINEERING_HOLD", "a per-symbol capability is not a verified primitive")
     case.equal(route["capability_gap"], ["data:btcusdt-1h"], "the gap names the primitive")
-    mismatch = json.loads(json.dumps(HANDOFF))
+
+    mismatch = json.loads(json.dumps(resolved))
     mismatch["entrypoint_sha256"] = "not-a-digest"
-    bad = envelope({"code": 0, "stdout": json.dumps({"ok": True, "generator": "hermes", "handoff": mismatch})},
-                   dict(selection, materialize_policy=policy))
-    case.equal(readiness(bad[ENVELOPE_03E][0])["route"], "NEEDS_REVIEW", "an unbound handoff shape fails closed")
+    _, env = envelope(dict(selection, handoff_policy=policy), reply=ok_reply(mismatch))
+    case.equal(readiness(env)["route"], "NEEDS_REVIEW", "an unbound handoff shape fails closed")
+
+    no_policy = envelope(dict(selection, handoff_policy=None), reply={"code": 0, "stdout": ""})[0]
+    case.equal(no_policy["request_problem"] is not None, True, "no policy is a declared problem")
+    env = envelope(dict(selection, handoff_policy=None), reply={"code": 0, "stdout": ""})[1]
+    case.equal(readiness(env)["route"], "IMPLEMENTATION_NEEDED", "no policy holds, never guesses")
+
     cases.append(case)
 
     failed = 0
