@@ -28,7 +28,7 @@ const workflow = JSON.parse(fs.readFileSync(WORKFLOW, 'utf8'));
 
 const SOURCE_BLOB_SHA = '8a09f6e642261714ef72872b601b8f679e1f0d30';
 const SOURCE_COMMIT = '890da11cb50daadc4d59b7fd58a2e96638b17833';
-const RUNTIME_COMMIT = 'bee09f23d938b96c2c1ef82d891aa0abfa171cd0';
+const RUNTIME_COMMIT = '5600671b8a6c445ea4ef3785ee6774ca6033076d';
 const CANDIDATE_PATH = 'donchian-20-10-breakout-btcusdt-1h-2026-10-06.md';
 const RESULTS_ROOT = '/results/_validation';
 const CELLS_DIR = RESULTS_ROOT + '/formal-cells-round0';
@@ -275,14 +275,14 @@ function main() {
   check('generator is stable across calls',
     runCode('01 · Generate 42 cell identities', contextFor([], {}, {})).map((item) => item.json.cell_id).join(',') === ids.join(','));
 
-  // T3 run-location formula matches the transport and the deployed evidence
-  check('out_dir formula reproduces the deployed representative evidence dir',
+  // T3 run-location formula stays bound to the canonical frozen runtime identity
+  check('out_dir formula reproduces the canonical frozen runtime identity',
     outDirShort({
       source_blob_sha: SOURCE_BLOB_SHA,
       entrypoint_sha256: '000e23b739eb13a7c3b1077af5501556bd73fd2ec0e9d439ce1e6d5113d14c05',
       effective_config_sha256: '7a976cce5a6d418c635af073e9df7f553b6893259c79e59722f49b368c28d1d2',
       qlib_runtime_commit: RUNTIME_COMMIT,
-    }) === '8b37e4ca2140');
+    }) === 'b582fcefa8a9');
 
   // T3b node 05 tracks the frozen Node04 contract. The printed receipt carries
   // no cost flag, so the cost fact must come from the handoff, under the

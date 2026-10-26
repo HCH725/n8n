@@ -249,7 +249,7 @@ HANDOFF = {
     "entrypoint_sha256": ENTRY_SHA,
     "effective_config_ref": "/results/_validation/donchian-s01509-native-20261014/effective_config.json",
     "effective_config_sha256": CONFIG_SHA,
-    "qlib_runtime_commit": "bee09f23d938b96c2c1ef82d891aa0abfa171cd0",
+    "qlib_runtime_commit": "5600671b8a6c445ea4ef3785ee6774ca6033076d",
     "run_inputs": {"frequency": "60min", "symbol": "BTCUSDT"},
     "evidence_refs": {
         "candidate": f"https://api.github.com/repos/HCH725/alpha-strategy-research/git/blobs/{BLOB_SHA}",

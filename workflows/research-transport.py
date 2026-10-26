@@ -116,9 +116,9 @@ REQUIRED_MANIFEST = ("mlflow_readback.json", "summary.json", "signals.csv", "eve
 # that fixed runtime. Never accept arbitrary shell/image/argv here.
 FIXED_CONTAINER = "qlib-run"
 FIXED_GUEST_PYTHON = "/opt/venv/bin/python"
-FIXED_IMAGE = "qlib:main-bee09f23-arm64"
-FIXED_IMAGE_DIGEST = "sha256:8bee2a8beed672b17096ad44db5064dbaadcafe124c2ee989cd03b47683355b9"
-FIXED_RUNTIME_COMMIT = "bee09f23d938b96c2c1ef82d891aa0abfa171cd0"
+FIXED_IMAGE = "qlib:main-5600671b-arm64"
+FIXED_IMAGE_DIGEST = "sha256:7ca0c33fd6ae791656bc77a85eb22559d2a25ac78a4da94451583ac00bf4e03a"
+FIXED_RUNTIME_COMMIT = "5600671b8a6c445ea4ef3785ee6774ca6033076d"
 HOST_RESULTS_SOURCE = "/Volumes/ExpansionDrive/qlib-results"
 
 
