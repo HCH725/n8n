@@ -859,6 +859,17 @@ def main():
     check("T18o an events row without every required field fails closed",
           rc == 2 and "bad row" in out, out)
 
+    # T18p/T18q an unfinished quoted field is malformed CSV, not evidence. The
+    # non-strict reader folded it into a legal field and passed both the header
+    # and the width checks.
+    rc, out = readback_of(events=EVENT_HEADER + "\n1,0,2.0,100.0,\"100.0")
+    check("T18p an unterminated quoted data field fails closed",
+          rc == 2 and "event evidence is not readable CSV" in out, out)
+    rc, out = readback_of(cycles=0, trades=0,
+                          events=EVENT_HEADER[:-len("filled_quote")] + "\"filled_quote")
+    check("T18q an unterminated quoted header field fails closed",
+          rc == 2 and "event evidence is not readable CSV" in out, out)
+
     # T19 production namespace: the default root is production, the test
     # override still works, and forwarding follows the configured root.
     check("T19a the default results root is production",

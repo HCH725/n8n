@@ -442,7 +442,8 @@ def count_events(events_bytes):
     replayed stage. A zero-cycle run writes the header only.
     """
     try:
-        rows = [row for row in csv.reader(io.StringIO(events_bytes.decode("utf-8"), newline=""))
+        rows = [row for row in csv.reader(io.StringIO(events_bytes.decode("utf-8"), newline=""),
+                                          strict=True)
                 if row]
     except (UnicodeDecodeError, csv.Error):
         return None, "event evidence is not readable CSV"
