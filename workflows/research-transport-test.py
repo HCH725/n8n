@@ -87,6 +87,142 @@ def signal(*, high, low, close, volume, times, params, window_start, window_end)
     return [], None
 """
 
+#: Test double for ``qlib.backtest.research_cell``. The transport may spawn only
+#: ``-m qlib.backtest.research_cell materialize --spec ... --root ...``, so this
+#: module implements exactly that command over an isolated fixture tree. It is a
+#: fixture, never production code: the real materializer lives in the pinned Qlib
+#: runtime image.
+STUB_MATERIALIZER = '''\
+"""Fixture double for qlib.backtest.research_cell materialize."""
+import hashlib, json, sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve()
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def main(argv):
+    spec_path = root = None
+    args = list(argv)
+    while args:
+        arg = args.pop(0)
+        if arg == "materialize":
+            continue
+        if arg == "--spec":
+            spec_path = args.pop(0)
+        elif arg == "--root":
+            root = args.pop(0)
+        else:
+            raise SystemExit("HOLD: unexpected argv " + arg)
+    if not spec_path or not root:
+        raise SystemExit("HOLD: materialize needs --spec and --root")
+    spec = json.loads(Path(spec_path).read_text())
+    entry_bytes = (HERE.parents[2] / "cell_entrypoint.py").read_bytes()
+    artifact_bytes = Path(spec["strategy_artifact"]["source"]).read_bytes()
+    cells = []
+    for symbol, timeframe in (("BTCUSDT", "1h"), ("ETHUSDT", "1h")):
+        cell_id = "%s-%s-x3" % (symbol, timeframe)
+        cell_dir = Path(root) / cell_id
+        cell_dir.mkdir(parents=True, exist_ok=True)
+        (cell_dir / "run_cell.entrypoint.py").write_bytes(entry_bytes)
+        (cell_dir / "strategy_signal.py").write_bytes(artifact_bytes)
+        config = {
+            "schema": "qlib-formal-research-cell-v1",
+            "candidate": dict(spec["candidate"]),
+            "runtime": dict(spec["runtime"]),
+            "data": dict(spec["data"]),
+            "execution": {"entrypoint": str(cell_dir / "run_cell.entrypoint.py")},
+            "research_leverage": 3,
+            "strategy": dict(spec["strategy"], symbol=symbol, timeframe=timeframe,
+                             artifact={"ref": str(cell_dir / "strategy_signal.py"),
+                                       "sha256": sha(artifact_bytes)}),
+            "capabilities": {"execution": ["qlib-native-backtest"],
+                             "data": ["binance-usdm-ohlcv"], "timing": ["bar-close"],
+                             "sides": list(spec["strategy"]["sides"])},
+            "house_overlay": dict(spec["house_overlay"]),
+            "research_cost_model": dict(spec["research_cost_model"]),
+        }
+        config_path = cell_dir / "effective_config.json"
+        config_path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\\n")
+        cells.append({
+            "cell_id": cell_id, "symbol": symbol, "timeframe": timeframe,
+            "research_leverage": 3,
+            "source_commit": spec["candidate"]["source_commit"],
+            "candidate_path": spec["candidate"]["path"],
+            "source_blob_sha": spec["candidate"]["git_blob_sha"],
+            "entrypoint_ref": config["execution"]["entrypoint"],
+            "entrypoint_sha256": sha(entry_bytes),
+            "strategy_artifact_ref": config["strategy"]["artifact"]["ref"],
+            "strategy_artifact_sha256": sha(artifact_bytes),
+            "effective_config_ref": str(config_path),
+            "effective_config_sha256": sha(config_path.read_bytes()),
+            "qlib_runtime_commit": spec["runtime"]["commit"],
+            "capabilities": dict(config["capabilities"]),
+            "evidence_refs": {},
+            "run_inputs": {"symbol": symbol, "timeframe": timeframe,
+                           "research_leverage": 3},
+            "research_cost_model": dict(spec["research_cost_model"]),
+        })
+    manifest = {"schema": "qlib-formal-campaign-manifest-v1",
+                "generated_from": str(Path(spec_path).resolve()),
+                "cell_count": len(cells), "cells": cells}
+    (Path(root) / "campaign-manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\\n")
+    print(json.dumps({"materialized": len(cells)}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+'''
+
+#: Fixture entrypoint for one materialized cell. It writes the same native
+#: evidence contract the real cell writes, so submit/readback run for real.
+STUB_CELL_ENTRY = '''\
+"""Fixture double for one frozen cell entrypoint."""
+import hashlib, json, os
+from pathlib import Path
+
+out = Path(os.environ["QLIB_OUT_DIR"])
+if out.exists():
+    raise SystemExit("refuse overwrite")
+(out / "mlruns" / "123456" / ("ab" * 16)).mkdir(parents=True)
+(out / "summary.json").write_text(json.dumps({
+    "cycles_replayed": 1,
+    "evaluation_window_start_utc": "2025-01-02T00:00:00",
+    "evaluation_window_end_utc": "2025-12-30T00:00:00",
+    "strategy_params": {"entry_len": 5},
+    "applied_economics": {"slippage_applied": False, "funding_applied": False,
+                          "funding_reconciled": False,
+                          "declared_model_matches_applied": False,
+                          "declared_model_match_reason": "research cost model is not approved"},
+    "economics_boundary": {"performance_claimable": False, "cost_model_approved": False},
+    "mlflow_metrics_omitted": []}))
+(out / "metrics.json").write_text(json.dumps({
+    "total_trades": 1, "net_return_pct": 1.0, "cagr_pct": None, "sharpe": None,
+    "max_drawdown_pct": 0.0, "win_rate_pct": 100.0, "profit_factor": None,
+    "net_profit_usdt": 10.0, "evaluation_bars": 2}))
+(out / "signals.csv").write_text("datetime,close\\n1,2\\n")
+(out / "events.csv").write_text(
+    "cycle,stage,stage_price,stage_quote_amount,filled_quote\\n1,entry,2.0,100.0,100.0\\n")
+readback = {"tracking_uri": "file://x", "experiment_id": "123456", "run_id": "ab" * 16,
+            "status": "FINISHED",
+            "params": {"qlib_version": "t", "symbol": "BTCUSDT", "frequency": "60min",
+                       "research_leverage": "3"},
+            "metrics": {"m": 1.0}, "artifact_names": ["summary.json"]}
+(out / "mlflow_readback.json").write_text(json.dumps(readback, sort_keys=True))
+manifest = {}
+for path in sorted(out.rglob("*")):
+    if path.is_file() and "mlruns" not in path.parts and path.name != "manifest.json":
+        manifest[str(path.relative_to(out))] = {
+            "bytes": path.stat().st_size, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+(out / "manifest.json").write_text(json.dumps(manifest, sort_keys=True))
+print(json.dumps({"summary": {}, "mlflow": readback, "manifest": manifest}))
+'''
+
 #: The frozen f923 evidence contract: one integer count in summary.json, one
 #: integer count in metrics.json, and one events row per replayed stage.
 EVENT_HEADER = "cycle,stage,stage_price,stage_quote_amount,filled_quote"
@@ -99,8 +235,23 @@ out = Path(os.environ["QLIB_OUT_DIR"])
 if out.exists():
     sys.exit("refuse overwrite")
 (out / "mlruns" / EXP / RUN).mkdir(parents=True)
-(out / "summary.json").write_text(json.dumps({"cycles_replayed": __CYCLES__}))
-(out / "metrics.json").write_text(json.dumps({"total_trades": __TRADES__}))
+summary = {"cycles_replayed": __CYCLES__,
+           "evaluation_window_start_utc": "2025-01-02T00:00:00",
+           "evaluation_window_end_utc": "2025-12-30T00:00:00",
+           "strategy_params": {"entry_len": 5},
+           "applied_economics": {"applied": "frozen primitive", "slippage_applied": False,
+                                 "funding_applied": False, "funding_reconciled": False,
+                                 "declared_model_matches_applied": False,
+                                 "declared_model_match_reason": "research cost model is not approved",
+                                 "funding_total_payment_quote": 0.0, "funding_charged_event_count": 0,
+                                 "funding_basis": None, "funding_source_ref": None,
+                                 "funding_source_sha256": None},
+           "economics_boundary": {"performance_claimable": False, "cost_model_approved": False},
+           "mlflow_metrics_omitted": ["cagr_pct", "sharpe"]}
+(out / "summary.json").write_text(json.dumps(summary))
+(out / "metrics.json").write_text(json.dumps({"total_trades": __TRADES__, "net_return_pct": 1.5,
+    "cagr_pct": None, "sharpe": None, "max_drawdown_pct": 0.0, "win_rate_pct": 100.0,
+    "profit_factor": None, "net_profit_usdt": 10.0, "evaluation_bars": 2}))
 (out / "signals.csv").write_text("datetime,close\\n1,2\\n")
 (out / "events.csv").write_text(__EVENTS__)
 readback = {"tracking_uri": "file://x", "experiment_id": EXP, "run_id": RUN,
@@ -127,10 +278,13 @@ def stub_source(cycles=1, trades=1, events=None):
             .replace("__EVENTS__", repr(events)))
 
 
-def run(cmd, *args, root=None):
+def run(cmd, *args, root=None, py_path=None):
     env = dict(os.environ)
     if root is not None:
         env["RESEARCH_RESULTS_ROOT"] = str(root)
+    if py_path is not None:
+        prefix = str(py_path)
+        env["PYTHONPATH"] = prefix + ((os.pathsep + env["PYTHONPATH"]) if env.get("PYTHONPATH") else "")
     proc = subprocess.run(
         [sys.executable, str(TRANSPORT), cmd, *args],
         env=env, capture_output=True, text=True, timeout=120,
@@ -183,6 +337,9 @@ def write_stub_files(root, blob="a" * 40, cycles=1, trades=1, events=None):
         "candidate": {"path": "demo-candidate.md", "git_blob_sha": blob},
         "execution": {"entrypoint": str(entry)},
         "runtime": {"commit": "c" * 40},
+        "strategy": {"window_start_utc": "2025-01-01 00:00:00",
+                     "window_end_utc_inclusive": "2025-12-31 00:00:00",
+                     "params": {"entry_len": 5}},
     }, sort_keys=True))
     entry.write_text(
         stub_source(cycles, trades, events).replace("EXP", '"%s"' % EXP_ID)
@@ -443,8 +600,9 @@ def main():
           good is not None and _t.FIXED_IMAGE in good
           and _t.FIXED_GUEST_PYTHON in good and good[-2:] == ["research-readback", RUN_ID]
           and not any(";" in a or "|" in a or "$" in a for a in good), str(good))
-    check("T13d forced verbs are research-only",
-          set(_t.FORCED_VERBS) == {"research-submit", "research-readback"}, str(_t.FORCED_VERBS))
+    check("T13d forced verbs are research-only plus the one bounded materializer",
+          set(_t.FORCED_VERBS) == {"research-submit", "research-readback", "research-materialize"},
+          str(_t.FORCED_VERBS))
     check("T13e the runtime pin is the exact f923 build",
           _t.FIXED_IMAGE == "qlib:main-f92320c1-arm64"
           and _t.FIXED_RUNTIME_COMMIT == "f92320c176521b269f5dee361a2172b8e6cde25c"
@@ -764,11 +922,14 @@ def main():
           == ((_t.HANDOFF_VERB, encoded), None))
     check("T17c the handoff verb is never forwarded to the fixed runtime",
           _t.build_forward_command(_t.HANDOFF_VERB, encoded) is None)
-    check("T17d the Qlib verb set is unchanged",
-          set(_t.FORCED_VERBS) == {"research-submit", "research-readback"}, str(_t.FORCED_VERBS))
-    check("T17e the transport imports no strategy code and starts no subprocess",
-          not hasattr(_t, "cmd_materialize") and not hasattr(_t, "artifact_source")
-          and not hasattr(_t, "ARTIFACT_SMOKE") and "importlib" not in Path(_t.__file__).read_text())
+    check("T17d the Qlib verb set carries no Hermes verb",
+          set(_t.FORCED_VERBS) == {"research-submit", "research-readback", "research-materialize"}
+          and _t.HERMES_VERB not in _t.FORCED_VERBS, str(_t.FORCED_VERBS))
+    # The read paths still import no strategy code and start no child process. The
+    # materialize verb is the ONE bounded child allowed, and T22 proves its argv.
+    check("T17e the verified read paths import no strategy code",
+          not hasattr(_t, "artifact_source") and not hasattr(_t, "ARTIFACT_SMOKE")
+          and "importlib" not in Path(_t.__file__).read_text())
     with patch.object(_t.subprocess, "run", side_effect=AssertionError("no child process allowed")):
         with contextlib.redirect_stdout(io.StringIO()):
             rc = _t.cmd_handoff(encoded)
@@ -892,6 +1053,502 @@ def main():
          patch.object(_t, "RESULTS_ROOT_DEFAULT", str(existing / "absent")):
         check("T19e forwarding follows the configured root, not a literal",
               _t.should_forward_host() is True)
+
+    # T20 verified campaign-manifest readback. One zero-write read of the frozen
+    # manifest, never a caller copy and never the per-run manifest.
+    def campaign_request(root, **over):
+        request = {"request": "campaign-manifest-read-v1", "source_commit": "b" * 40,
+                   "candidate_path": "demo-candidate.md", "source_blob_sha": "a" * 40,
+                   "evidence_root": str(root)}
+        request.update(over)
+        return request
+
+    root = frozen_root()
+    before = snapshot(root)
+    rc, out = handoff_resolve(campaign_request(root))
+    report = json.loads(out) if out.startswith("{") else {}
+    check("T20a the campaign read returns the verified manifest",
+          rc == 0 and report.get("manifest_kind") == "campaign"
+          and report.get("schema") == "qlib-formal-campaign-manifest-v1"
+          and report.get("cell_count") == 1
+          and report.get("manifest_sha256") == sha(root / "campaign-manifest.json")
+          and report["cells"][0]["cell_id"] == "btcusdt-1h-3x"
+          and report["cells"][0]["effective_config_sha256"] == sha(
+              root / "btcusdt-1h-3x/effective_config.json"), out)
+    check("T20b the campaign read writes nothing", snapshot(root) == before)
+    check("T20c an unbound campaign read reports no phase instead of guessing",
+          report.get("phase_bound") is False and report.get("phase_binding") is None
+          and report["window"]["start_utc"] == "2025-01-01 00:00:00"
+          and len(report["window"]["identity_sha256"]) == 64, out)
+    bad = frozen_root()
+    manifest = json.loads((bad / "campaign-manifest.json").read_text())
+    manifest["schema"] = "qlib-formal-run-manifest-v1"
+    (bad / "campaign-manifest.json").write_text(json.dumps(manifest))
+    rc, out = handoff_resolve(campaign_request(bad))
+    check("T20d a wrong manifest schema fails closed", rc == 2 and "schema" in out, out)
+    run_only = Path(tempfile.mkdtemp(prefix="transport-runmanifest-"))
+    (run_only / "manifest.json").write_text(json.dumps({"summary.json": {"sha256": "0" * 64}}))
+    rc, out = handoff_resolve(campaign_request(run_only))
+    check("T20e a per-run manifest is not a campaign manifest",
+          rc == 2 and "campaign-manifest.json" in out, out)
+    copied = Path(tempfile.mkdtemp(prefix="transport-runmanifest-"))
+    (copied / "campaign-manifest.json").write_text(json.dumps({"summary.json": {"sha256": "0" * 64}}))
+    rc, out = handoff_resolve(campaign_request(copied))
+    check("T20f a run manifest copied to the campaign name fails closed",
+          rc == 2 and "schema" in out, out)
+    rc, out = handoff_resolve(campaign_request(Path(tempfile.mkdtemp(prefix="transport-empty-"))))
+    check("T20g an empty evidence root fails closed", rc == 2, out)
+    tampered = frozen_root()
+    (tampered / "btcusdt-1h-3x/strategy_signal.py").write_text(
+        "def signal(**kwargs):\n    return [{}], None\n")
+    rc, out = handoff_resolve(campaign_request(tampered))
+    check("T20h a tampered cell digest fails the campaign read",
+          rc == 2 and "frozen manifest digest" in out, out)
+    outside = frozen_root()
+    manifest = json.loads((outside / "campaign-manifest.json").read_text())
+    manifest["cells"][0]["entrypoint_ref"] = str(Path(__file__).resolve())
+    manifest["cells"][0]["entrypoint_sha256"] = sha(__file__)
+    (outside / "campaign-manifest.json").write_text(json.dumps(manifest))
+    rc, out = handoff_resolve(campaign_request(outside))
+    check("T20i a cell ref outside the evidence root fails closed",
+          rc == 2 and "outside the evidence root" in out, out)
+    rc, out = handoff_resolve(campaign_request(frozen_root(), candidate_path="other-candidate.md"))
+    check("T20j a manifest for another candidate fails closed",
+          rc == 2 and "requested candidate" in out, out)
+    rc, out = handoff_resolve(campaign_request(frozen_root(), evidence_root="/tmp/../etc"))
+    check("T20k a parent-hop evidence root fails closed", rc == 2, out)
+    extra = campaign_request(frozen_root())
+    extra["identity"] = json.loads(json.dumps(identity))
+    rc, out = handoff_resolve(extra)
+    check("T20l the campaign kind accepts no identity field",
+          rc == 2 and "unknown field" in out, out)
+    with patch.object(_t.subprocess, "run", side_effect=AssertionError("no child process allowed")):
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = _t.cmd_handoff(b64(campaign_request(frozen_root())))
+        check("T20m the campaign read starts no child process", rc == 0)
+
+    # T21 native readback enrichment. Additive, whitelisted, never synthesized.
+    root, out_dir = fresh_run()
+    rc, out = run("research-readback", RUN_ID, root=root)
+    back = json.loads(out) if rc == 0 else {}
+    native = back.get("native_evidence") or {}
+    receipt_on_disk = json.loads((out_dir / "submit-receipt.json").read_text()) if rc == 0 else {}
+    check("T21a readback exposes one additive native evidence object",
+          rc == 0 and isinstance(native, dict) and native.get("phase") is None
+          and native.get("phase_bound") is False and native.get("feeds_research") is None, out)
+    check("T21b the native window is bound to the verified config window",
+          native.get("window", {}).get("approved_start_utc") == "2025-01-01 00:00:00"
+          and native["window"]["native_evaluation_start_utc"] == "2025-01-02T00:00:00"
+          and native["window"]["native_inside_approved"] is True
+          and len(native["window"].get("identity_sha256") or "") == 64, out)
+    check("T21c native metrics expose total_trades and keep omitted values null",
+          native.get("metrics", {}).get("total_trades") == 1
+          and native["metrics"]["cagr_pct"] is None
+          and native["metrics"]["net_return_pct"] == 1.5
+          and native.get("metrics_omitted") == ["cagr_pct", "sharpe"], out)
+    check("T21d native economics and claimability are reported, not rewritten",
+          native.get("applied_economics", {}).get("funding_applied") is False
+          and native.get("applied_economics", {}).get("declared_model_matches_applied") is False
+          and native.get("performance_claimable") is False
+          and native.get("cost_model_approved") is False
+          and any("not approved" in item for item in native.get("limitations") or []), out)
+    check("T21e the receipt's own claimability stays derived-false",
+          back.get("performance_claimable") is False and back.get("coverage_complete") is False)
+    check("T21f the native identity block binds the verified hashes",
+          native.get("identity", {}).get("effective_config_sha256")
+          == receipt_on_disk.get("effective_config_sha256")
+          and len(native["identity"].get("run_manifest_sha256") or "") == 64
+          and native["identity"].get("campaign_manifest_sha256") is None
+          and native["identity"].get("strategy_params") == {"entry_len": 5}, out)
+
+    def readback_with(summary_change=None, metrics_change=None, **stub):
+        """Submit one fresh stub run, rewrite one evidence file, read it back."""
+        root, out_dir = fresh_run(**stub)
+        if summary_change is not None:
+            summary = json.loads((out_dir / "summary.json").read_text())
+            summary_change(summary)
+            (out_dir / "summary.json").write_text(json.dumps(summary))
+        if metrics_change is not None:
+            metrics = json.loads((out_dir / "metrics.json").read_text())
+            metrics_change(metrics)
+            (out_dir / "metrics.json").write_text(json.dumps(metrics))
+        code, text = run("research-readback", RUN_ID, root=root)
+        return code, text
+
+    rc, out = readback_with(summary_change=lambda s: s.update(applied_economics="nope"))
+    check("T21g malformed native applied economics fails closed",
+          rc == 2 and "applied economics" in out, out)
+    rc, out = readback_with(summary_change=lambda s: s.update(
+        evaluation_window_end_utc="2027-01-01T00:00:00"))
+    check("T21h a native window outside the approved window fails closed",
+          rc == 2 and "escapes the approved window" in out, out)
+    rc, out = readback_with(summary_change=lambda s: s.update(
+        evaluation_window_start_utc="not-a-date"))
+    check("T21i a malformed native window fails closed",
+          rc == 2 and "not readable UTC" in out, out)
+    rc, out = readback_with(metrics_change=lambda m: m.update(net_return_pct="1.5"))
+    check("T21j a non-numeric native metric fails closed",
+          rc == 2 and "net_return_pct" in out, out)
+    rc, out = readback_with(summary_change=lambda s: s.update(strategy_params={"entry_len": 99}))
+    check("T21k native params that differ from the verified config fail closed",
+          rc == 2 and "strategy params" in out, out)
+    rc, out = readback_with(
+        cycles=0, trades=0, events=EVENT_HEADER + "\n",
+        summary_change=lambda s: s.update(
+            economics_boundary={"performance_claimable": True, "cost_model_approved": True}))
+    check("T21l a zero-trade run can never claim performance",
+          rc == 2 and "zero-trade" in out, out)
+    rc, out = readback_with(summary_change=lambda s: s.update(
+        economics_boundary={"performance_claimable": True, "cost_model_approved": False}))
+    check("T21m a claim without an approved cost model fails closed",
+          rc == 2 and "without an approved cost model" in out, out)
+
+    # T22 bounded materialize. One fixed command, no --force, no arbitrary argv.
+    def materialize_fixture():
+        """Write one isolated stub Qlib materializer under a fresh results root."""
+        root = Path(tempfile.mkdtemp(prefix="transport-materialize-"))
+        pkg = root / "stub-qlib"
+        (pkg / "qlib" / "backtest").mkdir(parents=True)
+        (pkg / "qlib" / "__init__.py").write_text("")
+        (pkg / "qlib" / "backtest" / "__init__.py").write_text("")
+        (pkg / "qlib" / "backtest" / "research_cell.py").write_text(STUB_MATERIALIZER)
+        (pkg / "cell_entrypoint.py").write_text(STUB_CELL_ENTRY)
+        artifact = root / "strategy_signal.py"
+        artifact.write_text("def signal(**kwargs):\n    return [], None\n")
+        spec = {
+            "candidate": {"path": "demo-candidate.md", "source_commit": "b" * 40,
+                          "git_blob_sha": "a" * 40},
+            "runtime": {"commit": "c" * 40},
+            "data": {"provider_ref": str(root / "provider")},
+            "strategy": {"sides": ["long"], "params": {"entry_len": 5}, "warmup_days": 5,
+                         "window_start_utc": "2025-01-01 00:00:00",
+                         "window_end_utc_inclusive": "2025-12-31 00:00:00"},
+            "strategy_artifact": {"source": str(artifact)},
+            "house_overlay": {"base_order_quote_pct": 0.06, "safety_order_quote_pct": 0.06,
+                              "safety_order_levels": 2, "so_spacing_pct": 0.04,
+                              "take_profit_pct": 0.05, "stop_loss_pct": None,
+                              "trade_cost": 0.0004, "initial_capital_quote": 100000.0},
+            "research_cost_model": {"fees_per_side": 0.0004, "slippage": 0.0,
+                                    "funding": "not_modeled", "approved": False},
+            "materialize": {"cells_dir": str(root / "frozen-cells"),
+                            "results_root": str(root / "runs")},
+        }
+        spec_path = root / "fixture-spec.json"
+        spec_path.write_text(json.dumps(spec, indent=2, sort_keys=True) + "\n")
+        return root, pkg, spec_path, spec, artifact
+
+    def materialize_request(spec_path, spec, **over):
+        request = {
+            "request": "materialize-v1",
+            "spec_ref": str(spec_path),
+            "root": spec["materialize"]["cells_dir"],
+            "phase": "IS_BASELINE",
+            "window": {"start_utc": spec["strategy"]["window_start_utc"],
+                       "end_utc_inclusive": spec["strategy"]["window_end_utc_inclusive"]},
+            "source_commit": spec["candidate"]["source_commit"],
+            "candidate_path": spec["candidate"]["path"],
+            "source_blob_sha": spec["candidate"]["git_blob_sha"],
+            "strategy_artifact_sha256": sha(spec["strategy_artifact"]["source"]),
+            "qlib_runtime_commit": spec["runtime"]["commit"],
+        }
+        request.update(over)
+        return request
+
+    def run_materialize(payload, root, pkg):
+        return run(MATERIALIZE_VERB_LOCAL, b64(payload), root=root, py_path=pkg)
+
+    MATERIALIZE_VERB_LOCAL = "research-materialize"
+    froot, pkg, spec_path, spec, artifact = materialize_fixture()
+    request = materialize_request(spec_path, spec)
+    cells_root = Path(spec["materialize"]["cells_dir"])
+    manifest_path = cells_root / "campaign-manifest.json"
+    rc, out = run_materialize(request, froot, pkg)
+    receipt = json.loads(out) if out.startswith("{") else {}
+    check("T22a materialize runs the fixed Qlib command and verifies its manifest",
+          rc == 0 and receipt.get("status") == "materialized"
+          and receipt.get("state") == "created"
+          and receipt.get("campaign_manifest", {}).get("sha256") == sha(manifest_path)
+          and receipt.get("campaign_manifest", {}).get("cell_count") == 2
+          and (cells_root / "materialize-receipt.json").is_file(), out)
+    check("T22b the receipt binds the request identity, phase and window",
+          receipt.get("phase") == "IS_BASELINE" and receipt.get("window") == request["window"]
+          and receipt.get("window_identity_sha256") == _t._window_identity(request["window"])
+          and receipt.get("spec_sha256") == sha(spec_path)
+          and receipt.get("strategy_artifact", {}).get("sha256")
+          == request["strategy_artifact_sha256"]
+          and receipt.get("source_commit") == request["source_commit"]
+          and len(receipt.get("cell_evidence_sha256") or "") == 64, out)
+    stored = (cells_root / "materialize-receipt.json").read_bytes()
+    manifest_bytes = manifest_path.read_bytes()
+    rc, out = run_materialize(request, froot, pkg)
+    again = json.loads(out) if out.startswith("{") else {}
+    check("T22c the same request converges without writing again",
+          rc == 0 and again.get("state") == "existing"
+          and (cells_root / "materialize-receipt.json").read_bytes() == stored
+          and manifest_path.read_bytes() == manifest_bytes, out)
+    rc, out = run_materialize(dict(request, phase="IS_RETEST"), froot, pkg)
+    check("T22d a conflicting phase over an existing root refuses",
+          rc == 2 and "refuse overwrite" in out and "different request" in out, out)
+    rc, out = run_materialize(dict(request, candidate_path="other-candidate.md"), froot, pkg)
+    check("T22d2 a candidate that is not the spec candidate fails closed",
+          rc == 2 and "spec candidate.path" in out, out)
+    for label, change, expect in (
+        ("a spec outside the results root",
+         lambda req: dict(req, spec_ref="/etc/passwd"), "escapes the results root"),
+        ("a parent-hop root",
+         lambda req: dict(req, root=req["root"] + "/../evil"), "root is not an absolute path"),
+        ("a candidate path with a slash",
+         lambda req: dict(req, candidate_path="a/b.md"), "candidate_path has a bad shape"),
+        ("an unapproved phase",
+         lambda req: dict(req, phase="IS_SIDE"), "phase is not one of"),
+        ("an invented window",
+         lambda req: dict(req, window={"start_utc": "2025-02-01 00:00:00",
+                                       "end_utc_inclusive": "2025-12-31 00:00:00"}),
+         "does not match the approved window"),
+        ("a runtime that is not the spec runtime",
+         lambda req: dict(req, qlib_runtime_commit="d" * 40), "spec runtime.commit"),
+        ("an artifact hash that is not the spec artifact",
+         lambda req: dict(req, strategy_artifact_sha256="0" * 64),
+         "does not match the requested sha256"),
+        ("an unknown request field",
+         lambda req: dict(req, force=True), "unknown field"),
+    ):
+        froot2, pkg2, spec_path2, spec2, _artifact2 = materialize_fixture()
+        bad_request = change(materialize_request(spec_path2, spec2))
+        rc, out = run_materialize(bad_request, froot2, pkg2)
+        check("T22e " + label + " fails closed", rc == 2 and expect in out, out)
+        check("T22e " + label + " writes no frozen cell",
+              not (Path(spec2["materialize"]["cells_dir"]) / "campaign-manifest.json").exists(),
+              out)
+    # An absent spec is an expected typed answer (exit 0, like research-handoff),
+    # while a malformed spec at the same path is a transport failure (exit 2). The
+    # caller must be able to tell those two apart.
+    nroot, npkg, nspec_path, nspec, _nartifact = materialize_fixture()
+    absent = str(nspec_path.with_name("absent-spec.json"))
+    rc, out = run_materialize(dict(materialize_request(nspec_path, nspec), spec_ref=absent),
+                              nroot, npkg)
+    missing = json.loads(out) if out.startswith("{") else {}
+    check("T22f a missing spec is a typed implementation_needed answer at exit 0",
+          rc == 0 and missing.get("status") == "implementation_needed"
+          and "MATERIALIZE_SPEC_MISSING" in str(missing.get("reason")), out)
+    check("T22f2 the expected implementation_needed answer writes nothing",
+          not Path(nspec["materialize"]["cells_dir"]).exists(), out)
+    broken_root, broken_pkg, broken_spec_path, broken_spec, _broken = materialize_fixture()
+    broken_spec_path.write_text("{not json")
+    rc, out = run_materialize(
+        dict(materialize_request(broken_spec_path, broken_spec), spec_ref=str(broken_spec_path)),
+        broken_root, broken_pkg)
+    check("T22f3 a malformed spec is still a transport failure at exit 2",
+          rc == 2 and "not readable JSON" in out and "implementation_needed" not in out, out)
+
+    froot, pkg, spec_path, spec, artifact = materialize_fixture()
+    short_spec = json.loads(spec_path.read_text())
+    short_spec["strategy"]["sides"] = ["long", "short"]
+    short_path = spec_path.with_name("short-spec.json")
+    short_path.write_text(json.dumps(short_spec, indent=2, sort_keys=True) + "\n")
+    rc, out = run_materialize(materialize_request(short_path, short_spec), froot, pkg)
+    check("T22g a declared short side holds before anything is written",
+          rc == 2 and "ENGINEERING_HOLD" in out
+          and not (Path(short_spec["materialize"]["cells_dir"]) / "campaign-manifest.json").exists(),
+          out)
+
+    # An existing root converges only through its own receipt: a changed spec, a
+    # changed cost, or a prefix-era root without a receipt all refuse. A receipt is
+    # never reconstructed from a later spec.
+    rroot, rpkg, rspec_path, rspec, _rart = materialize_fixture()
+    rrequest = materialize_request(rspec_path, rspec)
+    rc, out = run_materialize(rrequest, rroot, rpkg)
+    if rc != 0:
+        raise SystemExit("FAILED: existing-root setup " + out)
+    rreceipt = Path(rspec["materialize"]["cells_dir"]) / "materialize-receipt.json"
+    first_receipt = rreceipt.read_bytes()
+    changed = json.loads(rspec_path.read_text())
+    changed["house_overlay"]["trade_cost"] = 0.0011
+    changed["strategy"]["params"] = {"entry_len": 7}
+    changed_path = rspec_path.with_name("changed-spec.json")
+    changed_path.write_text(json.dumps(changed, indent=2, sort_keys=True) + "\n")
+    rc, out = run_materialize(materialize_request(changed_path, changed), rroot, rpkg)
+    check("T22r a changed spec over an existing root refuses instead of rebinding",
+          rc == 2 and "refuse overwrite" in out and rreceipt.read_bytes() == first_receipt, out)
+    cost_only = json.loads(rspec_path.read_text())
+    cost_only["research_cost_model"]["fees_per_side"] = 0.0006
+    cost_path = rspec_path.with_name("cost-spec.json")
+    cost_path.write_text(json.dumps(cost_only, indent=2, sort_keys=True) + "\n")
+    rc, out = run_materialize(materialize_request(cost_path, cost_only), rroot, rpkg)
+    check("T22s a cost-only spec change cannot rebind existing cells",
+          rc == 2 and "refuse overwrite" in out and rreceipt.read_bytes() == first_receipt, out)
+    rreceipt.unlink()
+    rc, out = run_materialize(rrequest, rroot, rpkg)
+    check("T22t a materialization without its receipt refuses and stays unrepaired",
+          rc == 2 and "no receipt" in out and not rreceipt.exists(), out)
+
+    # Runtime provenance: inside the fixed runtime the receipt binds the image and
+    # digest this process is actually executing; on the host it invents none.
+    host_runtime = _t._receipt_runtime(rrequest, rspec)
+    check("T22u the host receipt does not invent an image",
+          host_runtime["commit"] == rrequest["qlib_runtime_commit"]
+          and host_runtime["image"] is None and host_runtime["image_digest"] is None,
+          str(host_runtime))
+    with patch.object(_t, "is_fixed_runtime", return_value=True):
+        fixed_runtime = _t._receipt_runtime(rrequest, rspec)
+    check("T22v the fixed runtime binds the pinned image and digest",
+          fixed_runtime["commit"] == _t.FIXED_RUNTIME_COMMIT
+          and fixed_runtime["image"] == _t.FIXED_IMAGE
+          and fixed_runtime["image_digest"] == _t.FIXED_IMAGE_DIGEST, str(fixed_runtime))
+
+    # The only child process is the fixed Qlib materialize argv: no shell, no
+    # arbitrary argument, no --force.
+    froot, pkg, spec_path, spec, artifact = materialize_fixture()
+    request = materialize_request(spec_path, spec)
+    with patch.object(_t, "resolve_root", return_value=Path(os.path.realpath(froot))), \
+         patch.object(_t.subprocess, "run",
+                      return_value=subprocess.CompletedProcess([], 1, "", "boom")) as child:
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = _t.cmd_materialize(b64(request))
+        argv = list(child.call_args[0][0]) if child.call_args else []
+        kwargs = dict(child.call_args[1]) if child.call_args else {}
+    check("T22h the only child is the fixed Qlib materialize argv",
+          rc == 2 and argv == [sys.executable, "-m", "qlib.backtest.research_cell",
+                               "materialize", "--spec", str(spec_path),
+                               "--root", spec["materialize"]["cells_dir"]]
+          and kwargs.get("shell") in (None, False)
+          and not any(";" in arg or "|" in arg or "$" in arg or "`" in arg for arg in argv), str(argv))
+    payload = b64(request)
+    check("T22i the materialize verb accepts one base64 request and no shell chaining",
+          _t.parse_forced_command("research-materialize " + payload)[0]
+          == ("research-materialize", payload)
+          and _t.parse_forced_command("research-materialize " + payload + "; touch evil")[0] is None
+          and _t.parse_forced_command("research-materialize " + payload, hermes=True)[0] is None)
+    forwarded = _t.build_forward_command("research-materialize", payload)
+    check("T22j the Qlib key forwards materialize to the fixed image without a shell",
+          forwarded is not None and _t.FIXED_IMAGE in forwarded
+          and forwarded[-2:] == ["research-materialize", payload]
+          and "target=/results" in " ".join(forwarded)
+          and not any(";" in arg or "|" in arg or "$" in arg for arg in forwarded), str(forwarded))
+
+    # Concurrency: one exclusive lock, bounded wait, typed refuse instead of racing.
+    froot, pkg, spec_path, spec, artifact = materialize_fixture()
+    request = materialize_request(spec_path, spec)
+    cells_root = Path(spec["materialize"]["cells_dir"])
+    cells_root.mkdir(parents=True, exist_ok=True)
+    (cells_root / _t.MATERIALIZE_LOCK).write_text("")
+    with patch.object(_t, "MATERIALIZE_LOCK_WAIT", 0.2), \
+         patch.object(_t, "resolve_root", return_value=Path(os.path.realpath(froot))), \
+         contextlib.redirect_stdout(io.StringIO()) as buf:
+        rc = _t.cmd_materialize(b64(request))
+    check("T22k a held lock refuses instead of racing",
+          rc == 2 and "another materialization holds" in buf.getvalue(), buf.getvalue())
+    (cells_root / _t.MATERIALIZE_LOCK).unlink()
+    rc, out = run_materialize(request, froot, pkg)
+    check("T22l the same request converges once the lock is released",
+          rc == 0 and json.loads(out).get("status") == "materialized", out)
+
+    # T22m..T22q phase/window: a materialized root answers a phase-bound campaign
+    # read, and a run from one of its cells carries that phase into Node05.
+    def submit_from_cells(root, pkg_path, cells_dir):
+        """Submit one materialized cell through the real transport path."""
+        manifest = json.loads((Path(cells_dir) / "campaign-manifest.json").read_text())
+        cell = manifest["cells"][0]
+        handoff = {
+            "source_commit": cell["source_commit"], "candidate_path": cell["candidate_path"],
+            "source_blob_sha": cell["source_blob_sha"],
+            "entrypoint_ref": cell["entrypoint_ref"],
+            "entrypoint_sha256": cell["entrypoint_sha256"],
+            "effective_config_ref": cell["effective_config_ref"],
+            "effective_config_sha256": cell["effective_config_sha256"],
+            "qlib_runtime_commit": cell["qlib_runtime_commit"],
+            "capabilities": dict(cell["capabilities"]),
+            "evidence_refs": {"manifest": str(Path(cells_dir) / "campaign-manifest.json")},
+            "run_inputs": {"symbol": cell["symbol"]},
+        }
+        return run("research-submit", b64(handoff), root=root)
+
+    active_manifest = Path(spec["materialize"]["cells_dir"]) / "campaign-manifest.json"
+    rc, out = handoff_resolve({"request": "campaign-manifest-read-v1",
+                               "source_commit": request["source_commit"],
+                               "candidate_path": request["candidate_path"],
+                               "source_blob_sha": request["source_blob_sha"],
+                               "evidence_root": spec["materialize"]["cells_dir"]})
+    report = json.loads(out) if out.startswith("{") else {}
+    check("T22m the campaign read returns the verified phase binding",
+          rc == 0 and report.get("phase_bound") is True
+          and report["phase_binding"]["phase"] == "IS_BASELINE"
+          and report["phase_binding"]["window_identity_sha256"]
+          == _t._window_identity(request["window"])
+          and report.get("cell_count") == 2
+          and report["manifest_sha256"] == sha(active_manifest), out)
+    rc, out = submit_from_cells(froot, pkg, spec["materialize"]["cells_dir"])
+    if rc != 0:
+        raise SystemExit("FAILED: materialized cell submit " + out)
+    rc, out = run("research-readback", RUN_ID, root=froot)
+    back = json.loads(out) if rc == 0 else {}
+    native = back.get("native_evidence") or {}
+    check("T22n a run from a materialized IS cell carries its approved phase",
+          rc == 0 and native.get("phase") == "IS_BASELINE" and native.get("phase_bound") is True
+          and native.get("feeds_research") is True and native.get("oos_isolated") is False
+          and native.get("identity", {}).get("campaign_manifest_sha256") == sha(active_manifest)
+          and native["identity"].get("materialize_spec_sha256") == sha(spec_path), out)
+
+    oroot, opkg, ospec_path, ospec, _oartifact = materialize_fixture()
+    orequest = materialize_request(ospec_path, ospec, phase="OOS")
+    rc, out = run_materialize(orequest, oroot, opkg)
+    if rc != 0:
+        raise SystemExit("FAILED: OOS materialize setup " + out)
+    rc, out = submit_from_cells(oroot, opkg, ospec["materialize"]["cells_dir"])
+    if rc != 0:
+        raise SystemExit("FAILED: OOS cell submit " + out)
+    rc, out = run("research-readback", RUN_ID, root=oroot)
+    oback = json.loads(out) if rc == 0 else {}
+    onative = oback.get("native_evidence") or {}
+    check("T22o an OOS run is marked isolated and never feeds research",
+          rc == 0 and onative.get("phase") == "OOS" and onative.get("phase_bound") is True
+          and onative.get("feeds_research") is False and onative.get("oos_isolated") is True, out)
+    check("T22p an OOS run is not performance claimable at the transport",
+          oback.get("performance_claimable") is False
+          and onative.get("performance_claimable") is False, out)
+
+    # T23 mutation control: the new guards are load-bearing. A weakened copy must
+    # ACCEPT exactly what the shipped guard rejects, so a mutation is detectable.
+    source_text = Path(TRANSPORT).read_text()
+
+    def mutated_copy(old, new):
+        if old not in source_text:
+            raise SystemExit("FAILED: mutation anchor missing: " + old[:60])
+        mutant = Path(tempfile.mkdtemp(prefix="transport-mutant-")) / "research-transport.py"
+        mutant.write_text(source_text.replace(old, new, 1))
+        return mutant
+
+    def forced_copy(path, command, root):
+        env = dict(os.environ, RESEARCH_RESULTS_ROOT=str(root))
+        proc = subprocess.run([sys.executable, str(path), "hermes-forced"],
+                              env=dict(env, SSH_ORIGINAL_COMMAND=command),
+                              capture_output=True, text=True, timeout=120)
+        return proc.returncode, proc.stdout.strip()
+
+    bad_root = frozen_root()
+    (bad_root / "btcusdt-1h-3x/strategy_signal.py").write_text(
+        "def signal(**kwargs):\n    return [{}], None\n")
+    mutant = mutated_copy(
+        'problems = _cell_byte_problems(cell, evidence_root)\n'
+        '        if problems:\n'
+        '            return None, "; ".join(sorted(set(problems))[:4])',
+        'problems = _cell_byte_problems(cell, evidence_root)\n'
+        '        if False:\n'
+        '            return None, "; ".join(sorted(set(problems))[:4])')
+    rc, out = forced_copy(mutant, "research-handoff " + b64(campaign_request(bad_root)), bad_root)
+    check("T23a the campaign cell-digest guard is load-bearing", rc == 0, out)
+
+    root, out_dir = fresh_run(cycles=0, trades=0, events=EVENT_HEADER + "\n")
+    summary = json.loads((out_dir / "summary.json").read_text())
+    summary["economics_boundary"] = {"performance_claimable": True, "cost_model_approved": True}
+    (out_dir / "summary.json").write_text(json.dumps(summary))
+    mutant = mutated_copy("    if zero_trade and claimable is True:",
+                          "    if False and zero_trade and claimable is True:")
+    env = dict(os.environ, RESEARCH_RESULTS_ROOT=str(root))
+    proc = subprocess.run([sys.executable, str(mutant), "research-readback", RUN_ID],
+                          env=env, capture_output=True, text=True, timeout=120)
+    check("T23b the zero-trade claimability guard is load-bearing",
+          proc.returncode == 0, proc.stdout.strip())
 
     print("%d checks passed" % len(CHECKS))
     print("ALL THIN CHECKS PASSED")

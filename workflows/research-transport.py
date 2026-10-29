@@ -7,6 +7,14 @@ results root, verify its manifest, print one Node05 receipt. Exit 0 means valid,
 exit 2 means invalid. This file never fabricates a PASS receipt: every receipt
 field comes from hashes checked here or files the native run wrote.
 
+materialize: verify one base64 materialize request, then run ONLY the existing
+Qlib ``research_cell.py materialize --spec ... --root ...`` in the pinned
+runtime. No arbitrary argv, no shell, no ``--force``. It writes the frozen cell
+dirs the existing engineering flow declares, verifies the campaign manifest the
+Qlib run wrote, and prints one receipt. A request whose spec does not exist is
+a typed ``implementation_needed`` answer, never an invented strategy: this file
+carries no strategy semantics and never compiles Markdown into Qlib code.
+
 hermes-forced: a separate restricted key sends one base64 UTF-8 task to the
 fixed host Hermes argv. This mode accepts no Qlib verb and starts no shell. The
 same key serves ``research-handoff``: it resolves one already-frozen engineering
@@ -46,11 +54,14 @@ import csv
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 HEX40 = re.compile(r"^[a-f0-9]{40}$")
@@ -98,11 +109,14 @@ OUT_PREFIX = "n8n-live-"
 SUBMIT_TIMEOUT = 1800
 MAX_SCAN_DIRS = 500
 
-# ponytail: the forced-command entry accepts exactly these two verbs, one arg
+# ponytail: the forced-command entry accepts exactly these three verbs, one arg
 # each. The short aliases (submit/readback) are gone on purpose: production
 # Node04/Node05 already use the research- prefix, and one spelling keeps the
-# SSH trust boundary auditable.
-FORCED_VERBS = ("research-submit", "research-readback")
+# SSH trust boundary auditable. ``research-materialize`` is the third Qlib verb:
+# it runs the existing Qlib materializer in this same pinned runtime, so it
+# belongs to the Qlib key rather than to the restricted Hermes key.
+MATERIALIZE_VERB = "research-materialize"
+FORCED_VERBS = ("research-submit", "research-readback", MATERIALIZE_VERB)
 HERMES_VERB = "research-hermes"
 #: Second host verb on the same restricted key: resolve one frozen engineering
 #: cell and print its executable handoff. It never generates, writes or imports.
@@ -136,6 +150,19 @@ def fail(reason):
     """Print a rejection report and return exit code 2."""
     print(json.dumps({"ok": False, "error": reason}))
     return 2
+
+
+def implementation_needed(reason):
+    """Print one expected ``implementation_needed`` answer. Exit 0, like the handoff.
+
+    A missing approved spec is an expected state, not corrupt transport: the
+    caller must be able to parse the typed payload and route it to the bounded
+    engineering lane. Every malformed, mismatched or unsafe request still fails
+    closed with exit 2, so this answer can never be read as a pass.
+    """
+    print(json.dumps({"ok": True, "status": "implementation_needed",
+                      "source": "none", "reason": reason}, sort_keys=True))
+    return 0
 
 
 PATH_CHARS = re.compile(r"^/[A-Za-z0-9_@+./-]{1,511}$")
@@ -773,6 +800,20 @@ def cmd_readback(run_id):
     }
     if not all(readable.values()):
         return fail("unreadable evidence: " + ",".join(k for k, v in readable.items() if not v))
+    # ponytail: additive, whitelisted native evidence. Every PR #19 check above
+    # already ran; this block only re-exposes what they verified, and it never
+    # fills in a field the native run did not write. A missing phase stays null
+    # so the caller holds on the absence instead of reading a guessed phase.
+    config, _why = _read_json(submit["effective_config_ref"])
+    if not isinstance(config, dict):
+        return fail("the verified effective config is not readable JSON")
+    binding, reason = _phase_binding_for_run(submit)
+    if reason is not None:
+        return fail(reason)
+    native, reason = _native_evidence(summary, run_metrics, config, submit,
+                                      manifest_sha256, binding)
+    if native is None:
+        return fail(reason)
     # ponytail: one live proof never equals full coverage, so claimability
     # stays derived-false here; evidence completeness was already enforced
     # above by fail-closed manifest verification.
@@ -801,6 +842,7 @@ def cmd_readback(run_id):
                 "manifest_sha256": manifest_sha256,
                 "coverage_complete": coverage_complete,
                 "performance_claimable": derived,
+                "native_evidence": native,
             }
         )
     )
@@ -859,6 +901,57 @@ CELL_EVIDENCE = (("effective_config_ref", "effective_config_sha256"),
                  ("strategy_artifact_ref", "strategy_artifact_sha256"))
 HANDOFF_MATCH_KEYS = ("source_commit", "candidate_path", "source_blob_sha", "entrypoint_ref",
                       "entrypoint_sha256", "effective_config_sha256", "qlib_runtime_commit")
+
+# ---------------------------------------------------------------------------
+# Three narrow additions on the already-fixed surface. None of them adds a
+# service, queue, registry, scheduler or compiler.
+#
+# - ``campaign-manifest-read-v1`` reads one frozen campaign manifest (zero
+#   writes, no child process) on the existing handoff verb.
+# - ``native_evidence`` is one additive, whitelisted object inside the existing
+#   Node05 receipt, built only from bytes this file already verified.
+# - ``research-materialize`` runs ONLY the existing Qlib
+#   ``materialize --spec ... --root ...``, never ``--force``, never a shell.
+# ---------------------------------------------------------------------------
+
+HANDOFF_KIND_CAMPAIGN = "campaign-manifest-read-v1"
+MATERIALIZE_KIND = "materialize-v1"
+MATERIALIZE_RECEIPT = "materialize-receipt.json"
+MATERIALIZE_RECEIPT_SCHEMA = "qlib-n8n-materialize-receipt-v1"
+MATERIALIZE_LOCK = ".materialize.lock"
+#: Bounded wait for one concurrent identical request to converge. A longer wait
+#: is not a retry policy: the caller sees a typed refuse and can ask again.
+MATERIALIZE_LOCK_WAIT = 30.0
+MATERIALIZE_LOCK_POLL = 0.1
+#: A phase is a research decision the caller already made. This file never
+#: derives one: an absent phase stays null and unbound, never guessed.
+PHASES = ("IS_BASELINE", "IS_RETEST", "OOS")
+OOS_PHASE = "OOS"
+WINDOW_STAMP = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$")
+#: Whitelisted campaign-manifest cell fields. Only these are returned, so a field
+#: a later Qlib build adds cannot leak into the n8n reply by accident.
+CAMPAIGN_CELL_KEYS = (
+    "cell_id", "symbol", "timeframe", "research_leverage", "source_commit",
+    "candidate_path", "source_blob_sha", "entrypoint_ref", "entrypoint_sha256",
+    "effective_config_ref", "effective_config_sha256", "strategy_artifact_ref",
+    "strategy_artifact_sha256", "qlib_runtime_commit", "capabilities",
+    "evidence_refs", "run_inputs", "research_cost_model",
+)
+#: Native metrics the campaign/OOS decision needs. ``total_trades`` is required;
+#: every other value is null when the native run omitted it, never filled in.
+NATIVE_METRIC_KEYS = ("net_return_pct", "cagr_pct", "sharpe", "max_drawdown_pct",
+                      "win_rate_pct", "profit_factor", "net_profit_usdt",
+                      "evaluation_bars", "funding_paid_quote")
+#: Native applied-economics fields, verbatim. The modeled-mark file inventory is
+#: deliberately excluded: it names host paths and adds no decision value.
+APPLIED_ECONOMICS_KEYS = (
+    "applied", "slippage_applied", "funding_applied", "funding_declaration",
+    "funding_total_payment_quote", "funding_charged_event_count", "funding_reconciled",
+    "funding_truth_status_counts", "funding_charged_truth_status_counts",
+    "funding_basis", "funding_source_ref", "funding_source_sha256",
+    "funding_modeled_mark_basis", "funding_modeled_mark_snapshot_sha256",
+    "declared_model_matches_applied", "declared_model_match_reason",
+)
 
 
 def _read_json(path_value):
@@ -936,10 +1029,15 @@ def _request_problems(request):
     if not isinstance(request, dict):
         return ["handoff request is not a JSON object"]
     kind = request.get("request")
-    if kind not in (HANDOFF_KIND_RESOLVE, HANDOFF_KIND_VERIFY):
+    if kind not in (HANDOFF_KIND_RESOLVE, HANDOFF_KIND_VERIFY, HANDOFF_KIND_CAMPAIGN):
         return ["handoff request kind is not supported"]
     allowed = {"request", "source_commit", "candidate_path", "source_blob_sha"}
-    allowed |= {"identity", "evidence_root"} if kind == HANDOFF_KIND_RESOLVE else {"handoff"}
+    if kind == HANDOFF_KIND_RESOLVE:
+        allowed |= {"identity", "evidence_root"}
+    elif kind == HANDOFF_KIND_CAMPAIGN:
+        allowed |= {"evidence_root"}
+    else:
+        allowed |= {"handoff"}
     unknown = [key for key in request if key not in allowed]
     if unknown:
         return ["unknown field: " + str(unknown[0])]
@@ -954,10 +1052,13 @@ def _request_problems(request):
         return ["candidate_path has a bad shape"]
     if not HEX40.match(str(request["source_blob_sha"])):
         return ["source_blob_sha has a bad shape"]
-    if kind == HANDOFF_KIND_RESOLVE:
+    if kind in (HANDOFF_KIND_RESOLVE, HANDOFF_KIND_CAMPAIGN):
         if not check_abs_path(request.get("evidence_root")):
             return ["evidence_root is not an absolute path"]
+    if kind == HANDOFF_KIND_RESOLVE:
         return _identity_problems(request.get("identity"))
+    if kind == HANDOFF_KIND_CAMPAIGN:
+        return []
     reason = check_handoff(request.get("handoff"))
     return [reason] if reason else []
 
@@ -1185,7 +1286,12 @@ def verify_frozen_handoff(request):
 
 
 def cmd_handoff(payload_b64):
-    """Verify or resolve one frozen cell and print the handoff. No writes."""
+    """Verify, resolve or read one frozen cell/campaign and print the report.
+
+    Every kind but ``campaign-manifest-read-v1`` answers for one cell; the
+    campaign read answers for the whole frozen manifest. All three are
+    zero-write and start no child process.
+    """
     request, reason = decode_handoff(payload_b64)
     if request is None:
         return fail(reason)
@@ -1194,12 +1300,780 @@ def cmd_handoff(payload_b64):
         return fail("; ".join(problems))
     if request["request"] == HANDOFF_KIND_RESOLVE:
         report, reason = resolve_frozen_handoff(request)
+    elif request["request"] == HANDOFF_KIND_CAMPAIGN:
+        report, reason = read_campaign_manifest(request)
     else:
         report, reason = verify_frozen_handoff(request)
     if report is None:
         return fail(reason)
     print(json.dumps(report, sort_keys=True))
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Phase/window binding. The transport never invents a calendar window: it
+# validates and binds the window the caller's approved run spec already carries.
+# ---------------------------------------------------------------------------
+
+
+def _window_problems(window):
+    """Return the problems in one approved phase window. Bounds are never invented."""
+    if not isinstance(window, dict):
+        return ["window is not a JSON object"]
+    unknown = [key for key in window if key not in ("start_utc", "end_utc_inclusive")]
+    if unknown:
+        return ["unknown window field: " + str(unknown[0])]
+    for key in ("start_utc", "end_utc_inclusive"):
+        value = window.get(key)
+        if not isinstance(value, str) or WINDOW_STAMP.match(value) is None:
+            return ["window.%s is not a naive UTC timestamp" % key]
+    if window["start_utc"] >= window["end_utc_inclusive"]:
+        return ["window bounds are not ordered"]
+    return []
+
+
+def _window_identity(window):
+    """Return the stable digest of one already validated approved window."""
+    return hashlib.sha256(
+        json.dumps({"start_utc": window["start_utc"],
+                    "end_utc_inclusive": window["end_utc_inclusive"]},
+                   sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _as_utc(value):
+    """Return one naive-UTC datetime from the two evidence spellings, or None."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        moment = datetime.fromisoformat(value.strip().replace(" ", "T", 1))
+    except ValueError:
+        return None
+    if moment.tzinfo is not None:
+        moment = moment.astimezone(timezone.utc).replace(tzinfo=None)
+    return moment
+
+
+# ---------------------------------------------------------------------------
+# Campaign manifest readback: one zero-write verified read of the frozen
+# campaign manifest. Every cell digest is recomputed from the bytes on disk.
+# ---------------------------------------------------------------------------
+
+
+def _cell_config_problems(cell, config, request=None):
+    """Bind one cell config to its manifest declaration and the caller identity."""
+    if not isinstance(config, dict):
+        return ["a frozen cell config is not readable JSON"]
+    problems = []
+    candidate = config.get("candidate") if isinstance(config.get("candidate"), dict) else {}
+    for key, want in (("path", cell.get("candidate_path")),
+                      ("source_commit", cell.get("source_commit")),
+                      ("git_blob_sha", cell.get("source_blob_sha"))):
+        if candidate.get(key) != want:
+            problems.append("cell config candidate.%s does not match the manifest" % key)
+    runtime = config.get("runtime") if isinstance(config.get("runtime"), dict) else {}
+    if runtime.get("commit") != cell.get("qlib_runtime_commit"):
+        problems.append("cell config runtime.commit does not match the manifest")
+    strategy = config.get("strategy") if isinstance(config.get("strategy"), dict) else {}
+    artifact = strategy.get("artifact") if isinstance(strategy.get("artifact"), dict) else {}
+    if artifact.get("sha256") != cell.get("strategy_artifact_sha256"):
+        problems.append("cell config strategy.artifact.sha256 does not match the manifest")
+    if request is not None:
+        for key, want in (("path", request["candidate_path"]),
+                          ("source_commit", request["source_commit"]),
+                          ("git_blob_sha", request["source_blob_sha"])):
+            if candidate.get(key) != want:
+                problems.append("cell config candidate.%s does not match the request" % key)
+        wanted_runtime = request.get("qlib_runtime_commit")
+        if wanted_runtime is not None and runtime.get("commit") != wanted_runtime:
+            problems.append("cell config runtime.commit does not match the request")
+    return problems
+
+
+def _phase_binding_for_manifest(evidence_root, manifest_sha256, config_ref=None):
+    """Return (binding, None) or (None, reason) for one evidence root.
+
+    The chain is: a campaign manifest whose bytes and cell digests are verified,
+    a materialize receipt that binds that exact manifest sha256, and the approved
+    phase plus window the receipt recorded. A missing receipt is an unbound
+    answer (never an invented phase); a present but inconsistent receipt is
+    contradictory evidence and fails closed.
+    """
+    receipt, _why = _read_json(str(Path(evidence_root) / MATERIALIZE_RECEIPT))
+    if receipt is None:
+        return None, None
+    if not isinstance(receipt, dict) or receipt.get("schema") != MATERIALIZE_RECEIPT_SCHEMA:
+        return None, "the materialize receipt in the evidence root is not readable"
+    bound = receipt.get("campaign_manifest") if isinstance(receipt.get("campaign_manifest"), dict) else {}
+    if bound.get("sha256") != manifest_sha256:
+        return None, "the materialize receipt does not bind this campaign manifest"
+    phase = receipt.get("phase")
+    window = receipt.get("window")
+    problems = _window_problems(window)
+    if phase not in PHASES or problems:
+        return None, ("the materialize receipt carries no usable phase/window: "
+                      + "; ".join(problems or ["phase is not an approved phase"]))
+    if receipt.get("window_identity_sha256") != _window_identity(window):
+        return None, "the materialize receipt window identity does not match its window"
+    if config_ref is not None:
+        cells, reason = _manifest_cells(evidence_root)
+        if cells is None:
+            return None, reason
+        hit = [cell for cell in cells
+               if isinstance(cell.get("effective_config_ref"), str)
+               and os.path.realpath(cell["effective_config_ref"]) == os.path.realpath(config_ref)]
+        if not hit:
+            return None, "the frozen campaign manifest does not carry this run's effective config"
+    return {"phase": phase, "window": dict(window),
+            "window_identity_sha256": receipt["window_identity_sha256"],
+            "campaign_manifest_sha256": manifest_sha256,
+            "campaign_manifest_ref": str(Path(evidence_root) / MANIFEST_NAME),
+            "materialize_spec_sha256": receipt.get("spec_sha256")
+            if isinstance(receipt.get("spec_sha256"), str) else None,
+            "source": MATERIALIZE_RECEIPT}, None
+
+
+def _phase_binding_for_run(submit):
+    """Return (binding, None) or (None, reason) for one submitted run.
+
+    The evidence root is discovered from the already hash-verified effective
+    config, so the caller cannot point a run at someone else's phase.
+    """
+    config_ref = submit.get("effective_config_ref")
+    if not isinstance(config_ref, str):
+        return None, None
+    evidence_root = _evidence_root_for(config_ref)
+    if evidence_root is None:
+        return None, None
+    manifest_sha256 = file_sha256(str(Path(evidence_root) / MANIFEST_NAME))
+    if manifest_sha256 is None or not HEX64.match(manifest_sha256):
+        return None, "the evidence root campaign manifest is not readable"
+    return _phase_binding_for_manifest(evidence_root, manifest_sha256, config_ref)
+
+
+def read_campaign_manifest(request):
+    """Return (report, None) or (None, reason) for one verified campaign manifest.
+
+    The manifest is read from the evidence root the request names, never from the
+    request body. Every cell ref must resolve inside that root and every declared
+    digest must equal the bytes on disk. A per-run ``manifest.json`` (a sha map
+    with no schema) is not a campaign manifest and never passes here.
+    """
+    evidence_root = request["evidence_root"]
+    try:
+        if not Path(evidence_root).is_dir():
+            return None, "the evidence root is not a directory"
+    except OSError:
+        return None, "the evidence root is not a directory"
+    ref = Path(evidence_root) / MANIFEST_NAME
+    if not contained(evidence_root, str(ref)):
+        return None, "the campaign manifest is outside the evidence root"
+    manifest, _why = _read_json(str(ref))
+    if manifest is None:
+        return None, "the evidence root has no readable " + MANIFEST_NAME
+    if not isinstance(manifest, dict) or manifest.get("schema") != MANIFEST_SCHEMA:
+        return None, "the evidence manifest schema is not " + MANIFEST_SCHEMA
+    cells = manifest.get("cells")
+    if not isinstance(cells, list) or not cells:
+        return None, "the evidence manifest carries no cell"
+    if manifest.get("cell_count") != len(cells):
+        return None, "the evidence manifest cell_count does not match its cells"
+    if [cell for cell in cells if not isinstance(cell, dict)]:
+        return None, "the evidence manifest carries a malformed cell"
+    windows = set()
+    seen = set()
+    for cell in cells:
+        for key in ("source_commit", "candidate_path", "source_blob_sha"):
+            if cell.get(key) != request[key]:
+                return None, "the evidence manifest does not carry the requested candidate: " + key
+        if cell.get("cell_id") in seen:
+            return None, "the evidence manifest repeats a cell id"
+        seen.add(cell.get("cell_id"))
+        problems = _cell_byte_problems(cell, evidence_root)
+        if problems:
+            return None, "; ".join(sorted(set(problems))[:4])
+        config, _why = _read_json(cell.get("effective_config_ref"))
+        problems = _cell_config_problems(cell, config, request)
+        if problems:
+            return None, "; ".join(sorted(set(problems))[:4])
+        strategy = config.get("strategy") if isinstance(config.get("strategy"), dict) else {}
+        windows.add((strategy.get("window_start_utc"), strategy.get("window_end_utc_inclusive")))
+    if len(windows) != 1 or _window_problems({"start_utc": list(windows)[0][0],
+                                              "end_utc_inclusive": list(windows)[0][1]}):
+        return None, "the evidence manifest cells do not share one approved window"
+    manifest_sha256 = file_sha256(str(ref))
+    if manifest_sha256 is None or not HEX64.match(manifest_sha256):
+        return None, "the campaign manifest identity is invalid"
+    binding, reason = _phase_binding_for_manifest(evidence_root, manifest_sha256)
+    if reason is not None:
+        return None, reason
+    window_start, window_end = list(windows)[0]
+    return {
+        "ok": True, "status": "ready", "source": "frozen-campaign-manifest",
+        "manifest_kind": "campaign", "schema": manifest["schema"],
+        "manifest_ref": str(ref), "manifest_sha256": manifest_sha256,
+        "cell_count": len(cells),
+        "window": {"start_utc": window_start, "end_utc_inclusive": window_end,
+                   "identity_sha256": _window_identity({"start_utc": window_start,
+                                                        "end_utc_inclusive": window_end})},
+        "cells": [{key: cell[key] for key in CAMPAIGN_CELL_KEYS if key in cell} for cell in cells],
+        "phase_binding": binding,
+        "phase_bound": binding is not None,
+        "generated_from": manifest.get("generated_from")
+        if isinstance(manifest.get("generated_from"), str) else None,
+    }, None
+
+
+# ---------------------------------------------------------------------------
+# Native readback enrichment. Additive only: the PR #19 receipt fields and every
+# PR #19 check above stay exactly as they are.
+# ---------------------------------------------------------------------------
+
+
+def _native_metrics(run_metrics):
+    """Return (metrics, None) or (None, reason) for the whitelisted native metrics."""
+    total = run_metrics.get("total_trades")
+    if not is_count(total):
+        return None, "native metrics carry no usable total_trades"
+    out = {"total_trades": total}
+    for key in NATIVE_METRIC_KEYS:
+        if key not in run_metrics or run_metrics[key] is None:
+            out[key] = None
+            continue
+        value = run_metrics[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None, "native metric %s is not a JSON number" % key
+        if not math.isfinite(float(value)):
+            return None, "native metric %s is not finite" % key
+        if key == "evaluation_bars":
+            if not is_count(value):
+                return None, "native metric evaluation_bars is not an integer count"
+            out[key] = value
+            continue
+        out[key] = float(value)
+    return out, None
+
+
+def _native_applied_economics(summary):
+    """Return (applied, None) or (None, reason) for the native economics block."""
+    applied = summary.get("applied_economics")
+    if applied is None:
+        return None, None
+    if not isinstance(applied, dict):
+        return None, "native applied economics is not a JSON object"
+    for key in ("funding_applied", "funding_reconciled", "slippage_applied",
+                "declared_model_matches_applied"):
+        if key in applied and not isinstance(applied[key], bool):
+            return None, "native applied economics %s is not a boolean" % key
+    for key in ("funding_total_payment_quote", "funding_charged_event_count"):
+        value = applied.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None, "native applied economics %s is not a JSON number" % key
+        if not math.isfinite(float(value)):
+            return None, "native applied economics %s is not finite" % key
+    for key in ("funding_truth_status_counts", "funding_charged_truth_status_counts"):
+        if key in applied and applied[key] is not None and not isinstance(applied[key], dict):
+            return None, "native applied economics %s is not a JSON object" % key
+    for key in ("funding_basis", "funding_source_ref", "funding_source_sha256",
+                "funding_modeled_mark_basis", "funding_modeled_mark_snapshot_sha256",
+                "funding_declaration", "declared_model_match_reason", "applied"):
+        value = applied.get(key)
+        if value is not None and not isinstance(value, str):
+            return None, "native applied economics %s is not a string" % key
+    return {key: applied[key] for key in APPLIED_ECONOMICS_KEYS if key in applied}, None
+
+
+def _native_claim(summary):
+    """Return (claimable, cost_approved, None) or (None, None, reason) from summary."""
+    boundary = summary.get("economics_boundary")
+    if boundary is None:
+        return None, None, None
+    if not isinstance(boundary, dict):
+        return None, None, "native economics boundary is not a JSON object"
+    claimable = boundary.get("performance_claimable")
+    approved = boundary.get("cost_model_approved")
+    for name, value in (("performance_claimable", claimable), ("cost_model_approved", approved)):
+        if value is not None and not isinstance(value, bool):
+            return None, None, "native economics boundary %s is not a boolean" % name
+    return claimable, approved, None
+
+
+def _native_evidence(summary, run_metrics, config, submit, manifest_sha256, binding):
+    """Return (native, None) or (None, reason) for the additive Node05 block.
+
+    Only fields this file already verified reach the reply, and nothing is filled
+    in: a field the native run did not write stays null so the caller can hold on
+    the absence. Contradictory native claims are evidence corruption, not a
+    smaller claim, and fail closed.
+    """
+    metrics, reason = _native_metrics(run_metrics)
+    if metrics is None:
+        return None, reason
+    applied, reason = _native_applied_economics(summary)
+    if reason is not None:
+        return None, reason
+    claimable, cost_approved, reason = _native_claim(summary)
+    if reason is not None:
+        return None, reason
+    omitted = summary.get("mlflow_metrics_omitted")
+    if omitted is not None:
+        if not isinstance(omitted, list) or any(not isinstance(key, str) for key in omitted):
+            return None, "native omitted metric list is not a list of names"
+        omitted = list(omitted)
+    else:
+        omitted = []
+    strategy = config.get("strategy") if isinstance(config.get("strategy"), dict) else {}
+    window = {"start_utc": strategy.get("window_start_utc"),
+              "end_utc_inclusive": strategy.get("window_end_utc_inclusive")}
+    approved = isinstance(window["start_utc"], str) and isinstance(window["end_utc_inclusive"], str)
+    window_identity = None
+    if approved:
+        problems = _window_problems(window)
+        if problems:
+            return None, "the verified effective config window is not usable: " + "; ".join(problems)
+        window_identity = _window_identity(window)
+    native_start_raw = summary.get("evaluation_window_start_utc")
+    native_end_raw = summary.get("evaluation_window_end_utc")
+    native_start = native_end = None
+    inside = None
+    if native_start_raw is not None or native_end_raw is not None:
+        native_start, native_end = _as_utc(native_start_raw), _as_utc(native_end_raw)
+        if native_start is None or native_end is None:
+            return None, "native evaluation window is not readable UTC evidence"
+        if native_start > native_end:
+            return None, "native evaluation window bounds are not ordered"
+        if not approved:
+            return None, "native evaluation window cannot be bound without a frozen config window"
+        bound_start, bound_end = _as_utc(window["start_utc"]), _as_utc(window["end_utc_inclusive"])
+        if bound_start is None or bound_end is None:
+            return None, "the verified effective config window is not readable UTC"
+        inside = bound_start <= native_start and native_end <= bound_end
+        if not inside:
+            return None, "native evaluation window escapes the approved window"
+    phase = phase_source = None
+    if binding is not None:
+        if window_identity is None or binding.get("window_identity_sha256") != window_identity:
+            return None, "the verified materialize receipt binds a different window"
+        phase = binding.get("phase")
+        phase_source = binding.get("source")
+    zero_trade = metrics["total_trades"] == 0
+    if zero_trade and claimable is True:
+        return None, "native evidence claims performance claimability for a zero-trade run"
+    if claimable is True and cost_approved is not True:
+        return None, "native evidence claims performance claimability without an approved cost model"
+    limits = []
+    if applied is None:
+        limits.append("native applied economics are absent")
+    else:
+        if applied.get("funding_applied") is not True:
+            limits.append("funding is not applied to PnL")
+        if applied.get("slippage_applied") is True:
+            limits.append("slippage is applied to fills")
+        match_reason = applied.get("declared_model_match_reason")
+        if applied.get("declared_model_matches_applied") is not True and isinstance(match_reason, str):
+            limits.append(match_reason)
+    if cost_approved is not True:
+        limits.append("the research cost model is not approved")
+    for key in omitted:
+        limits.append("native metric is undefined: " + key)
+    if zero_trade:
+        limits.append("zero-trade run: completed execution, not performance evidence")
+    if not approved:
+        limits.append("the verified effective config carries no frozen window")
+    if phase is None:
+        limits.append("no verified materialize receipt binds an approved phase/window")
+    params = strategy.get("params") if isinstance(strategy.get("params"), dict) else None
+    native_params = summary.get("strategy_params")
+    if native_params is not None and not isinstance(native_params, dict):
+        return None, "native strategy params are not a JSON object"
+    if isinstance(native_params, dict) and params is not None and native_params != params:
+        return None, "native strategy params do not match the verified run config"
+    artifact = strategy.get("artifact") if isinstance(strategy.get("artifact"), dict) else {}
+    return {
+        "phase": phase,
+        "phase_source": phase_source,
+        "phase_bound": phase is not None,
+        "feeds_research": None if phase is None else phase != OOS_PHASE,
+        "oos_isolated": None if phase is None else phase == OOS_PHASE,
+        "window": {
+            "approved_start_utc": window["start_utc"],
+            "approved_end_utc_inclusive": window["end_utc_inclusive"],
+            "native_evaluation_start_utc": native_start_raw if native_start is not None else None,
+            "native_evaluation_end_utc": native_end_raw if native_end is not None else None,
+            "native_inside_approved": inside,
+            "identity_sha256": window_identity,
+        },
+        "metrics": metrics,
+        "metrics_omitted": omitted,
+        "applied_economics": applied,
+        "performance_claimable": claimable,
+        "cost_model_approved": cost_approved,
+        "limitations": limits,
+        "identity": {
+            "candidate_blob_sha": submit.get("candidate_blob_sha"),
+            "source_commit": submit.get("source_commit"),
+            "effective_config_sha256": submit.get("effective_config_sha256"),
+            "entrypoint_ref": submit.get("entrypoint_ref"),
+            "entrypoint_sha256": submit.get("entrypoint_sha256"),
+            "qlib_runtime_commit": submit.get("qlib_runtime_commit"),
+            "strategy_artifact_ref": artifact.get("ref") if isinstance(artifact.get("ref"), str) else None,
+            "strategy_artifact_sha256": artifact.get("sha256")
+            if isinstance(artifact.get("sha256"), str) else None,
+            "strategy_params": params,
+            "run_manifest_sha256": manifest_sha256,
+            "campaign_manifest_sha256": (binding or {}).get("campaign_manifest_sha256"),
+            "campaign_manifest_ref": (binding or {}).get("campaign_manifest_ref"),
+            "materialize_spec_sha256": (binding or {}).get("materialize_spec_sha256"),
+        },
+    }, None
+
+
+# ---------------------------------------------------------------------------
+# Bounded materialize: one fixed request, one fixed Qlib command, no shell.
+# ---------------------------------------------------------------------------
+
+
+def _materialize_problems(request):
+    """Return the fail-closed problems in one materialize request."""
+    if not isinstance(request, dict):
+        return ["materialize request is not a JSON object"]
+    if request.get("request") != MATERIALIZE_KIND:
+        return ["materialize request kind is not supported"]
+    allowed = {"request", "spec_ref", "root", "phase", "window", "source_commit",
+               "candidate_path", "source_blob_sha", "strategy_artifact_sha256",
+               "qlib_runtime_commit"}
+    unknown = [key for key in request if key not in allowed]
+    if unknown:
+        return ["unknown field: " + str(unknown[0])]
+    for key in ("spec_ref", "root", "phase", "window", "source_commit", "candidate_path",
+                "source_blob_sha", "strategy_artifact_sha256", "qlib_runtime_commit"):
+        if request.get(key) is None:
+            return ["missing field: " + key]
+    if not check_abs_path(request["spec_ref"]):
+        return ["spec_ref is not an absolute path"]
+    if not check_abs_path(request["root"]):
+        return ["root is not an absolute path"]
+    if request["phase"] not in PHASES:
+        return ["phase is not one of " + ", ".join(PHASES)]
+    problems = _window_problems(request["window"])
+    if problems:
+        return problems
+    if not HEX40.match(str(request["source_commit"])):
+        return ["source_commit has a bad shape"]
+    name = request["candidate_path"]
+    if (not isinstance(name, str) or "/" in name or ".." in name
+            or not name.endswith(".md") or len(name) > 256):
+        return ["candidate_path has a bad shape"]
+    if not HEX40.match(str(request["source_blob_sha"])):
+        return ["source_blob_sha has a bad shape"]
+    if not HEX64.match(str(request["strategy_artifact_sha256"])):
+        return ["strategy_artifact_sha256 has a bad shape"]
+    if not HEX40.match(str(request["qlib_runtime_commit"])):
+        return ["qlib_runtime_commit has a bad shape"]
+    return []
+
+
+def _materialize_spec_problems(spec, request):
+    """Bind one materialize spec to the request. Strategy semantics stay outside."""
+    if not isinstance(spec, dict):
+        return ["the materialize spec is not a JSON object"]
+    problems = []
+    materialize = spec.get("materialize")
+    if not isinstance(materialize, dict):
+        return ["the materialize spec has no materialize block"]
+    cells_dir = materialize.get("cells_dir")
+    if not check_abs_path(cells_dir):
+        problems.append("materialize.cells_dir is not an absolute path")
+    elif os.path.realpath(cells_dir) != os.path.realpath(request["root"]):
+        problems.append("materialize.cells_dir does not match the requested root")
+    if not check_abs_path(materialize.get("results_root")):
+        problems.append("materialize.results_root is not an absolute path")
+    candidate = spec.get("candidate") if isinstance(spec.get("candidate"), dict) else {}
+    for key, want in (("path", request["candidate_path"]),
+                      ("source_commit", request["source_commit"]),
+                      ("git_blob_sha", request["source_blob_sha"])):
+        if candidate.get(key) != want:
+            problems.append("spec candidate.%s does not match the request" % key)
+    runtime = spec.get("runtime") if isinstance(spec.get("runtime"), dict) else {}
+    if runtime.get("commit") != request["qlib_runtime_commit"]:
+        problems.append("spec runtime.commit does not match the request")
+    strategy = spec.get("strategy") if isinstance(spec.get("strategy"), dict) else {}
+    window = request["window"]
+    if strategy.get("window_start_utc") != window["start_utc"]:
+        problems.append("spec strategy.window_start_utc does not match the approved window")
+    if strategy.get("window_end_utc_inclusive") != window["end_utc_inclusive"]:
+        problems.append("spec strategy.window_end_utc_inclusive does not match the approved window")
+    sides = strategy.get("sides")
+    if not isinstance(sides, list) or not sides or [s for s in sides if not isinstance(s, str) or not s]:
+        problems.append("spec strategy.sides is not a declared side list")
+    else:
+        outside = [side for side in sides if side not in VERIFIED_PRIMITIVES["sides"]]
+        if outside:
+            problems.append("ENGINEERING_HOLD: the engine has no execution primitive for side: "
+                            + ", ".join(map(str, outside)))
+    artifact = spec.get("strategy_artifact") if isinstance(spec.get("strategy_artifact"), dict) else {}
+    source = artifact.get("source")
+    if not check_abs_path(source):
+        problems.append("spec strategy_artifact.source is not an absolute path")
+    elif file_sha256(source) != request["strategy_artifact_sha256"]:
+        problems.append("spec strategy_artifact.source does not match the requested sha256")
+    return problems
+
+
+def _verify_materialized(root, request, window):
+    """Return (manifest, None) or (None, reason) for the manifest Qlib just wrote."""
+    manifest, _why = _read_json(str(Path(root) / MANIFEST_NAME))
+    if not isinstance(manifest, dict) or manifest.get("schema") != MANIFEST_SCHEMA:
+        return None, "the materialized campaign manifest is not " + MANIFEST_SCHEMA
+    cells = manifest.get("cells")
+    if not isinstance(cells, list) or not cells:
+        return None, "the materialized campaign manifest carries no cell"
+    if manifest.get("cell_count") != len(cells):
+        return None, "the materialized campaign manifest cell_count does not match its cells"
+    seen = set()
+    windows = set()
+    for cell in cells:
+        if not isinstance(cell, dict):
+            return None, "the materialized campaign manifest carries a malformed cell"
+        for key, want in (("source_commit", request["source_commit"]),
+                          ("candidate_path", request["candidate_path"]),
+                          ("source_blob_sha", request["source_blob_sha"]),
+                          ("qlib_runtime_commit", request["qlib_runtime_commit"]),
+                          ("strategy_artifact_sha256", request["strategy_artifact_sha256"])):
+            if cell.get(key) != want:
+                return None, "a materialized cell does not carry the requested identity: " + key
+        if cell.get("cell_id") in seen:
+            return None, "the materialized campaign manifest repeats a cell id"
+        seen.add(cell.get("cell_id"))
+        problems = _cell_byte_problems(cell, str(root))
+        if problems:
+            return None, "; ".join(sorted(set(problems))[:4])
+        config, _why = _read_json(cell.get("effective_config_ref"))
+        problems = _cell_config_problems(cell, config, request)
+        if problems:
+            return None, "; ".join(sorted(set(problems))[:4])
+        strategy = config.get("strategy") if isinstance(config.get("strategy"), dict) else {}
+        windows.add((strategy.get("window_start_utc"), strategy.get("window_end_utc_inclusive")))
+    if windows != {(window["start_utc"], window["end_utc_inclusive"])}:
+        return None, "the materialized cells do not all carry the approved window"
+    return manifest, None
+
+
+def _receipt_runtime(request, spec):
+    """Return the runtime provenance one receipt binds, truthfully.
+
+    The spec usually declares only ``runtime.commit``. Inside the fixed runtime
+    the transport itself knows the image and digest it is executing, so it binds
+    those constants instead of persisting null; on the host it never invents an
+    image the spec did not declare.
+    """
+    declared = spec.get("runtime") if isinstance(spec.get("runtime"), dict) else {}
+    commit = request["qlib_runtime_commit"]
+    image = declared.get("image") if isinstance(declared.get("image"), str) else None
+    digest = declared.get("image_digest") if isinstance(declared.get("image_digest"), str) else None
+    if is_fixed_runtime():
+        commit = FIXED_RUNTIME_COMMIT
+        image = image or FIXED_IMAGE
+        digest = digest or FIXED_IMAGE_DIGEST
+    return {"commit": commit, "image": image, "image_digest": digest}
+
+
+def _materialize_receipt(request, spec, spec_sha256, manifest, manifest_sha256):
+    """Return the deterministic receipt one verified materialization binds."""
+    cells = [cell for cell in manifest["cells"] if isinstance(cell, dict)]
+    ordered = sorted(cells, key=lambda cell: str(cell.get("cell_id")))
+    ids = [str(cell.get("cell_id")) for cell in ordered]
+    evidence = "\n".join("%s:%s:%s:%s" % (cell.get("cell_id"), cell.get("effective_config_sha256"),
+                                          cell.get("entrypoint_sha256"),
+                                          cell.get("strategy_artifact_sha256"))
+                         for cell in ordered)
+    window = {"start_utc": request["window"]["start_utc"],
+              "end_utc_inclusive": request["window"]["end_utc_inclusive"]}
+    return {
+        "schema": MATERIALIZE_RECEIPT_SCHEMA,
+        "request": MATERIALIZE_KIND,
+        "phase": request["phase"],
+        "window": window,
+        "window_identity_sha256": _window_identity(window),
+        "source_commit": request["source_commit"],
+        "candidate_path": request["candidate_path"],
+        "source_blob_sha": request["source_blob_sha"],
+        "qlib_runtime_commit": request["qlib_runtime_commit"],
+        "runtime": _receipt_runtime(request, spec),
+        "spec_ref": request["spec_ref"],
+        "spec_sha256": spec_sha256,
+        "strategy_artifact": {"source": spec["strategy_artifact"]["source"],
+                              "sha256": request["strategy_artifact_sha256"]},
+        "root": request["root"],
+        "cells_root": spec["materialize"]["cells_dir"],
+        "results_root": spec["materialize"]["results_root"],
+        "campaign_manifest": {"schema": manifest.get("schema"),
+                              "ref": str(Path(request["root"]) / MANIFEST_NAME),
+                              "sha256": manifest_sha256,
+                              "cell_count": manifest.get("cell_count")},
+        "cell_ids": ids,
+        "cell_ids_sha256": hashlib.sha256("\n".join(ids).encode("utf-8")).hexdigest(),
+        "cell_evidence_sha256": hashlib.sha256(evidence.encode("utf-8")).hexdigest(),
+    }
+
+
+def _write_receipt(root, receipt):
+    """Write one receipt deterministically. Return True on success."""
+    try:
+        (Path(root) / MATERIALIZE_RECEIPT).write_text(
+            json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
+def _acquire_lock(lock_path):
+    """Take the one materialization lock. Return (handle, None) or (None, reason)."""
+    deadline = time.monotonic() + MATERIALIZE_LOCK_WAIT
+    while True:
+        try:
+            return os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), None
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                return None, ("another materialization holds " + MATERIALIZE_LOCK
+                              + "; retry after it finishes")
+            time.sleep(MATERIALIZE_LOCK_POLL)
+        except OSError:
+            return None, "the materialization lock is not usable"
+
+
+def _release_lock(handle, lock_path):
+    """Release one materialization lock. Never raises."""
+    try:
+        os.close(handle)
+    except OSError:
+        pass
+    try:
+        os.unlink(str(lock_path))
+    except OSError:
+        pass
+
+
+def _materialize_existing(request, spec, spec_sha256):
+    """Converge on one receipt-bound materialization, or refuse.
+
+    An existing campaign manifest alone is NOT proof: it records the cells, not
+    the spec economics/params that produced them. Writing a fresh receipt for a
+    root that has none would let a different spec be bound to someone else's
+    cells, so an existing root must already carry a receipt, and that receipt
+    must match this request and spec byte for byte. A receipt is never
+    reconstructed after the fact, and production never uses ``--force``.
+    """
+    manifest, reason = _verify_materialized(request["root"], request, request["window"])
+    if manifest is None:
+        return fail("refuse overwrite: " + str(reason))
+    manifest_sha256 = file_sha256(str(Path(request["root"]) / MANIFEST_NAME))
+    if manifest_sha256 is None or not HEX64.match(manifest_sha256):
+        return fail("materialized campaign manifest identity is invalid")
+    receipt = _materialize_receipt(request, spec, spec_sha256, manifest, manifest_sha256)
+    payload = (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    try:
+        stored = (Path(request["root"]) / MATERIALIZE_RECEIPT).read_bytes()
+    except OSError:
+        return fail("refuse overwrite: the existing materialization carries no receipt, and a "
+                    "receipt is never reconstructed from a later spec")
+    if stored != payload:
+        return fail("refuse overwrite: the stored materialize receipt binds a different request")
+    print(json.dumps(dict(receipt, ok=True, status="materialized", state="existing"),
+                     sort_keys=True))
+    return 0
+
+
+def cmd_materialize(payload_b64):
+    """Run ONLY the existing Qlib materializer for one validated request."""
+    request, reason = decode_handoff(payload_b64)
+    if request is None:
+        return fail(reason)
+    problems = _materialize_problems(request)
+    if problems:
+        return fail("; ".join(problems))
+    root = resolve_root()
+    if root is None:
+        return fail("results root is not usable")
+    for key in ("spec_ref", "root"):
+        if not under_root(request[key], root):
+            return fail(key + " escapes the results root")
+    try:
+        spec_bytes = Path(request["spec_ref"]).read_bytes()
+    except OSError:
+        return implementation_needed(
+            "MATERIALIZE_SPEC_MISSING: no approved materialize spec exists at the requested "
+            "path; the existing engineering flow must produce it")
+    try:
+        spec = json.loads(spec_bytes.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return fail("the materialize spec is not readable JSON")
+    problems = _materialize_spec_problems(spec, request)
+    if problems:
+        return fail("; ".join(problems))
+    for key in ("strategy_artifact.source", "materialize.results_root"):
+        block, _, name = key.rpartition(".")
+        value = spec[block][name]
+        if not under_root(value, root):
+            return fail(key + " escapes the results root")
+    if is_fixed_runtime():
+        if request["qlib_runtime_commit"] != FIXED_RUNTIME_COMMIT:
+            return fail("config/runtime identity mismatch")
+        runtime = spec.get("runtime") if isinstance(spec.get("runtime"), dict) else {}
+        if runtime.get("commit") != FIXED_RUNTIME_COMMIT:
+            return fail("config/runtime identity mismatch")
+        if runtime.get("image") is not None and runtime.get("image") != FIXED_IMAGE:
+            return fail("config/runtime identity mismatch")
+        if runtime.get("image_digest") is not None and runtime.get("image_digest") != FIXED_IMAGE_DIGEST:
+            return fail("config/runtime identity mismatch")
+    spec_sha256 = hashlib.sha256(spec_bytes).hexdigest()
+    cells_root = Path(request["root"])
+    manifest_path = cells_root / MANIFEST_NAME
+    if manifest_path.exists():
+        return _materialize_existing(request, spec, spec_sha256)
+    try:
+        cells_root.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return fail("the materialization root is not writable")
+    try:
+        leftovers = [entry.name for entry in cells_root.iterdir()
+                     if entry.name not in (MATERIALIZE_LOCK, MATERIALIZE_RECEIPT)]
+    except OSError:
+        return fail("the materialization root is not readable")
+    if leftovers:
+        return fail("refuse overwrite: the materialization root is not empty: " + leftovers[0])
+    handle, why = _acquire_lock(cells_root / MATERIALIZE_LOCK)
+    if handle is None:
+        return fail(str(why))
+    try:
+        if manifest_path.exists():  # a concurrent identical request converged first
+            return _materialize_existing(request, spec, spec_sha256)
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-m", "qlib.backtest.research_cell", "materialize",
+                 "--spec", request["spec_ref"], "--root", request["root"]],
+                cwd="/", capture_output=True, text=True, timeout=SUBMIT_TIMEOUT,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return fail("native materialize did not start: " + str(exc)[:200])
+        if proc.returncode != 0:
+            return fail("native materialize failed: " + (proc.stderr or "")[-2000:])
+        manifest, reason = _verify_materialized(request["root"], request, request["window"])
+        if manifest is None:
+            return fail(str(reason))
+        manifest_sha256 = file_sha256(str(manifest_path))
+        if manifest_sha256 is None or not HEX64.match(manifest_sha256):
+            return fail("materialized campaign manifest identity is invalid")
+        receipt = _materialize_receipt(request, spec, spec_sha256, manifest, manifest_sha256)
+        if not _write_receipt(request["root"], receipt):
+            return fail("materialize receipt is not writable")
+        print(json.dumps(dict(receipt, ok=True, status="materialized", state="created"),
+                         sort_keys=True))
+        return 0
+    finally:
+        _release_lock(handle, cells_root / MATERIALIZE_LOCK)
 
 
 def parse_forced_command(value, hermes=False):
@@ -1371,17 +2245,22 @@ def main(argv):
             return forward_via_container(verb, arg)
         if verb == "research-submit":
             return cmd_submit(arg)
+        if verb == MATERIALIZE_VERB:
+            return cmd_materialize(arg)
         return cmd_readback(arg)
     parser = argparse.ArgumentParser(description="Bridge a handoff to the native Qlib path.")
     parser.add_argument(
         "cmd",
-        choices=["research-submit", "research-readback"],
-        help="research-submit takes a base64 handoff; research-readback takes a run id",
+        choices=["research-submit", "research-readback", MATERIALIZE_VERB],
+        help=("research-submit takes a base64 handoff, research-readback takes a run id, "
+              "research-materialize takes a base64 materialize request"),
     )
-    parser.add_argument("arg", help="base64 handoff JSON or 32-hex run id")
+    parser.add_argument("arg", help="base64 JSON or 32-hex run id")
     args = parser.parse_args(argv)
     if args.cmd == "research-submit":
         return cmd_submit(args.arg)
+    if args.cmd == MATERIALIZE_VERB:
+        return cmd_materialize(args.arg)
     return cmd_readback(args.arg)
 
 

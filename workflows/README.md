@@ -118,9 +118,125 @@ holds, and prints one JSON report. It writes no file, starts no shell, runs no Q
 verb and imports no strategy artifact: executing the frozen artifact stays in the
 native Qlib run path.
 
-The existing no-argument Qlib forced command still accepts only `research-submit`
-and `research-readback`. The Hermes key accepts neither. No key, listener or host
-handler is installed by this PR.
+### Verified campaign-manifest readback (zero writes)
+
+`research-handoff` takes a third request kind, `campaign-manifest-read-v1`:
+
+```json
+{"request": "campaign-manifest-read-v1", "source_commit": "<40 hex>",
+ "candidate_path": "<file>.md", "source_blob_sha": "<40 hex>",
+ "evidence_root": "/abs/evidence/root"}
+```
+
+The manifest is loaded from `evidence_root/campaign-manifest.json`, never from the
+request. The reply is `status=ready` only when the file parses, its `schema` is
+`qlib-formal-campaign-manifest-v1`, `cell_count` equals its `cells`, every cell ref
+resolves inside `evidence_root`, every declared digest (entrypoint, effective config,
+strategy artifact) equals the bytes on disk, every cell config still declares that
+cell's own candidate/runtime/artifact identity, every cell carries the requested
+candidate, and every cell shares one window. The reply returns the whitelisted cell
+fields plus `manifest_ref`, `manifest_sha256`, `cell_count`, `window` (with
+`identity_sha256`), `manifest_kind: "campaign"` and `phase_binding`.
+
+This read is not the per-run `manifest.json`. A run manifest is a sha map with no
+schema, and a run directory has no campaign manifest at all, so neither can pass
+here. `phase_binding` is filled only when a verified `materialize-receipt.json` in
+the same root binds that exact `manifest_sha256`; otherwise it is `null` with
+`phase_bound: false` and the caller holds. Zero writes, no child process.
+
+The caller supplies the evidence root, but nothing inside it is trusted: every
+digest is recomputed, so a foreign root can only produce verified facts about its
+own bytes, and a ref outside that root is refused.
+
+### Native evidence in the Node05 receipt (additive)
+
+After every existing manifest/hash/readback check, `research-readback` adds one
+`native_evidence` object. It only re-exposes fields those checks already verified,
+and it never fills in a value the native run did not write:
+
+* `phase`, `phase_source`, `phase_bound`, `feeds_research`, `oos_isolated` — the
+  phase comes only from a verified materialize receipt bound to this run's frozen
+  config, so an unbound run reports `phase: null` and the caller holds;
+* `window` — the approved start/end from the hash-verified effective config, the
+  native evaluation start/end from `summary.json`, `native_inside_approved`, and the
+  approved window `identity_sha256`;
+* `metrics` — `total_trades` (required integer) plus the native net return, CAGR,
+  Sharpe, max drawdown, win rate, profit factor, net profit, evaluation bars and
+  funding paid; a metric the native run omitted stays `null` and is listed in
+  `metrics_omitted`;
+* `applied_economics` — the whitelisted native block verbatim (fees/funding/slippage
+  truth, funding source identity and digests, `declared_model_matches_applied` and
+  its reason);
+* `performance_claimable` and `cost_model_approved` — the native claim, plus
+  `limitations[]` assembled from those native facts;
+* `identity` — candidate/commit, entrypoint, effective config, strategy artifact and
+  params, run manifest sha256, and (when bound) the campaign manifest and spec
+  sha256.
+
+Malformed or contradictory native evidence fails closed: a non-numeric metric, a
+malformed window, an evaluation window outside the approved one, params that differ
+from the verified config, or a claim of performance claimability on a zero-trade run
+all exit 2. The receipt's own top-level `performance_claimable` stays derived-false
+(`coverage_complete` stays false), so a single cell never becomes a campaign claim.
+
+### Bounded materialization (Qlib key only)
+
+`research-materialize <base64 JSON>` is the third Qlib forced verb. It runs only the
+existing materializer and never carries strategy semantics:
+
+```json
+{"request": "materialize-v1", "spec_ref": "/abs/spec.json", "root": "/abs/cells",
+ "phase": "IS_BASELINE", "window": {"start_utc": "YYYY-MM-DD HH:MM:SS",
+ "end_utc_inclusive": "YYYY-MM-DD HH:MM:SS"}, "source_commit": "<40 hex>",
+ "candidate_path": "<file>.md", "source_blob_sha": "<40 hex>",
+ "strategy_artifact_sha256": "<64 hex>", "qlib_runtime_commit": "<40 hex>"}
+```
+
+Every path (`spec_ref`, `root`, the spec's `materialize.cells_dir`,
+`materialize.results_root` and the declared artifact source) must stay inside the
+resolved results root, and `root` must equal the spec's `cells_dir`. The spec must
+carry exactly that candidate, runtime commit, window and artifact sha256; a declared
+side outside the verified `long` primitive is an `ENGINEERING_HOLD`. The only child
+process is:
+
+    <fixed runtime python> -m qlib.backtest.research_cell materialize --spec <validated> --root <validated>
+
+No arbitrary argv, no shell, no `--force`. After the child, the transport verifies
+the campaign manifest the Qlib run wrote (schema, per-cell digests recomputed,
+per-cell candidate/runtime/window/artifact binding) and writes one deterministic
+`materialize-receipt.json` in the cells root binding the request identity, runtime
+commit/image/digest, spec sha256, artifact sha256, root, phase, window and window
+identity, and the campaign manifest ref/sha256/cell count plus `cell_ids_sha256` and
+`cell_evidence_sha256`.
+
+An existing root converges only through that receipt: the same request returns the
+same receipt and `state: "existing"`. A different spec, a different phase, a root
+without a receipt, or any identity mismatch refuses (`refuse overwrite`); a receipt
+is never reconstructed from a later spec, so a changed cost model or parameter block
+cannot be retroactively bound to older cells. Concurrency uses one
+`O_CREAT|O_EXCL` lock with a bounded wait and then converges by re-verification; a
+still-held lock is a typed refusal.
+
+An absent approved spec is an expected answer, not a transport failure: the verb
+prints `{"ok": true, "status": "implementation_needed", "reason":
+"MATERIALIZE_SPEC_MISSING: ..."}` and exits 0, exactly like `research-handoff`. A
+malformed spec, a mismatched identity, an unsafe path or a runtime mismatch still
+exits 2. **Residual capability boundary:** this PR adds no engineering verb, no
+Markdown-to-Qlib compiler and no agent shell, so a candidate whose approved
+spec/artifact does not exist yet cannot materialize itself; that still requires the
+existing Hermes/Kanban engineering flow to produce the spec and the artifact.
+
+### Out-of-scope dependency for the campaign lane
+
+`WF-Research-42-cell-campaign.json` compares `receipt.refs.manifest` with
+`handoff.evidence_refs.manifest`, but `_handoff_from_cell` overwrites that key with
+the **campaign** manifest path while `research-readback` returns the **run**
+manifest. That mismatch belongs to the campaign workflow card, not to this
+transport PR, and no workflow JSON is changed here.
+
+The existing no-argument Qlib forced command accepts only `research-submit`,
+`research-readback` and `research-materialize`. The Hermes key accepts none of them.
+No key, listener or host handler is installed by this PR.
 
 Node12 sets one audit deadline at PR creation: 24 hours later. The existing Wait
 node polls every 15 minutes. An open PR at or after the deadline goes to the
