@@ -34,12 +34,17 @@ vs the prior attestation engine, per thin-orchestration contract:
 RESULTS_ROOT holds at most a few hundred run dirs (readback scans one filename
 per dir); SUBMIT_TIMEOUT bounds one native run; run_inputs/cost ride along as
 declared facts and never steer the frozen entrypoint.
+- Zero-trade is valid completed execution, not performance evidence. readback
+  cross-checks summary.cycles_replayed, metrics.total_trades and the events.csv
+  header and row count. It never invents a trade.
 """
 
 import argparse
 import base64
 import binascii
+import csv
 import hashlib
+import io
 import json
 import os
 import re
@@ -88,7 +93,7 @@ VERIFIED_PRIMITIVES = {
 
 CANDIDATE_BLOB_API = "https://api.github.com/repos/HCH725/alpha-strategy-research/git/blobs/"
 
-RESULTS_ROOT_DEFAULT = "/results/_validation"
+RESULTS_ROOT_DEFAULT = "/results/production"
 OUT_PREFIX = "n8n-live-"
 SUBMIT_TIMEOUT = 1800
 MAX_SCAN_DIRS = 500
@@ -105,10 +110,15 @@ HANDOFF_VERB = "research-handoff"
 HERMES_VERBS = (HERMES_VERB, HANDOFF_VERB)
 HERMES_PAYLOAD_LIMIT = 65536
 
-# ponytail: readback actually reads these four files, so the manifest must
+# ponytail: readback actually reads these five files, so the manifest must
 # cover them. Only existence plus the readback sha correspondence is checked;
 # per-file byte attestation lives with the native run, not here.
-REQUIRED_MANIFEST = ("mlflow_readback.json", "summary.json", "signals.csv", "events.csv")
+REQUIRED_MANIFEST = ("mlflow_readback.json", "summary.json", "metrics.json",
+                     "signals.csv", "events.csv")
+
+#: The runtime writes this exact minimum header, then one row per replayed
+#: stage. A zero-cycle run writes the header only.
+EVENT_FIELDS = ("cycle", "stage", "stage_price", "stage_quote_amount", "filled_quote")
 
 # ponytail: bounded host-to-fixed-runtime forwarding. The host key runs this
 # file with no argv; when the guest /results root is missing on the host but
@@ -116,9 +126,9 @@ REQUIRED_MANIFEST = ("mlflow_readback.json", "summary.json", "signals.csv", "eve
 # that fixed runtime. Never accept arbitrary shell/image/argv here.
 FIXED_CONTAINER = "qlib-run"
 FIXED_GUEST_PYTHON = "/opt/venv/bin/python"
-FIXED_IMAGE = "qlib:main-5600671b-arm64"
-FIXED_IMAGE_DIGEST = "sha256:7ca0c33fd6ae791656bc77a85eb22559d2a25ac78a4da94451583ac00bf4e03a"
-FIXED_RUNTIME_COMMIT = "5600671b8a6c445ea4ef3785ee6774ca6033076d"
+FIXED_IMAGE = "qlib:main-f92320c1-arm64"
+FIXED_IMAGE_DIGEST = "sha256:6081534f5b223c7ee53b28a05670b3351cfe0878cc0c05cf81790bf86d48efc8"
+FIXED_RUNTIME_COMMIT = "f92320c176521b269f5dee361a2172b8e6cde25c"
 HOST_RESULTS_SOURCE = "/Volumes/ExpansionDrive/qlib-results"
 
 
@@ -420,6 +430,29 @@ def check_manifest_minimal(out_dir, readback_bytes):
     return manifest, None
 
 
+def is_count(value):
+    """True when value is one integer count. A bool is never a count."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def count_events(events_bytes):
+    """Return (data rows, None) or (None, reason) for one events.csv payload.
+
+    The runtime writes the five minimum header fields, then one row per
+    replayed stage. A zero-cycle run writes the header only.
+    """
+    try:
+        rows = [row for row in csv.reader(io.StringIO(events_bytes.decode("utf-8"), newline=""))
+                if row]
+    except (UnicodeDecodeError, csv.Error):
+        return None, "event evidence is not readable CSV"
+    if not rows or tuple(rows[0]) != EVENT_FIELDS:
+        return None, "event evidence has a bad header"
+    if any(len(row) != len(EVENT_FIELDS) for row in rows[1:]):
+        return None, "event evidence has a bad row"
+    return len(rows) - 1, None
+
+
 def cmd_submit(payload_b64):
     """Verify one handoff, run the existing native entrypoint, print receipt."""
     obj, reason = decode_handoff(payload_b64)
@@ -696,23 +729,39 @@ def cmd_readback(run_id):
         return fail("candidate identity is invalid")
     try:
         summary_bytes = read_contained(real_out, "summary.json")
+        run_metrics_bytes = read_contained(real_out, "metrics.json")
         signals_bytes = read_contained(real_out, "signals.csv")
         events_bytes = read_contained(real_out, "events.csv")
-        if summary_bytes is None or signals_bytes is None or events_bytes is None:
+        if (summary_bytes is None or run_metrics_bytes is None
+                or signals_bytes is None or events_bytes is None):
             return fail("run evidence is not readable")
         summary = json.loads(summary_bytes.decode("utf-8"))
+        run_metrics = json.loads(run_metrics_bytes.decode("utf-8"))
         signals = signals_bytes.decode("utf-8").splitlines()
-        events = events_bytes.decode("utf-8").splitlines()
     except (ValueError, UnicodeDecodeError, OSError):
         return fail("run evidence is not readable")
+    # ponytail: the runtime writes both counts. Zero trades is a valid
+    # completed execution, so the two counts must agree instead of being
+    # guessed from a non-empty events file.
+    if not isinstance(summary, dict) or not is_count(summary.get("cycles_replayed")):
+        return fail("run evidence has no usable cycle count")
+    if not isinstance(run_metrics, dict) or not is_count(run_metrics.get("total_trades")):
+        return fail("run evidence has no usable trade count")
+    cycles = summary["cycles_replayed"]
+    if run_metrics["total_trades"] != cycles:
+        return fail("run evidence cycle/trade mismatch")
+    event_rows, reason = count_events(events_bytes)
+    if event_rows is None:
+        return fail(reason)
+    if (cycles == 0) != (event_rows == 0):
+        return fail("event evidence does not match the replayed cycle count")
     data_ok = (
         isinstance(params.get("symbol"), str) and len(params["symbol"]) > 0
         and isinstance(params.get("frequency"), str) and len(params["frequency"]) > 0
-        and isinstance(summary, dict)
-        and any("rows" in k and isinstance(v, int) and v > 0 for k, v in summary.items())
+        and isinstance(summary, dict) and is_count(summary.get("cycles_replayed"))
         and len(signals) >= 2
     )
-    execution_ok = len(events) >= 2
+    execution_ok = (cycles == 0 and event_rows == 0) or (cycles > 0 and event_rows > 0)
     runtime_ok = isinstance(params.get("qlib_version"), str) and len(params["qlib_version"]) > 0
     readable = {
         "candidate": bool(candidate_ok),
@@ -1225,7 +1274,7 @@ def host_results_source():
 def should_forward_host():
     """True when a no-argv host launch should use the fixed runtime.
 
-    Only for the default guest root missing on the host. Temp-root tests
+    Only for the configured guest root missing on the host. Temp-root tests
     stay local; inside the fixed runtime /results exists so no forwarding.
     """
     if "RESEARCH_RESULTS_ROOT" in os.environ:
@@ -1233,7 +1282,7 @@ def should_forward_host():
     if os.environ.get("RESEARCH_FORWARDED") == "1":
         return False
     try:
-        if Path("/results/_validation").is_dir():
+        if Path(RESULTS_ROOT_DEFAULT).is_dir():
             return False
     except OSError:
         pass

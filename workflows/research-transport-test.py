@@ -29,6 +29,8 @@ HERE = Path(__file__).resolve().parent
 TRANSPORT = HERE / "research-transport.py"
 RUN_ID = "ab" * 16
 EXP_ID = "123456"
+CHECKS = []
+
 
 #: Minimal stand-in for the shared engine. The transport must call the engine
 #: for the artifact contract instead of carrying its own copy.
@@ -85,6 +87,11 @@ def signal(*, high, low, close, volume, times, params, window_start, window_end)
     return [], None
 """
 
+#: The frozen f923 evidence contract: one integer count in summary.json, one
+#: integer count in metrics.json, and one events row per replayed stage.
+EVENT_HEADER = "cycle,stage,stage_price,stage_quote_amount,filled_quote"
+EVENT_ROW = "1,entry,2.0,100.0,100.0"
+
 STUB_ENTRYPOINT = """\
 import hashlib, json, os, sys
 from pathlib import Path
@@ -92,12 +99,13 @@ out = Path(os.environ["QLIB_OUT_DIR"])
 if out.exists():
     sys.exit("refuse overwrite")
 (out / "mlruns" / EXP / RUN).mkdir(parents=True)
-(out / "summary.json").write_text(json.dumps({"evaluation_rows_including_force_flat": 10}))
-(out / "signals.csv").write_text("a\\n" + "1\\n")
-(out / "events.csv").write_text("a\\n" + "1\\n")
+(out / "summary.json").write_text(json.dumps({"cycles_replayed": __CYCLES__}))
+(out / "metrics.json").write_text(json.dumps({"total_trades": __TRADES__}))
+(out / "signals.csv").write_text("datetime,close\\n1,2\\n")
+(out / "events.csv").write_text(__EVENTS__)
 readback = {"tracking_uri": "file://x", "experiment_id": EXP, "run_id": RUN,
             "status": "FINISHED", "params": {"qlib_version": "t", "symbol": "BTCUSDT", "frequency": "60min", "research_leverage": "3"},
-            "metrics": {"m": 1.0}, "artifact_names": ["summary.json", "signals.csv", "events.csv"]}
+            "metrics": {"m": 1.0}, "artifact_names": ["summary.json", "metrics.json", "signals.csv", "events.csv"]}
 (out / "mlflow_readback.json").write_text(json.dumps(readback, sort_keys=True))
 manifest = {}
 for p in sorted(out.rglob("*")):
@@ -107,6 +115,16 @@ for p in sorted(out.rglob("*")):
 (out / "manifest.json").write_text(json.dumps(manifest, sort_keys=True))
 print(json.dumps({"summary": {"ok": True}, "mlflow": readback, "manifest": manifest}))
 """
+
+
+def stub_source(cycles=1, trades=1, events=None):
+    """Build one native stub that writes the frozen f923 execution evidence."""
+    if events is None:
+        events = EVENT_HEADER + "\n" + EVENT_ROW + "\n"
+    return (STUB_ENTRYPOINT
+            .replace("__CYCLES__", repr(cycles))
+            .replace("__TRADES__", repr(trades))
+            .replace("__EVENTS__", repr(events)))
 
 
 def run(cmd, *args, root=None):
@@ -152,11 +170,12 @@ def make_handoff(root, entry, config, blob="a" * 40, caps=None, cost=True):
 
 def check(name, cond, extra=""):
     print(("PASS " if cond else "FAIL ") + name + (" " + str(extra) if extra and not cond else ""))
+    CHECKS.append(name)
     if not cond:
         raise SystemExit("FAILED: " + name + " " + str(extra))
 
 
-def write_stub_files(root, blob="a" * 40):
+def write_stub_files(root, blob="a" * 40, cycles=1, trades=1, events=None):
     """Write one frozen stub pair whose formal fields match make_handoff."""
     entry = root / "run_stub.entrypoint.py"
     config = root / "effective_config.json"
@@ -166,10 +185,20 @@ def write_stub_files(root, blob="a" * 40):
         "runtime": {"commit": "c" * 40},
     }, sort_keys=True))
     entry.write_text(
-        STUB_ENTRYPOINT.replace("EXP", '"%s"' % EXP_ID)
+        stub_source(cycles, trades, events).replace("EXP", '"%s"' % EXP_ID)
         .replace("RUN", '"%s"' % RUN_ID)
     )
     return entry, config
+
+
+def fresh_run(**stub):
+    """Submit one stub run in a fresh root and return (root, out_dir)."""
+    root = Path(tempfile.mkdtemp(prefix="transport-evidence-"))
+    entry, config = write_stub_files(root, **stub)
+    rc, out = run("research-submit", b64(make_handoff(root, entry, config)), root=root)
+    if rc != 0:
+        raise SystemExit("FAILED: golden setup for a fresh run " + out)
+    return root, Path(json.loads(out)["out_dir"])
 
 
 def run_forced(forced_command, root):
@@ -416,6 +445,20 @@ def main():
           and not any(";" in a or "|" in a or "$" in a for a in good), str(good))
     check("T13d forced verbs are research-only",
           set(_t.FORCED_VERBS) == {"research-submit", "research-readback"}, str(_t.FORCED_VERBS))
+    check("T13e the runtime pin is the exact f923 build",
+          _t.FIXED_IMAGE == "qlib:main-f92320c1-arm64"
+          and _t.FIXED_RUNTIME_COMMIT == "f92320c176521b269f5dee361a2172b8e6cde25c"
+          and _t.FIXED_IMAGE_DIGEST ==
+          "sha256:6081534f5b223c7ee53b28a05670b3351cfe0878cc0c05cf81790bf86d48efc8",
+          "%s %s %s" % (_t.FIXED_IMAGE, _t.FIXED_RUNTIME_COMMIT, _t.FIXED_IMAGE_DIGEST))
+    forward_payload = base64.b64encode(b'{"x": 1}').decode()
+    submit_cmd = _t.build_forward_command("research-submit", forward_payload)
+    check("T13f a forwarded submit pins the new image with no shell expansion",
+          submit_cmd is not None and _t.FIXED_IMAGE in submit_cmd
+          and submit_cmd[-2:] == ["research-submit", forward_payload]
+          and "target=/results" in " ".join(submit_cmd)
+          and not any(";" in a or "|" in a or "$" in a or "`" in a for a in submit_cmd),
+          str(submit_cmd))
 
     from unittest.mock import patch
 
@@ -731,6 +774,115 @@ def main():
             rc = _t.cmd_handoff(encoded)
         check("T17f resolve starts no child process", rc == 0)
 
+    # T18 zero-trade: a completed execution that filled no trade is valid
+    # evidence. It must never become performance evidence.
+    header_only = EVENT_HEADER + "\n"
+
+    def readback_of(**stub):
+        """Submit one fresh stub run and read it back."""
+        root, _ = fresh_run(**stub)
+        code, text = run("research-readback", RUN_ID, root=root)
+        return code, text
+
+    zroot, zout = fresh_run(cycles=0, trades=0, events=header_only)
+    rc, out = run("research-readback", RUN_ID, root=zroot)
+    zback = json.loads(out) if rc == 0 else {}
+    check("T18a zero-trade run prints the Node05 receipt",
+          rc == 0 and zback.get("node05") == "PASS", out)
+    check("T18b zero-trade counts as completed execution",
+          zback.get("readable", {}).get("execution") is True, out)
+    check("T18c zero-trade is not performance claimable",
+          zback.get("performance_claimable") is False
+          and zback.get("coverage_complete") is False, out)
+
+    rc, out = readback_of(cycles=0, trades=0, events=header_only + EVENT_ROW + "\n")
+    check("T18d zero cycles with an event row fails closed",
+          rc == 2 and "does not match the replayed cycle count" in out, out)
+    rc, out = readback_of(cycles=1, trades=1, events=header_only)
+    check("T18e a replayed cycle with no event row fails closed",
+          rc == 2 and "does not match the replayed cycle count" in out, out)
+    rc, out = readback_of(cycles=1, trades=0)
+    check("T18f a cycle/trade mismatch fails closed",
+          rc == 2 and "cycle/trade mismatch" in out, out)
+    rc, out = readback_of(cycles=0, trades=1)
+    check("T18g a trade without a cycle fails closed",
+          rc == 2 and "cycle/trade mismatch" in out, out)
+
+    root, out_dir = fresh_run()
+    (out_dir / "metrics.json").unlink()
+    rc, out = run("research-readback", RUN_ID, root=root)
+    check("T18h missing metrics evidence fails closed",
+          rc == 2 and "metrics.json" in out, out)
+
+    root, out_dir = fresh_run()
+    manifest = json.loads((out_dir / "manifest.json").read_text())
+    manifest.pop("metrics.json")
+    (out_dir / "manifest.json").write_text(json.dumps(manifest, sort_keys=True))
+    rc, out = run("research-readback", RUN_ID, root=root)
+    check("T18i metrics absent from the manifest fails closed",
+          rc == 2 and "required evidence is missing from the manifest: metrics.json" in out, out)
+
+    root, out_dir = fresh_run()
+    (out_dir / "metrics.json").write_text("not json")
+    rc, out = run("research-readback", RUN_ID, root=root)
+    check("T18j malformed metrics fails closed",
+          rc == 2 and "run evidence is not readable" in out, out)
+
+    root, out_dir = fresh_run()
+    (out_dir / "summary.json").write_text(json.dumps([]))
+    (out_dir / "metrics.json").write_text(json.dumps({"total_trades": 0}))
+    rc, out = run("research-readback", RUN_ID, root=root)
+    check("T18k a non-object summary fails closed",
+          rc == 2 and "no usable cycle count" in out, out)
+
+    for label, summary, run_metrics in (
+        ("a boolean cycle count", {"cycles_replayed": True}, {"total_trades": 1}),
+        ("a string cycle count", {"cycles_replayed": "1"}, {"total_trades": 1}),
+        ("a negative cycle count", {"cycles_replayed": -1}, {"total_trades": -1}),
+        ("a float trade count", {"cycles_replayed": 1}, {"total_trades": 1.0}),
+        ("a boolean trade count", {"cycles_replayed": 1}, {"total_trades": True}),
+    ):
+        root, out_dir = fresh_run()
+        (out_dir / "summary.json").write_text(json.dumps(summary))
+        (out_dir / "metrics.json").write_text(json.dumps(run_metrics))
+        rc, out = run("research-readback", RUN_ID, root=root)
+        check("T18l " + label + " fails closed",
+              rc == 2 and ("no usable cycle count" in out or "no usable trade count" in out), out)
+
+    rc, out = readback_of(events="cycle,stage,stage_price,stage_quote_amount\n" + EVENT_ROW + "\n")
+    check("T18m an events header without every required field fails closed",
+          rc == 2 and "bad header" in out, out)
+    rc, out = readback_of(events="")
+    check("T18n an events file without a header fails closed",
+          rc == 2 and "bad header" in out, out)
+    rc, out = readback_of(events=EVENT_HEADER + "\n1,entry\n")
+    check("T18o an events row without every required field fails closed",
+          rc == 2 and "bad row" in out, out)
+
+    # T19 production namespace: the default root is production, the test
+    # override still works, and forwarding follows the configured root.
+    check("T19a the default results root is production",
+          _t.RESULTS_ROOT_DEFAULT == "/results/production", _t.RESULTS_ROOT_DEFAULT)
+    check("T19b no hardcoded validation root remains",
+          "_validation" not in Path(_t.__file__ or str(TRANSPORT)).read_text())
+    with patch.dict(os.environ, {"RESEARCH_RESULTS_ROOT": str(tmp)}):
+        check("T19c the test override still resolves",
+              _t.resolve_root() == Path(os.path.realpath(tmp)), str(_t.resolve_root()))
+    existing = Path(tempfile.mkdtemp(prefix="transport-root-"))
+    with patch.dict(os.environ, {}, clear=True), \
+         patch.object(_t, "resolve_container_cli", return_value="/usr/local/bin/container"), \
+         patch.object(_t, "host_results_source", return_value=str(existing)), \
+         patch.object(_t, "RESULTS_ROOT_DEFAULT", str(existing)):
+        check("T19d a present configured root keeps the launch local",
+              _t.should_forward_host() is False)
+    with patch.dict(os.environ, {}, clear=True), \
+         patch.object(_t, "resolve_container_cli", return_value="/usr/local/bin/container"), \
+         patch.object(_t, "host_results_source", return_value=str(existing)), \
+         patch.object(_t, "RESULTS_ROOT_DEFAULT", str(existing / "absent")):
+        check("T19e forwarding follows the configured root, not a literal",
+              _t.should_forward_host() is True)
+
+    print("%d checks passed" % len(CHECKS))
     print("ALL THIN CHECKS PASSED")
 
 
