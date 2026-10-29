@@ -1204,7 +1204,7 @@ def main():
           rc == 2 and "without an approved cost model" in out, out)
 
     # T22 bounded materialize. One fixed command, no --force, no arbitrary argv.
-    def materialize_fixture():
+    def materialize_fixture(phase="IS_BASELINE"):
         """Write one isolated stub Qlib materializer under a fresh results root."""
         root = Path(tempfile.mkdtemp(prefix="transport-materialize-"))
         pkg = root / "stub-qlib"
@@ -1216,6 +1216,7 @@ def main():
         artifact = root / "strategy_signal.py"
         artifact.write_text("def signal(**kwargs):\n    return [], None\n")
         spec = {
+            "phase": phase,
             "candidate": {"path": "demo-candidate.md", "source_commit": "b" * 40,
                           "git_blob_sha": "a" * 40},
             "runtime": {"commit": "c" * 40},
@@ -1242,7 +1243,7 @@ def main():
             "request": "materialize-v1",
             "spec_ref": str(spec_path),
             "root": spec["materialize"]["cells_dir"],
-            "phase": "IS_BASELINE",
+            "phase": spec["phase"],
             "window": {"start_utc": spec["strategy"]["window_start_utc"],
                        "end_utc_inclusive": spec["strategy"]["window_end_utc_inclusive"]},
             "source_commit": spec["candidate"]["source_commit"],
@@ -1286,9 +1287,16 @@ def main():
           rc == 0 and again.get("state") == "existing"
           and (cells_root / "materialize-receipt.json").read_bytes() == stored
           and manifest_path.read_bytes() == manifest_bytes, out)
-    rc, out = run_materialize(dict(request, phase="IS_RETEST"), froot, pkg)
+    retest = json.loads(spec_path.read_text())
+    retest["phase"] = "IS_RETEST"
+    retest_path = spec_path.with_name("retest-spec.json")
+    retest_path.write_text(json.dumps(retest, indent=2, sort_keys=True) + "\n")
+    rc, out = run_materialize(materialize_request(retest_path, retest), froot, pkg)
     check("T22d a conflicting phase over an existing root refuses",
           rc == 2 and "refuse overwrite" in out and "different request" in out, out)
+    rc, out = run_materialize(dict(request, phase="IS_RETEST"), froot, pkg)
+    check("T22d1 a request phase the spec does not declare fails closed",
+          rc == 2 and "spec phase does not match the requested phase" in out, out)
     rc, out = run_materialize(dict(request, candidate_path="other-candidate.md"), froot, pkg)
     check("T22d2 a candidate that is not the spec candidate fails closed",
           rc == 2 and "spec candidate.path" in out, out)
@@ -1489,8 +1497,8 @@ def main():
           and native.get("identity", {}).get("campaign_manifest_sha256") == sha(active_manifest)
           and native["identity"].get("materialize_spec_sha256") == sha(spec_path), out)
 
-    oroot, opkg, ospec_path, ospec, _oartifact = materialize_fixture()
-    orequest = materialize_request(ospec_path, ospec, phase="OOS")
+    oroot, opkg, ospec_path, ospec, _oartifact = materialize_fixture(phase="OOS")
+    orequest = materialize_request(ospec_path, ospec)
     rc, out = run_materialize(orequest, oroot, opkg)
     if rc != 0:
         raise SystemExit("FAILED: OOS materialize setup " + out)
@@ -1506,6 +1514,245 @@ def main():
     check("T22p an OOS run is not performance claimable at the transport",
           oback.get("performance_claimable") is False
           and onative.get("performance_claimable") is False, out)
+
+    # T24 receipt identity (B1). A receipt is authoritative only when every
+    # identity it declares verifies against evidence this file reads itself.
+    def bound_fixture(phase="IS_BASELINE"):
+        """Materialize one campaign and submit one of its cells."""
+        root, pkg_path, spec_path_, spec_, _art = materialize_fixture(phase=phase)
+        rc, out = run_materialize(materialize_request(spec_path_, spec_), root, pkg_path)
+        if rc != 0:
+            raise SystemExit("FAILED: bound fixture materialize " + out)
+        rc, out = submit_from_cells(root, pkg_path, spec_["materialize"]["cells_dir"])
+        if rc != 0:
+            raise SystemExit("FAILED: bound fixture submit " + out)
+        return root, pkg_path, spec_path_, spec_, Path(spec_["materialize"]["cells_dir"])
+
+    def campaign_read_for(cells_dir, spec):
+        return handoff_resolve({"request": "campaign-manifest-read-v1",
+                                "source_commit": spec["candidate"]["source_commit"],
+                                "candidate_path": spec["candidate"]["path"],
+                                "source_blob_sha": spec["candidate"]["git_blob_sha"],
+                                "evidence_root": str(cells_dir)})
+
+    def rewrite_receipt(cells_dir, payload):
+        ref = Path(cells_dir) / "materialize-receipt.json"
+        if payload is None:
+            ref.unlink()
+        elif isinstance(payload, str):
+            ref.write_text(payload)
+        else:
+            ref.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        return ref
+
+    # T24a the auditor exploit: edit only receipt.phase on a materialized OOS
+    # campaign, then read the campaign and the run back.
+    oos_cells = Path(ospec["materialize"]["cells_dir"])
+    oos_receipt = json.loads((oos_cells / "materialize-receipt.json").read_text())
+    rewrite_receipt(oos_cells, dict(oos_receipt, phase="IS_BASELINE"))
+    rc, out = campaign_read_for(oos_cells, ospec)
+    check("T24a a phase-only receipt tamper fails the campaign read closed",
+          rc == 2 and "phase does not match the approved spec" in out, out)
+    rc, out = run("research-readback", RUN_ID, root=oroot)
+    check("T24a2 a phase-only receipt tamper cannot relabel an OOS run as IS",
+          rc == 2 and '"feeds_research": true' not in out
+          and "phase does not match the approved spec" in out, out)
+    rewrite_receipt(oos_cells, oos_receipt)
+
+    root, pkg_path, spec_path_, spec_, cells_dir = bound_fixture()
+    receipt_path = cells_dir / "materialize-receipt.json"
+    original_receipt = json.loads(receipt_path.read_text())
+    original_spec_text = spec_path_.read_text()
+    minimal = {key: original_receipt[key] for key in
+               ("schema", "request", "phase", "window", "window_identity_sha256",
+                "campaign_manifest", "root", "cells_root")}
+    rewrite_receipt(cells_dir, minimal)
+    rc, out = campaign_read_for(cells_dir, spec_)
+    check("T24b a minimal receipt without spec identity fails the campaign read closed",
+          rc == 2 and "spec reference" in out, out)
+    rc, out = run("research-readback", RUN_ID, root=root)
+    check("T24b2 a minimal receipt fails the readback closed instead of unbinding",
+          rc == 2 and "spec reference" in out, out)
+
+    rewrite_receipt(cells_dir, "{not json")
+    rc, out = campaign_read_for(cells_dir, spec_)
+    check("T24c a malformed receipt fails the campaign read closed",
+          rc == 2 and "not readable JSON" in out, out)
+    rc, out = run("research-readback", RUN_ID, root=root)
+    check("T24c2 a malformed receipt fails the readback closed, never silently unbound",
+          rc == 2 and "not readable JSON" in out and "phase_bound" not in out, out)
+
+    rewrite_receipt(cells_dir, None)
+    inner = spec_path_.with_name("receipt-copy.json")
+    inner.write_text(json.dumps(original_receipt, indent=2, sort_keys=True) + "\n")
+    receipt_path.symlink_to(inner)
+    rc, out = campaign_read_for(cells_dir, spec_)
+    check("T24d a receipt symlink is refused instead of followed",
+          rc == 2 and "not a regular file" in out, out)
+    rc, out = run("research-readback", RUN_ID, root=root)
+    check("T24d2 a receipt symlink fails the readback closed",
+          rc == 2 and "not a regular file" in out, out)
+    receipt_path.unlink()
+    outer = Path(tempfile.mkdtemp(prefix="transport-outside-")) / "receipt.json"
+    outer.write_text(json.dumps(original_receipt, indent=2, sort_keys=True) + "\n")
+    receipt_path.symlink_to(outer)
+    rc, out = campaign_read_for(cells_dir, spec_)
+    check("T24d3 a receipt symlink out of the campaign root is refused",
+          rc == 2 and "outside the evidence root" in out, out)
+    receipt_path.unlink()
+    rewrite_receipt(cells_dir, original_receipt)
+
+    changed_spec = json.loads(original_spec_text)
+    changed_spec["house_overlay"]["trade_cost"] = 0.0009
+    spec_path_.write_text(json.dumps(changed_spec, indent=2, sort_keys=True) + "\n")
+    rc, out = campaign_read_for(cells_dir, spec_)
+    check("T24e a spec rewritten after materialization fails the campaign read closed",
+          rc == 2 and "spec bytes do not match the receipt" in out, out)
+    rc, out = run("research-readback", RUN_ID, root=root)
+    check("T24e2 a spec rewritten after materialization fails the readback closed",
+          rc == 2 and "spec bytes do not match the receipt" in out, out)
+    spec_path_.write_text(original_spec_text)
+
+    rewrite_receipt(cells_dir, dict(original_receipt, cell_evidence_sha256="0" * 64))
+    rc, out = campaign_read_for(cells_dir, spec_)
+    check("T24f a receipt that does not bind the campaign cells fails closed",
+          rc == 2 and "does not bind these campaign cells" in out, out)
+    rewrite_receipt(cells_dir, {key: value for key, value in original_receipt.items()
+                                if key != "phase"})
+    rc, out = campaign_read_for(cells_dir, spec_)
+    check("T24g a receipt without an approved phase fails closed",
+          rc == 2 and "phase does not match the approved spec" in out, out)
+
+    rewrite_receipt(cells_dir, None)
+    rc, out = campaign_read_for(cells_dir, spec_)
+    report = json.loads(out) if out.startswith("{") else {}
+    check("T24h a missing receipt stays an explicitly unbound answer",
+          rc == 0 and report.get("phase_bound") is False
+          and report.get("phase_binding") is None, out)
+    rc, out = run("research-readback", RUN_ID, root=root)
+    back = json.loads(out) if rc == 0 else {}
+    unbound = back.get("native_evidence") or {}
+    check("T24h2 a missing receipt leaves the readback phase null, never guessed",
+          rc == 0 and unbound.get("phase") is None and unbound.get("phase_bound") is False
+          and unbound.get("feeds_research") is None, out)
+    rewrite_receipt(cells_dir, original_receipt)
+    rc, out = run("research-readback", RUN_ID, root=root)
+    back = json.loads(out) if rc == 0 else {}
+    restored = back.get("native_evidence") or {}
+    check("T24i the restored receipt binds the phase again",
+          rc == 0 and restored.get("phase") == "IS_BASELINE"
+          and restored.get("feeds_research") is True, out)
+
+    # T25 receipt creation (B2). A pre-existing receipt path never redirects a
+    # write, and an external file never changes.
+    def hostile_receipt(kind):
+        hroot, hpkg, hspec_path, hspec, _hart = materialize_fixture()
+        hcells = Path(hspec["materialize"]["cells_dir"])
+        hcells.mkdir(parents=True, exist_ok=True)
+        outside_dir = Path(tempfile.mkdtemp(prefix="transport-outside-"))
+        sentinel = outside_dir / "sentinel.txt"
+        sentinel.write_text("sentinel\n")
+        hreceipt = hcells / "materialize-receipt.json"
+        if kind == "symlink":
+            hreceipt.symlink_to(sentinel)
+        elif kind == "dangling":
+            hreceipt.symlink_to(outside_dir / "never-created.json")
+        else:
+            hreceipt.write_text('{"stale": true}\n')
+        before = sorted((p.name, p.stat().st_size) for p in outside_dir.iterdir())
+        code, text = run_materialize(materialize_request(hspec_path, hspec), hroot, hpkg)
+        after = sorted((p.name, p.stat().st_size) for p in outside_dir.iterdir())
+        return code, text, hcells, outside_dir, sentinel, before, after
+
+    rc, out, cells_dir, outside_dir, sentinel, before, after = hostile_receipt("symlink")
+    check("T25a a receipt symlink refuses before the native materializer runs",
+          rc == 2 and "already carries materialize-receipt.json" in out, out)
+    check("T25a2 the external sentinel stays byte-identical",
+          sentinel.read_bytes() == b"sentinel\n" and before == after, str(before))
+    check("T25a3 no cell or manifest is written over a hostile receipt path",
+          sorted(p.name for p in Path(cells_dir).iterdir()) == ["materialize-receipt.json"]
+          and not (Path(cells_dir) / "campaign-manifest.json").exists(), out)
+
+    rc, out, cells_dir, outside_dir, sentinel, before, after = hostile_receipt("dangling")
+    check("T25b a dangling receipt symlink refuses instead of following it",
+          rc == 2 and "already carries materialize-receipt.json" in out, out)
+    check("T25b2 the dangling target is never created outside the root",
+          not (outside_dir / "never-created.json").exists()
+          and sentinel.read_bytes() == b"sentinel\n" and before == after, str(before))
+
+    rc, out, cells_dir, outside_dir, sentinel, before, after = hostile_receipt("regular")
+    check("T25c a pre-existing receipt file refuses instead of being replaced",
+          rc == 2 and "already carries materialize-receipt.json" in out
+          and (Path(cells_dir) / "materialize-receipt.json").read_text() == '{"stale": true}\n',
+          out)
+
+    unit_root = Path(tempfile.mkdtemp(prefix="transport-receipt-"))
+    unit_target = unit_root.parent / (unit_root.name + "-sentinel.txt")
+    unit_target.write_text("sentinel\n")
+    (unit_root / "materialize-receipt.json").symlink_to(unit_target)
+    wrote = _t._write_receipt(str(unit_root), {"schema": "x"})
+    check("T25d the receipt writer itself never follows an existing target",
+          wrote is False and unit_target.read_text() == "sentinel\n", str(wrote))
+    fresh_root = Path(tempfile.mkdtemp(prefix="transport-receipt-"))
+    first = _t._write_receipt(str(fresh_root), {"schema": "y"})
+    second = _t._write_receipt(str(fresh_root), {"schema": "z"})
+    check("T25e the receipt writer creates once and never replaces",
+          first is True and second is False
+          and json.loads((fresh_root / "materialize-receipt.json").read_text()) == {"schema": "y"},
+          "%s %s" % (first, second))
+
+    # T26 request-only guards (B3). A missing spec never hides another defect.
+    groot, gpkg, gspec_path, gspec, _gart = materialize_fixture()
+    gcells = Path(gspec["materialize"]["cells_dir"])
+    gcells.mkdir(parents=True, exist_ok=True)
+    grequest = materialize_request(gspec_path, gspec)
+    absent_spec = str(gcells / "absent-spec.json")
+
+    def local_materialize(payload):
+        with patch.object(_t, "resolve_root", return_value=Path(os.path.realpath(groot))), \
+             contextlib.redirect_stdout(io.StringIO()) as buf:
+            code = _t.cmd_materialize(b64(payload))
+        return code, buf.getvalue()
+
+    with patch.object(_t, "is_fixed_runtime", return_value=True):
+        rc, out = local_materialize(dict(grequest, spec_ref=absent_spec,
+                                         qlib_runtime_commit="d" * 40))
+    check("T26a a wrong fixed runtime plus a missing spec fails at exit 2",
+          rc == 2 and "config/runtime identity mismatch" in out, out)
+
+    spec_dir = gcells / "spec-dir"
+    spec_dir.mkdir(parents=True, exist_ok=True)
+    rc, out = local_materialize(dict(grequest, spec_ref=str(spec_dir)))
+    check("T26b a directory spec_ref fails at exit 2",
+          rc == 2 and "not a regular file" in out, out)
+
+    real_spec = gcells / "real-spec.json"
+    real_spec.write_text(json.dumps(gspec, indent=2, sort_keys=True) + "\n")
+    spec_link = gcells / "spec-link.json"
+    spec_link.symlink_to(real_spec)
+    rc, out = local_materialize(dict(grequest, spec_ref=str(spec_link)))
+    check("T26c a symlinked spec_ref fails at exit 2",
+          rc == 2 and "not a regular file" in out, out)
+
+    escape_dir = gcells / "escape"
+    escape_dir.symlink_to(Path(tempfile.mkdtemp(prefix="transport-outside-")))
+    rc, out = local_materialize(dict(grequest, spec_ref=str(escape_dir / "absent-spec.json")))
+    check("T26d a spec_ref that escapes the results root fails at exit 2",
+          rc == 2 and "escapes the results root" in out, out)
+
+    rc, out = local_materialize(dict(grequest, spec_ref=absent_spec,
+                                     window={"start_utc": "yesterday",
+                                             "end_utc_inclusive": "today"}))
+    check("T26e a malformed window plus a missing spec fails at exit 2",
+          rc == 2 and "window.start_utc" in out, out)
+    rc, out = local_materialize(dict(grequest, spec_ref=absent_spec, phase="IS_SIDE"))
+    check("T26f an unapproved phase plus a missing spec fails at exit 2",
+          rc == 2 and "phase is not one of" in out, out)
+    rc, out = local_materialize(dict(grequest, spec_ref=absent_spec))
+    payload = json.loads(out) if out.strip().startswith("{") else {}
+    check("T26g a valid request with a truly absent spec stays implementation_needed",
+          rc == 0 and payload.get("status") == "implementation_needed"
+          and "MATERIALIZE_SPEC_MISSING" in str(payload.get("reason")), out)
 
     # T23 mutation control: the new guards are load-bearing. A weakened copy must
     # ACCEPT exactly what the shipped guard rejects, so a mutation is detectable.

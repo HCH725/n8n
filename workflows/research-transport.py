@@ -58,6 +58,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -1390,35 +1391,268 @@ def _cell_config_problems(cell, config, request=None):
     return problems
 
 
-def _phase_binding_for_manifest(evidence_root, manifest_sha256, config_ref=None):
-    """Return (binding, None) or (None, reason) for one evidence root.
+def _regular_file_bytes(path_value):
+    """Read one regular file without following a symlink. Return (bytes, reason).
 
-    The chain is: a campaign manifest whose bytes and cell digests are verified,
-    a materialize receipt that binds that exact manifest sha256, and the approved
-    phase plus window the receipt recorded. A missing receipt is an unbound
-    answer (never an invented phase); a present but inconsistent receipt is
-    contradictory evidence and fails closed.
+    A receipt, a spec or an artifact is evidence only when it is an ordinary
+    file. A symlink is a mutable indirection to a path this root does not own,
+    so it is refused instead of followed.
     """
-    receipt, _why = _read_json(str(Path(evidence_root) / MATERIALIZE_RECEIPT))
-    if receipt is None:
+    try:
+        info = os.lstat(path_value)
+    except OSError:
+        return None, "not readable"
+    if not stat.S_ISREG(info.st_mode):
+        return None, "not a regular file"
+    try:
+        handle = os.open(str(path_value), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return None, "not readable"
+    try:
+        with os.fdopen(handle, "rb") as fh:
+            return fh.read(), None
+    except OSError:
+        return None, "not readable"
+
+
+def _campaign_bases(evidence_root):
+    """Return the directories one campaign's referenced paths may live in.
+
+    The materialized cells root and the campaign directory beside it, where the
+    approved spec and the strategy artifact live. Nothing outside is trusted,
+    even when a receipt or a manifest names it.
+    """
+    try:
+        root = Path(os.path.realpath(evidence_root))
+    except (OSError, ValueError):
+        return []
+    return [root, root.parent]
+
+
+def _in_campaign_bases(path_value, bases):
+    """True when one referenced path resolves inside a campaign base."""
+    try:
+        real = Path(os.path.realpath(path_value))
+    except (OSError, ValueError):
+        return False
+    for base in bases:
+        try:
+            if os.path.commonpath([str(real), str(base)]) == str(base):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _verified_campaign(evidence_root):
+    """Return (evidence, None) or (None, reason) for one campaign root.
+
+    One fail-closed read of a campaign manifest: schema, cell count, unique ids,
+    every declared digest recomputed from the bytes on disk, every cell config
+    bound to its own manifest declaration, every ref contained in the campaign
+    root, and one shared approved window. The caller's word is never evidence.
+    """
+    try:
+        if not Path(evidence_root).is_dir():
+            return None, "the evidence root is not a directory"
+    except OSError:
+        return None, "the evidence root is not a directory"
+    bases = _campaign_bases(evidence_root)
+    ref = Path(evidence_root) / MANIFEST_NAME
+    if not _in_campaign_bases(str(ref), bases):
+        return None, "the campaign manifest is outside the evidence root"
+    raw, _why = _regular_file_bytes(str(ref))
+    if raw is None:
+        return None, "the evidence root has no readable " + MANIFEST_NAME
+    try:
+        manifest = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None, "the evidence root has no readable " + MANIFEST_NAME
+    if not isinstance(manifest, dict) or manifest.get("schema") != MANIFEST_SCHEMA:
+        return None, "the evidence manifest schema is not " + MANIFEST_SCHEMA
+    cells = manifest.get("cells")
+    if not isinstance(cells, list) or not cells:
+        return None, "the evidence manifest carries no cell"
+    if manifest.get("cell_count") != len(cells):
+        return None, "the evidence manifest cell_count does not match its cells"
+    if [cell for cell in cells if not isinstance(cell, dict)]:
+        return None, "the evidence manifest carries a malformed cell"
+    seen = set()
+    windows = set()
+    for cell in cells:
+        if cell.get("cell_id") in seen:
+            return None, "the evidence manifest repeats a cell id"
+        seen.add(cell.get("cell_id"))
+        problems = _cell_byte_problems(cell, evidence_root)
+        if problems:
+            return None, "; ".join(sorted(set(problems))[:4])
+        config, _why = _read_json(cell.get("effective_config_ref"))
+        problems = _cell_config_problems(cell, config)
+        if problems:
+            return None, "; ".join(sorted(set(problems))[:4])
+        strategy = config.get("strategy") if isinstance(config.get("strategy"), dict) else {}
+        windows.add((strategy.get("window_start_utc"), strategy.get("window_end_utc_inclusive")))
+    if len(windows) != 1:
+        return None, "the evidence manifest cells do not share one approved window"
+    window = {"start_utc": list(windows)[0][0], "end_utc_inclusive": list(windows)[0][1]}
+    if _window_problems(window):
+        return None, "the evidence manifest cells do not share one approved window"
+    return {"manifest": manifest, "cells": cells, "window": window,
+            "manifest_ref": str(ref),
+            "manifest_sha256": hashlib.sha256(raw).hexdigest()}, None
+
+
+def _verified_receipt_binding(evidence_root, evidence, config_ref=None):
+    """Return (binding, reason) for one campaign root's materialize receipt.
+
+    ``(None, None)`` means the root carries no receipt, so the caller reports an
+    explicitly unbound phase. Any present receipt must verify against evidence
+    this file reads for itself: the spec bytes, the manifest bytes, the cells on
+    disk, the artifact bytes and the fixed runtime. The approved phase comes
+    from the spec, and the receipt must agree with it, so relabelling one
+    receipt field cannot move a campaign between IS and OOS.
+    """
+    receipt_ref = Path(evidence_root) / MATERIALIZE_RECEIPT
+    bases = _campaign_bases(evidence_root)
+    if not _in_campaign_bases(str(receipt_ref), bases):
+        return None, "the materialize receipt is outside the evidence root"
+    try:
+        present = os.lstat(str(receipt_ref))
+    except FileNotFoundError:
         return None, None
-    if not isinstance(receipt, dict) or receipt.get("schema") != MATERIALIZE_RECEIPT_SCHEMA:
-        return None, "the materialize receipt in the evidence root is not readable"
+    except OSError:
+        return None, "the materialize receipt is not readable"
+    if not stat.S_ISREG(present.st_mode):
+        return None, "the materialize receipt is not a regular file"
+    raw, _why = _regular_file_bytes(str(receipt_ref))
+    if raw is None:
+        return None, "the materialize receipt is not readable"
+    try:
+        receipt = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None, "the materialize receipt is not readable JSON"
+    if not isinstance(receipt, dict):
+        return None, "the materialize receipt is not a JSON object"
+    if (receipt.get("schema") != MATERIALIZE_RECEIPT_SCHEMA
+            or receipt.get("request") != MATERIALIZE_KIND):
+        return None, "the materialize receipt is not " + MATERIALIZE_RECEIPT_SCHEMA
+    manifest, cells = evidence["manifest"], evidence["cells"]
     bound = receipt.get("campaign_manifest") if isinstance(receipt.get("campaign_manifest"), dict) else {}
-    if bound.get("sha256") != manifest_sha256:
+    manifest_ref = bound.get("ref")
+    if (bound.get("schema") != MANIFEST_SCHEMA
+            or not isinstance(manifest_ref, str) or not check_abs_path(manifest_ref)
+            or os.path.realpath(manifest_ref) != os.path.realpath(evidence["manifest_ref"])):
         return None, "the materialize receipt does not bind this campaign manifest"
-    phase = receipt.get("phase")
-    window = receipt.get("window")
+    if bound.get("sha256") != evidence["manifest_sha256"]:
+        return None, "the materialize receipt does not bind this campaign manifest"
+    if bound.get("cell_count") != manifest.get("cell_count"):
+        return None, "the materialize receipt does not bind this campaign manifest"
+    for key in ("root", "cells_root"):
+        value = receipt.get(key)
+        if (not isinstance(value, str) or not check_abs_path(value)
+                or os.path.realpath(value) != os.path.realpath(evidence_root)):
+            return None, "the materialize receipt binds a different materialization root"
+    spec_ref = receipt.get("spec_ref")
+    if (not isinstance(spec_ref, str) or not check_abs_path(spec_ref)
+            or not _in_campaign_bases(spec_ref, bases)):
+        return None, "the materialize receipt spec reference is outside the campaign root"
+    spec_bytes, why = _regular_file_bytes(spec_ref)
+    if spec_bytes is None:
+        return None, "the materialize spec the receipt binds is " + str(why)
+    spec_sha256 = receipt.get("spec_sha256")
+    if not isinstance(spec_sha256, str) or not HEX64.match(spec_sha256):
+        return None, "the materialize receipt carries no spec identity"
+    if hashlib.sha256(spec_bytes).hexdigest() != spec_sha256:
+        return None, "the materialize spec bytes do not match the receipt"
+    try:
+        spec = json.loads(spec_bytes.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None, "the materialize spec is not readable JSON"
+    if not isinstance(spec, dict):
+        return None, "the materialize spec is not a JSON object"
+    materialize = spec.get("materialize") if isinstance(spec.get("materialize"), dict) else {}
+    for key in ("cells_dir", "results_root"):
+        value = materialize.get(key)
+        if not isinstance(value, str) or not check_abs_path(value) or not _in_campaign_bases(value, bases):
+            return None, "the materialize spec %s is outside the campaign root" % key
+    if os.path.realpath(materialize["cells_dir"]) != os.path.realpath(evidence_root):
+        return None, "the materialize spec does not bind this materialization root"
+    generated_from = manifest.get("generated_from")
+    if (not isinstance(generated_from, str) or not check_abs_path(generated_from)
+            or os.path.realpath(generated_from) != os.path.realpath(spec_ref)):
+        return None, "the campaign manifest was not generated from this spec"
+    candidate = spec.get("candidate") if isinstance(spec.get("candidate"), dict) else {}
+    for key, want in (("source_commit", receipt.get("source_commit")),
+                      ("path", receipt.get("candidate_path")),
+                      ("git_blob_sha", receipt.get("source_blob_sha"))):
+        if not isinstance(candidate.get(key), str) or candidate.get(key) != want:
+            return None, "the materialize receipt candidate does not match the spec"
+    for cell in cells:
+        for key in ("source_commit", "candidate_path", "source_blob_sha"):
+            if cell.get(key) != receipt.get(key):
+                return None, "the materialize receipt candidate does not match the campaign cells"
+    runtime = spec.get("runtime") if isinstance(spec.get("runtime"), dict) else {}
+    commit = runtime.get("commit")
+    if not isinstance(commit, str) or not HEX40.match(commit):
+        return None, "the materialize spec runtime identity is invalid"
+    if receipt.get("qlib_runtime_commit") != commit:
+        return None, "the materialize receipt runtime does not match the spec"
+    if receipt.get("runtime") != _receipt_runtime({"qlib_runtime_commit": commit}, spec):
+        return None, "the materialize receipt runtime does not match the fixed runtime"
+    if is_fixed_runtime():
+        if commit != FIXED_RUNTIME_COMMIT:
+            return None, "config/runtime identity mismatch"
+        if runtime.get("image") is not None and runtime.get("image") != FIXED_IMAGE:
+            return None, "config/runtime identity mismatch"
+        if runtime.get("image_digest") is not None and runtime.get("image_digest") != FIXED_IMAGE_DIGEST:
+            return None, "config/runtime identity mismatch"
+    for cell in cells:
+        if cell.get("qlib_runtime_commit") != commit:
+            return None, "the campaign cells runtime does not match the spec"
+    artifact = receipt.get("strategy_artifact") if isinstance(receipt.get("strategy_artifact"), dict) else {}
+    source = artifact.get("source")
+    spec_artifact = spec.get("strategy_artifact") if isinstance(spec.get("strategy_artifact"), dict) else {}
+    if (not isinstance(source, str) or not check_abs_path(source)
+            or not _in_campaign_bases(source, bases) or source != spec_artifact.get("source")):
+        return None, "the materialize receipt artifact does not match the spec"
+    artifact_bytes, why = _regular_file_bytes(source)
+    if artifact_bytes is None:
+        return None, "the materialize strategy artifact is " + str(why)
+    artifact_sha256 = hashlib.sha256(artifact_bytes).hexdigest()
+    if artifact.get("sha256") != artifact_sha256:
+        return None, "the materialize strategy artifact bytes do not match the receipt"
+    for cell in cells:
+        if cell.get("strategy_artifact_sha256") != artifact_sha256:
+            return None, "the campaign cells artifact does not match the receipt"
+    phase = spec.get("phase")
+    if phase not in PHASES:
+        return None, "the materialize spec carries no approved phase"
+    if receipt.get("phase") != phase:
+        return None, "the materialize receipt phase does not match the approved spec"
+    strategy = spec.get("strategy") if isinstance(spec.get("strategy"), dict) else {}
+    window = {"start_utc": strategy.get("window_start_utc"),
+              "end_utc_inclusive": strategy.get("window_end_utc_inclusive")}
     problems = _window_problems(window)
-    if phase not in PHASES or problems:
-        return None, ("the materialize receipt carries no usable phase/window: "
-                      + "; ".join(problems or ["phase is not an approved phase"]))
+    if problems:
+        return None, "the materialize spec carries no approved window: " + "; ".join(problems)
+    if receipt.get("window") != window:
+        return None, "the materialize receipt window does not match the approved spec"
     if receipt.get("window_identity_sha256") != _window_identity(window):
         return None, "the materialize receipt window identity does not match its window"
+    if evidence["window"] != window:
+        return None, "the campaign cells window does not match the approved spec"
+    ids = sorted(str(cell.get("cell_id")) for cell in cells)
+    if receipt.get("cell_ids") != ids:
+        return None, "the materialize receipt does not bind these campaign cells"
+    if receipt.get("cell_ids_sha256") != hashlib.sha256("\n".join(ids).encode("utf-8")).hexdigest():
+        return None, "the materialize receipt does not bind these campaign cells"
+    rows = "\n".join("%s:%s:%s:%s" % (cell.get("cell_id"), cell.get("effective_config_sha256"),
+                                      cell.get("entrypoint_sha256"),
+                                      cell.get("strategy_artifact_sha256"))
+                     for cell in sorted(cells, key=lambda item: str(item.get("cell_id"))))
+    if receipt.get("cell_evidence_sha256") != hashlib.sha256(rows.encode("utf-8")).hexdigest():
+        return None, "the materialize receipt does not bind these campaign cells"
     if config_ref is not None:
-        cells, reason = _manifest_cells(evidence_root)
-        if cells is None:
-            return None, reason
         hit = [cell for cell in cells
                if isinstance(cell.get("effective_config_ref"), str)
                and os.path.realpath(cell["effective_config_ref"]) == os.path.realpath(config_ref)]
@@ -1426,11 +1660,30 @@ def _phase_binding_for_manifest(evidence_root, manifest_sha256, config_ref=None)
             return None, "the frozen campaign manifest does not carry this run's effective config"
     return {"phase": phase, "window": dict(window),
             "window_identity_sha256": receipt["window_identity_sha256"],
-            "campaign_manifest_sha256": manifest_sha256,
-            "campaign_manifest_ref": str(Path(evidence_root) / MANIFEST_NAME),
-            "materialize_spec_sha256": receipt.get("spec_sha256")
-            if isinstance(receipt.get("spec_sha256"), str) else None,
+            "campaign_manifest_sha256": evidence["manifest_sha256"],
+            "campaign_manifest_ref": evidence["manifest_ref"],
+            "materialize_spec_sha256": spec_sha256,
             "source": MATERIALIZE_RECEIPT}, None
+
+
+def _phase_binding_for_manifest(evidence_root, manifest_sha256, config_ref=None, verified=None):
+    """Return (binding, None) or (None, reason) for one evidence root.
+
+    The chain is: a campaign manifest whose bytes and cell digests are verified,
+    a materialize receipt that binds that exact manifest sha256 and the approved
+    spec bytes, and the phase plus window that spec declares. A missing receipt
+    is an unbound answer (never an invented phase); a present but inconsistent
+    receipt is contradictory evidence and fails closed.
+    """
+    if verified is None:
+        evidence, reason = _verified_campaign(evidence_root)
+        if evidence is None:
+            return None, reason
+    else:
+        evidence = verified
+    if evidence["manifest_sha256"] != manifest_sha256:
+        return None, "the materialize receipt does not bind this campaign manifest"
+    return _verified_receipt_binding(evidence_root, evidence, config_ref)
 
 
 def _phase_binding_for_run(submit):
@@ -1460,67 +1713,36 @@ def read_campaign_manifest(request):
     with no schema) is not a campaign manifest and never passes here.
     """
     evidence_root = request["evidence_root"]
-    try:
-        if not Path(evidence_root).is_dir():
-            return None, "the evidence root is not a directory"
-    except OSError:
-        return None, "the evidence root is not a directory"
-    ref = Path(evidence_root) / MANIFEST_NAME
-    if not contained(evidence_root, str(ref)):
-        return None, "the campaign manifest is outside the evidence root"
-    manifest, _why = _read_json(str(ref))
-    if manifest is None:
-        return None, "the evidence root has no readable " + MANIFEST_NAME
-    if not isinstance(manifest, dict) or manifest.get("schema") != MANIFEST_SCHEMA:
-        return None, "the evidence manifest schema is not " + MANIFEST_SCHEMA
-    cells = manifest.get("cells")
-    if not isinstance(cells, list) or not cells:
-        return None, "the evidence manifest carries no cell"
-    if manifest.get("cell_count") != len(cells):
-        return None, "the evidence manifest cell_count does not match its cells"
-    if [cell for cell in cells if not isinstance(cell, dict)]:
-        return None, "the evidence manifest carries a malformed cell"
-    windows = set()
-    seen = set()
+    evidence, reason = _verified_campaign(evidence_root)
+    if evidence is None:
+        return None, reason
+    cells = evidence["cells"]
     for cell in cells:
         for key in ("source_commit", "candidate_path", "source_blob_sha"):
             if cell.get(key) != request[key]:
                 return None, "the evidence manifest does not carry the requested candidate: " + key
-        if cell.get("cell_id") in seen:
-            return None, "the evidence manifest repeats a cell id"
-        seen.add(cell.get("cell_id"))
-        problems = _cell_byte_problems(cell, evidence_root)
-        if problems:
-            return None, "; ".join(sorted(set(problems))[:4])
         config, _why = _read_json(cell.get("effective_config_ref"))
         problems = _cell_config_problems(cell, config, request)
         if problems:
             return None, "; ".join(sorted(set(problems))[:4])
-        strategy = config.get("strategy") if isinstance(config.get("strategy"), dict) else {}
-        windows.add((strategy.get("window_start_utc"), strategy.get("window_end_utc_inclusive")))
-    if len(windows) != 1 or _window_problems({"start_utc": list(windows)[0][0],
-                                              "end_utc_inclusive": list(windows)[0][1]}):
-        return None, "the evidence manifest cells do not share one approved window"
-    manifest_sha256 = file_sha256(str(ref))
-    if manifest_sha256 is None or not HEX64.match(manifest_sha256):
-        return None, "the campaign manifest identity is invalid"
-    binding, reason = _phase_binding_for_manifest(evidence_root, manifest_sha256)
+    binding, reason = _phase_binding_for_manifest(
+        evidence_root, evidence["manifest_sha256"], verified=evidence)
     if reason is not None:
         return None, reason
-    window_start, window_end = list(windows)[0]
+    window = evidence["window"]
     return {
         "ok": True, "status": "ready", "source": "frozen-campaign-manifest",
-        "manifest_kind": "campaign", "schema": manifest["schema"],
-        "manifest_ref": str(ref), "manifest_sha256": manifest_sha256,
+        "manifest_kind": "campaign", "schema": evidence["manifest"]["schema"],
+        "manifest_ref": evidence["manifest_ref"],
+        "manifest_sha256": evidence["manifest_sha256"],
         "cell_count": len(cells),
-        "window": {"start_utc": window_start, "end_utc_inclusive": window_end,
-                   "identity_sha256": _window_identity({"start_utc": window_start,
-                                                        "end_utc_inclusive": window_end})},
+        "window": {"start_utc": window["start_utc"], "end_utc_inclusive": window["end_utc_inclusive"],
+                   "identity_sha256": _window_identity(window)},
         "cells": [{key: cell[key] for key in CAMPAIGN_CELL_KEYS if key in cell} for cell in cells],
         "phase_binding": binding,
         "phase_bound": binding is not None,
-        "generated_from": manifest.get("generated_from")
-        if isinstance(manifest.get("generated_from"), str) else None,
+        "generated_from": evidence["manifest"].get("generated_from")
+        if isinstance(evidence["manifest"].get("generated_from"), str) else None,
     }, None
 
 
@@ -1775,6 +1997,25 @@ def _materialize_problems(request):
     return []
 
 
+def _absent_spec_parent(spec_ref, root):
+    """Return (True, None) when an absent spec path sits in a real contained dir.
+
+    A missing spec is an expected answer only when its directory is a real
+    directory inside the results root. A symlinked or escaping directory is not
+    an approved place for the engineering flow to write one.
+    """
+    parent = spec_ref.parent
+    try:
+        info = os.lstat(str(parent))
+    except OSError:
+        return False, "the materialize spec directory is not usable"
+    if not stat.S_ISDIR(info.st_mode):
+        return False, "the materialize spec directory is not a directory"
+    if not under_root(str(parent), root):
+        return False, "spec_ref escapes the results root"
+    return True, None
+
+
 def _materialize_spec_problems(spec, request):
     """Bind one materialize spec to the request. Strategy semantics stay outside."""
     if not isinstance(spec, dict):
@@ -1805,6 +2046,11 @@ def _materialize_spec_problems(spec, request):
         problems.append("spec strategy.window_start_utc does not match the approved window")
     if strategy.get("window_end_utc_inclusive") != window["end_utc_inclusive"]:
         problems.append("spec strategy.window_end_utc_inclusive does not match the approved window")
+    phase = spec.get("phase")
+    if phase not in PHASES:
+        problems.append("spec phase is not one of " + ", ".join(PHASES))
+    elif phase != request["phase"]:
+        problems.append("spec phase does not match the requested phase")
     sides = strategy.get("sides")
     if not isinstance(sides, list) or not sides or [s for s in sides if not isinstance(s, str) or not s]:
         problems.append("spec strategy.sides is not a declared side list")
@@ -1920,10 +2166,24 @@ def _materialize_receipt(request, spec, spec_sha256, manifest, manifest_sha256):
 
 
 def _write_receipt(root, receipt):
-    """Write one receipt deterministically. Return True on success."""
+    """Create one receipt exclusively. Return True on success.
+
+    ``O_CREAT|O_EXCL`` refuses every pre-existing path, including a symlink and
+    a dangling symlink, and ``O_NOFOLLOW`` never resolves a target. A receipt
+    therefore cannot overwrite a file this root does not own.
+    """
+    path = Path(root) / MATERIALIZE_RECEIPT
+    payload = (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
-        (Path(root) / MATERIALIZE_RECEIPT).write_text(
-            json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        handle = os.open(str(path), flags, 0o600)
+    except OSError:
+        return False
+    try:
+        with os.fdopen(handle, "wb") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
     except OSError:
         return False
     return True
@@ -1974,9 +2234,8 @@ def _materialize_existing(request, spec, spec_sha256):
         return fail("materialized campaign manifest identity is invalid")
     receipt = _materialize_receipt(request, spec, spec_sha256, manifest, manifest_sha256)
     payload = (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    try:
-        stored = (Path(request["root"]) / MATERIALIZE_RECEIPT).read_bytes()
-    except OSError:
+    stored, _why = _regular_file_bytes(str(Path(request["root"]) / MATERIALIZE_RECEIPT))
+    if stored is None:
         return fail("refuse overwrite: the existing materialization carries no receipt, and a "
                     "receipt is never reconstructed from a later spec")
     if stored != payload:
@@ -2000,12 +2259,27 @@ def cmd_materialize(payload_b64):
     for key in ("spec_ref", "root"):
         if not under_root(request[key], root):
             return fail(key + " escapes the results root")
+    # Every request-only constraint is checked before the spec is read, so an
+    # absent spec can never hide a wrong runtime or an unsafe path.
+    if is_fixed_runtime() and request["qlib_runtime_commit"] != FIXED_RUNTIME_COMMIT:
+        return fail("config/runtime identity mismatch")
+    spec_ref = Path(request["spec_ref"])
     try:
-        spec_bytes = Path(request["spec_ref"]).read_bytes()
-    except OSError:
+        spec_info = os.lstat(str(spec_ref))
+    except FileNotFoundError:
+        parent_ok, why = _absent_spec_parent(spec_ref, root)
+        if not parent_ok:
+            return fail(str(why))
         return implementation_needed(
             "MATERIALIZE_SPEC_MISSING: no approved materialize spec exists at the requested "
             "path; the existing engineering flow must produce it")
+    except OSError:
+        return fail("the materialize spec is not readable")
+    if not stat.S_ISREG(spec_info.st_mode):
+        return fail("the materialize spec is not a regular file")
+    spec_bytes, _why = _regular_file_bytes(str(spec_ref))
+    if spec_bytes is None:
+        return fail("the materialize spec is not readable")
     try:
         spec = json.loads(spec_bytes.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
@@ -2033,6 +2307,19 @@ def cmd_materialize(payload_b64):
     manifest_path = cells_root / MANIFEST_NAME
     if manifest_path.exists():
         return _materialize_existing(request, spec, spec_sha256)
+    # A receipt path that exists without a completed manifest/receipt pair is
+    # foreign state: a symlink, a dangling link or an attacker's file. Reject it
+    # before this run creates anything, because a receipt is only ever created
+    # exclusively by _write_receipt.
+    try:
+        os.lstat(str(cells_root / MATERIALIZE_RECEIPT))
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return fail("the materialization root is not readable")
+    else:
+        return fail("refuse overwrite: the materialization root already carries "
+                    + MATERIALIZE_RECEIPT + " without a completed materialization")
     try:
         cells_root.mkdir(parents=True, exist_ok=True)
     except OSError:

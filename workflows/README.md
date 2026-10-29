@@ -140,9 +140,26 @@ fields plus `manifest_ref`, `manifest_sha256`, `cell_count`, `window` (with
 
 This read is not the per-run `manifest.json`. A run manifest is a sha map with no
 schema, and a run directory has no campaign manifest at all, so neither can pass
-here. `phase_binding` is filled only when a verified `materialize-receipt.json` in
-the same root binds that exact `manifest_sha256`; otherwise it is `null` with
-`phase_bound: false` and the caller holds. Zero writes, no child process.
+here. `phase_binding` is filled only when a `materialize-receipt.json` in the same
+root verifies against evidence this file reads for itself:
+
+* the receipt is a regular file inside the campaign root, its `schema` is
+  `qlib-n8n-materialize-receipt-v1`, and it binds this exact `manifest_sha256`,
+  this manifest ref and this `cell_count`;
+* the `spec_ref` it names still exists as a regular contained file and its current
+  bytes hash to the receipt's `spec_sha256`, and the manifest's own `generated_from`
+  names that same spec;
+* the spec's candidate, runtime commit, window, artifact source and `cells_dir`
+  agree with the receipt and with every verified cell, and the artifact bytes hash
+  to the receipt's `strategy_artifact.sha256`;
+* the receipt's `runtime` block equals the runtime the spec declares, and inside
+  the fixed runtime it equals the pinned commit, image and digest;
+* the receipt's `cell_ids`, `cell_ids_sha256` and `cell_evidence_sha256` equal the
+  values recomputed from the verified cells.
+
+A missing receipt is an unbound answer (`null`, `phase_bound: false`) and the caller
+holds. A present receipt that does not verify is contradictory evidence and exits 2;
+it never silently downgrades to unbound. Zero writes, no child process.
 
 The caller supplies the evidence root, but nothing inside it is trusted: every
 digest is recomputed, so a foreign root can only produce verified facts about its
@@ -155,8 +172,9 @@ After every existing manifest/hash/readback check, `research-readback` adds one
 and it never fills in a value the native run did not write:
 
 * `phase`, `phase_source`, `phase_bound`, `feeds_research`, `oos_isolated` — the
-  phase comes only from a verified materialize receipt bound to this run's frozen
-  config, so an unbound run reports `phase: null` and the caller holds;
+  phase comes only from a materialize receipt that verifies against this run's
+  frozen config **and** the approved spec bytes the receipt binds, so an unbound run
+  reports `phase: null` and the caller holds, and a tampered receipt exits 2;
 * `window` — the approved start/end from the hash-verified effective config, the
   native evaluation start/end from `summary.json`, `native_inside_approved`, and the
   approved window `identity_sha256`;
@@ -195,19 +213,27 @@ existing materializer and never carries strategy semantics:
 Every path (`spec_ref`, `root`, the spec's `materialize.cells_dir`,
 `materialize.results_root` and the declared artifact source) must stay inside the
 resolved results root, and `root` must equal the spec's `cells_dir`. The spec must
-carry exactly that candidate, runtime commit, window and artifact sha256; a declared
-side outside the verified `long` primitive is an `ENGINEERING_HOLD`. The only child
-process is:
+carry exactly that candidate, runtime commit, window, **approved `phase`** and
+artifact sha256; a declared side outside the verified `long` primitive is an
+`ENGINEERING_HOLD`. The approved phase is a property of the approved spec, not of the
+request alone: the request phase must equal `spec.phase`, and the receipt records
+that spec-bound phase. The only child process is:
 
     <fixed runtime python> -m qlib.backtest.research_cell materialize --spec <validated> --root <validated>
 
 No arbitrary argv, no shell, no `--force`. After the child, the transport verifies
 the campaign manifest the Qlib run wrote (schema, per-cell digests recomputed,
-per-cell candidate/runtime/window/artifact binding) and writes one deterministic
+per-cell candidate/runtime/window/artifact binding) and creates one deterministic
 `materialize-receipt.json` in the cells root binding the request identity, runtime
 commit/image/digest, spec sha256, artifact sha256, root, phase, window and window
 identity, and the campaign manifest ref/sha256/cell count plus `cell_ids_sha256` and
 `cell_evidence_sha256`.
+
+The receipt is created with `O_CREAT|O_EXCL|O_NOFOLLOW` and mode `0600`. It never
+follows an existing path and never replaces one. A pre-existing
+`materialize-receipt.json` without a completed manifest/receipt pair is refused
+before the materializer starts, so a symlink, a dangling symlink or a foreign file in
+the cells root cannot redirect a write outside the results root.
 
 An existing root converges only through that receipt: the same request returns the
 same receipt and `state: "existing"`. A different spec, a different phase, a root
@@ -217,11 +243,17 @@ cannot be retroactively bound to older cells. Concurrency uses one
 `O_CREAT|O_EXCL` lock with a bounded wait and then converges by re-verification; a
 still-held lock is a typed refusal.
 
-An absent approved spec is an expected answer, not a transport failure: the verb
-prints `{"ok": true, "status": "implementation_needed", "reason":
-"MATERIALIZE_SPEC_MISSING: ..."}` and exits 0, exactly like `research-handoff`. A
-malformed spec, a mismatched identity, an unsafe path or a runtime mismatch still
-exits 2. **Residual capability boundary:** this PR adds no engineering verb, no
+Every request-only constraint is checked before the spec is read: the fixed-runtime
+commit identity, the phase and window shape, the candidate/source identity shape, the
+results-root containment, and the `spec_ref` path type. A `spec_ref` that is a
+directory, a symlink or an escaping path exits 2, and so does a known runtime
+mismatch, even when no spec exists. An absent approved spec is an expected answer,
+not a transport failure: the verb prints `{"ok": true, "status":
+"implementation_needed", "reason": "MATERIALIZE_SPEC_MISSING: ..."}` and exits 0,
+exactly like `research-handoff`, but only when the absent path is a regular-file path
+in a real directory inside the results root and every other request constraint is
+valid. A malformed spec, a mismatched identity, an unsafe path or a runtime mismatch
+still exits 2. **Residual capability boundary:** this PR adds no engineering verb, no
 Markdown-to-Qlib compiler and no agent shell, so a candidate whose approved
 spec/artifact does not exist yet cannot materialize itself; that still requires the
 existing Hermes/Kanban engineering flow to produce the spec and the artifact.
