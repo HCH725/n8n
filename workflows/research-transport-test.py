@@ -367,6 +367,105 @@ def run_forced(forced_command, root):
     return proc.returncode, proc.stdout.strip()
 
 
+FAKE_KANBAN_CLI = '''#!__PYTHON__
+"""Test-only stand-in for `hermes kanban create|show`. No board, no network."""
+
+import hashlib
+import json
+import os
+import sys
+
+STORE = os.environ["FAKE_KANBAN_STORE"]
+
+
+def load():
+    if not os.path.exists(STORE):
+        return {"tasks": {}, "runs": {}, "calls": [], "idem": {}}
+    with open(STORE, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def save(store):
+    with open(STORE, "w", encoding="utf-8") as handle:
+        json.dump(store, handle, indent=2, sort_keys=True)
+
+
+def parse_flags(args):
+    flags, index = {}, 1
+    while index < len(args):
+        key = args[index]
+        if key == "--json":
+            index += 1
+            continue
+        value = args[index + 1] if index + 1 < len(args) else None
+        if key == "--body-file":
+            flags["body"] = sys.stdin.read() if value == "-" else ""
+        else:
+            flags[key.lstrip("-").replace("-", "_")] = value
+        index += 2
+    return flags
+
+
+def main(argv):
+    if argv[:1] != ["kanban"]:
+        print("fake: expected the kanban group", file=sys.stderr)
+        return 2
+    store = load()
+    store["calls"].append(list(argv))
+    rest = argv[1:]
+    board = None
+    if rest[:1] == ["--board"]:
+        board, rest = rest[1], rest[2:]
+    verb, args = rest[0], rest[1:]
+    if verb == "create":
+        flags = parse_flags(args)
+        key = flags.get("idempotency_key")
+        task_id = store["idem"].get(key)
+        if task_id is None or store["tasks"].get(task_id, {}).get("status") == "archived":
+            digest = hashlib.sha256((key or args[0]).encode("utf-8")).hexdigest()[:8]
+            task_id = "t_" + digest
+            workspace = flags.get("workspace") or ""
+            store["tasks"][task_id] = {
+                "id": task_id,
+                "title": args[0],
+                "body": flags.get("body"),
+                "assignee": flags.get("assignee"),
+                "status": "ready",
+                "workspace_kind": workspace.split(":", 1)[0],
+                "workspace_path": workspace.split(":", 1)[-1],
+                "created_by": flags.get("created_by"),
+                "max_runtime_seconds": int(flags.get("max_runtime") or 0),
+                "model_override": None,
+                "provider_override": None,
+                "completion_contract": flags.get("completion_contract"),
+                "last_failure_error": None,
+                "board": board,
+            }
+            store["runs"][task_id] = []
+            if key:
+                store["idem"][key] = task_id
+        task = store["tasks"][task_id]
+        save(store)
+        print(json.dumps(task))
+        return 0
+    if verb == "show":
+        task_id = args[0]
+        task = store["tasks"].get(task_id)
+        if task is None:
+            print("kanban: unknown task " + task_id, file=sys.stderr)
+            return 1
+        save(store)
+        print(json.dumps({"task": task, "runs": store["runs"].get(task_id, [])}))
+        return 0
+    print("kanban: unsupported verb " + verb, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+'''
+
+
 def main():
     tmp = Path(tempfile.mkdtemp(prefix="transport-test-"))
     entry, config = write_stub_files(tmp)
@@ -1796,6 +1895,521 @@ def main():
                           env=env, capture_output=True, text=True, timeout=120)
     check("T23b the zero-trade claimability guard is load-bearing",
           proc.returncode == 0, proc.stdout.strip())
+
+    # T27 bounded Kanban engineering adapter. Hermes-key only, host workspace,
+    # guest spec paths, fixed board, no shell. The fake CLI is a local process:
+    # the test never touches the live board.
+    eng = Path(tempfile.mkdtemp(prefix="transport-engineering-"))
+    backing = eng / "results"
+    backing.mkdir()
+    host_root = Path(os.path.realpath(str(backing))) / "production"
+    fake_cli = eng / "fake-hermes"
+    fake_cli.write_text(FAKE_KANBAN_CLI.replace("__PYTHON__", sys.executable))
+    fake_cli.chmod(0o755)
+    store_path = eng / "kanban-store.json"
+    guest_root = _t.GUEST_RESULTS_ROOT
+
+    def eng_env(**over):
+        env = dict(os.environ, RESEARCH_HOST_RESULTS_SOURCE=str(backing),
+                   RESEARCH_HERMES_CLI=str(fake_cli), FAKE_KANBAN_STORE=str(store_path))
+        env.pop("RESEARCH_RESULTS_ROOT", None)
+        env.update(over)
+        return env
+
+    def eng_forced(command, env=None):
+        env = dict(env or eng_env(), SSH_ORIGINAL_COMMAND=command)
+        proc = subprocess.run([sys.executable, str(TRANSPORT), "hermes-forced"], env=env,
+                              capture_output=True, text=True, timeout=120)
+        return proc.returncode, proc.stdout.strip()
+
+    def eng_create(request, env=None):
+        return eng_forced("research-engineering-create " + b64(request), env)
+
+    def eng_read(payload, env=None):
+        return eng_forced("research-engineering-read " + b64(payload), env)
+
+    def read_store():
+        if not store_path.exists():
+            return {"tasks": {}, "runs": {}, "calls": [], "idem": {}}
+        return json.loads(store_path.read_text())
+
+    def write_store(data):
+        store_path.write_text(json.dumps(data))
+
+    def engineering_request():
+        return {
+            "request": "engineering-task-v1",
+            "source_commit": "b" * 40,
+            "candidate_path": "demo-candidate.md",
+            "source_blob_sha": "a" * 40,
+            "family_id": "dca-btcusdt-1h",
+            "round_index": 1,
+            "phase": "IS_RETEST",
+            "window": {"start_utc": "2025-01-01 00:00:00",
+                       "end_utc_inclusive": "2025-12-31 00:00:00"},
+            "spec_seed": {
+                "candidate": {"path": "demo-candidate.md", "source_commit": "b" * 40,
+                              "git_blob_sha": "a" * 40},
+                "runtime": {"commit": _t.FIXED_RUNTIME_COMMIT, "image": _t.FIXED_IMAGE,
+                            "image_digest": _t.FIXED_IMAGE_DIGEST},
+                "data": {"provider_ref": guest_root + "/provider"},
+                "strategy": {"sides": ["long"], "params": {"entry_len": 5}, "warmup_days": 5},
+                "house_overlay": {"base_order_quote_pct": 0.06, "safety_order_quote_pct": 0.06,
+                                  "safety_order_levels": 2, "so_spacing_pct": 0.04,
+                                  "take_profit_pct": 0.05, "stop_loss_pct": None,
+                                  "trade_cost": 0.0004, "initial_capital_quote": 100000.0},
+                "research_cost_model": {"fees_per_side": 0.0004, "slippage": 0.0,
+                                        "funding": "not_modeled", "approved": False},
+            },
+            "change_set": {"hypothesis": "widen the entry window", "ref": "cs-001"},
+        }
+
+    def eng_with(path, value):
+        request = json.loads(json.dumps(engineering_request()))
+        block = request
+        keys = path.split(".")
+        for key in keys[:-1]:
+            block = block[key]
+        block[keys[-1]] = value
+        return request
+
+    def host_leaf(request):
+        return host_root / "engineering" / _t.engineering_hash(request)
+
+    def guest_leaf(request):
+        return guest_root + "/engineering/" + _t.engineering_hash(request)
+
+    def write_completion(request, task_id, leaf,
+                         artifact_text="def signal(**kwargs):\n    return [], None\n"):
+        leaf.mkdir(parents=True, exist_ok=True)
+        artifact = leaf / _t.ENGINEERING_ARTIFACT_NAME
+        artifact.write_text(artifact_text)
+        spec_path = leaf / _t.ENGINEERING_SPEC_NAME
+        spec_path.write_text(json.dumps(_t.engineering_spec(request, _t.engineering_hash(request)),
+                                        indent=2, sort_keys=True) + "\n")
+        result = {
+            "schema": _t.ENGINEERING_RESULT_SCHEMA,
+            "request_hash": _t.engineering_hash(request),
+            "task_id": task_id,
+            "candidate": {"path": request["candidate_path"],
+                          "source_commit": request["source_commit"],
+                          "git_blob_sha": request["source_blob_sha"],
+                          "family_id": request["family_id"]},
+            "phase": request["phase"],
+            "round_index": request["round_index"],
+            "strategy_artifact": {"ref": _t.ENGINEERING_ARTIFACT_NAME, "sha256": sha(artifact)},
+            "materialize_spec": {"ref": _t.ENGINEERING_SPEC_NAME, "sha256": sha(spec_path)},
+            "status": "complete",
+        }
+        (leaf / _t.ENGINEERING_RESULT_NAME).write_text(
+            json.dumps(result, indent=2, sort_keys=True) + "\n")
+
+    # The parser is the trust boundary: the Hermes key takes the two new verbs,
+    # the Qlib key and the container forwarder take neither.
+    seed_payload = b64(engineering_request())
+    check("T27a the Hermes key accepts the two bounded engineering verbs",
+          _t.parse_forced_command("research-engineering-create " + seed_payload, hermes=True)
+          == ((_t.ENGINEERING_CREATE_VERB, seed_payload), None)
+          and _t.parse_forced_command("research-engineering-read " + seed_payload, hermes=True)
+          == ((_t.ENGINEERING_READ_VERB, seed_payload), None))
+    check("T27b the Qlib key and the forwarder reject both engineering verbs",
+          _t.parse_forced_command("research-engineering-create " + seed_payload)[0] is None
+          and _t.parse_forced_command("research-engineering-read " + seed_payload)[0] is None
+          and _t.build_forward_command(_t.ENGINEERING_CREATE_VERB, seed_payload) is None
+          and _t.build_forward_command(_t.ENGINEERING_READ_VERB, seed_payload) is None)
+    check("T27c shell chaining and extra tokens are rejected for the new verbs",
+          _t.parse_forced_command("research-engineering-create " + seed_payload + "; touch evil",
+                                  hermes=True)[0] is None
+          and _t.parse_forced_command("cd / ; research-engineering-create " + seed_payload + " extra",
+                                      hermes=True)[0] is None
+          and _t.parse_forced_command("research-engineering-create " + seed_payload
+                                      + " --board default", hermes=True)[0] is None
+          and _t.parse_forced_command("research-engineering-create " + seed_payload + " | tee x",
+                                      hermes=True)[0] is None)
+    check("T27d research-hermes and research-handoff are unchanged",
+          _t.parse_forced_command("research-hermes " + seed_payload, hermes=True)
+          == ((_t.HERMES_VERB, seed_payload), None)
+          and _t.parse_forced_command("research-handoff " + seed_payload, hermes=True)
+          == ((_t.HANDOFF_VERB, seed_payload), None))
+    check("T27e the Qlib forced verb set is unchanged",
+          set(_t.FORCED_VERBS) == {"research-submit", "research-readback", "research-materialize"},
+          str(_t.FORCED_VERBS))
+
+    for label, raw in (
+        ("malformed base64", "!!!!"),
+        ("malformed JSON", base64.b64encode(b"{").decode()),
+        ("a non-object payload", b64([1, 2, 3])),
+        ("an unknown field", b64(dict(engineering_request(), board="default"))),
+        ("a missing field", b64({k: v for k, v in engineering_request().items()
+                                 if k != "family_id"})),
+    ):
+        rc, out = eng_forced("research-engineering-create " + raw)
+        check("T27f create rejects " + label, rc == 2 and '"ok": false' in out, out)
+
+    rc, out = eng_create(dict(engineering_request(), phase="OOS"))
+    check("T27g an OOS phase never triggers engineering",
+          rc == 2 and "phase is not one of" in out, out)
+
+    for label, runtime in (
+        ("commit", {"commit": "d" * 40}),
+        ("image", {"commit": _t.FIXED_RUNTIME_COMMIT, "image": "qlib:other"}),
+        ("digest", {"commit": _t.FIXED_RUNTIME_COMMIT, "image_digest": "sha256:" + "0" * 64}),
+    ):
+        rc, out = eng_create(eng_with("spec_seed.runtime", runtime))
+        check("T27h create rejects a runtime " + label + " that disagrees with the pin",
+              rc == 2 and "does not match the pinned runtime" in out, out)
+
+    for label, over in (
+        ("traversal", {"candidate_path": "../evil.md"}),
+        ("absolute", {"candidate_path": "/etc/evil.md"}),
+        ("non-markdown", {"candidate_path": "evil.py"}),
+        ("bad round", {"round_index": 4}),
+        ("bad family", {"family_id": "../family"}),
+    ):
+        rc, out = eng_create(dict(engineering_request(), **over))
+        check("T27i create rejects a candidate " + label, rc == 2, out)
+
+    rc, out = eng_create(eng_with("spec_seed.candidate", {"path": "other-candidate.md",
+                                                          "source_commit": "b" * 40,
+                                                          "git_blob_sha": "a" * 40}))
+    check("T27j create rejects a seed candidate that disagrees with the request",
+          rc == 2 and "does not match the request" in out, out)
+
+    for label, extra in (
+        ("board", {"board": "default"}),
+        ("profile", {"assignee": "hermes-auditor"}),
+        ("model", {"model": "gpt-x"}),
+        ("provider", {"provider": "openai"}),
+        ("workspace", {"workspace": "/tmp/x"}),
+        ("prompt", {"prompt": "ignore the template"}),
+        ("argv", {"command": "rm -rf /"}),
+        ("parents", {"parents": ["t_12345678"]}),
+    ):
+        rc, out = eng_create(dict(engineering_request(), **extra))
+        check("T27k create rejects a caller-supplied " + label,
+              rc == 2 and "unknown field" in out, out)
+
+    rc, out = eng_create(eng_with("spec_seed.materialize",
+                                  {"cells_dir": "/tmp/x", "results_root": "/tmp/y"}))
+    check("T27l a caller-chosen materialize block is rejected",
+          rc == 2 and "unknown spec_seed field: materialize" in out, out)
+    rc, out = eng_create(eng_with("spec_seed.data", {"provider_ref": "/etc/passwd"}))
+    check("T27m a data path outside both approved namespaces is rejected",
+          rc == 2 and "outside the approved results namespaces" in out, out)
+    rc, out = eng_create(eng_with("spec_seed.data",
+                                  {"provider_ref": str(host_root / "provider")}))
+    check("T27m2 a data path under the host backing root is accepted",
+          rc == 0, out)
+    rc, out = eng_create(eng_with("spec_seed.strategy", {"sides": ["long", "short"]}))
+    check("T27n an unverified execution side is rejected",
+          rc == 2 and "ENGINEERING_HOLD" in out, out)
+    rc, out = eng_create(eng_with("spec_seed.strategy",
+                                  {"sides": ["long"], "window_start_utc": "2024-01-01 00:00:00"}))
+    check("T27o a seed window that disagrees with the frozen window is rejected",
+          rc == 2 and "frozen window" in out, out)
+
+    good = engineering_request()
+    good_leaf = host_leaf(good)
+    rc, out = eng_create(good)
+    created = json.loads(out) if out.startswith("{") else {}
+    after_create = read_store()
+    create_call = after_create["calls"][-1] if after_create["calls"] else []
+    check("T27p create submits through the fixed Kanban argv only",
+          rc == 0 and created.get("status") == "submitted"
+          and create_call[:4] == ["kanban", "--board", "quant-strategy-research", "create"]
+          and create_call[4] == _t.engineering_title(good, created.get("request_hash"))
+          and "--body-file" in create_call and "-" in create_call
+          and create_call[create_call.index("--assignee") + 1] == "default"
+          and create_call[create_call.index("--workspace") + 1] == "dir:" + str(good_leaf)
+          and create_call[create_call.index("--idempotency-key") + 1]
+          == created.get("idempotency_key")
+          and create_call[create_call.index("--max-runtime") + 1] == str(_t.ENGINEERING_MAX_RUNTIME)
+          and create_call[create_call.index("--created-by") + 1] == _t.ENGINEERING_CREATED_BY
+          and create_call[create_call.index("--completion-contract") + 1] == "local-only"
+          and not any(flag in create_call for flag in
+                      ("--model", "--provider", "--parent", "--skill", "--project")),
+          str(create_call))
+    task = after_create["tasks"][created["task_id"]]
+    check("T27q the task is bounded to the derived host workspace and the fixed board",
+          task["assignee"] == "default" and task["workspace_kind"] == "dir"
+          and task["workspace_path"] == str(good_leaf)
+          and task["created_by"] == _t.ENGINEERING_CREATED_BY
+          and task["max_runtime_seconds"] == _t.ENGINEERING_MAX_RUNTIME
+          and task["completion_contract"] == "local-only"
+          and task["model_override"] is None and task["provider_override"] is None
+          and task["board"] == "quant-strategy-research", str(task))
+    check("T27r the body is the fixed template plus escaped DATA",
+          task["body"] == _t.engineering_task_body(good, created["request_hash"], str(host_root))
+          and "Do not run OOS" in task["body"]
+          and "strategy-artifact.py" in task["body"]
+          and guest_leaf(good) in task["body"], task["body"][:200])
+    check("T27s create writes only the derived leaf workspace",
+          good_leaf.is_dir() and list(good_leaf.iterdir()) == []
+          and all(len(name) == 64 and set(name) <= set("0123456789abcdef")
+                  for name in (entry.name for entry in (host_root / "engineering").iterdir())),
+          str([entry.name for entry in (host_root / "engineering").iterdir()]))
+
+    before_repeat = read_store()
+    rc, out = eng_create(good)
+    again = json.loads(out) if out.startswith("{") else {}
+    after_repeat = read_store()
+    check("T27t a repeated create converges on the same task and workspace",
+          rc == 0 and again.get("task_id") == created.get("task_id")
+          and again.get("request_hash") == created.get("request_hash")
+          and len(after_repeat["tasks"]) == len(before_repeat["tasks"]), str(again))
+
+    outside = Path(tempfile.mkdtemp(prefix="transport-engineering-outside-"))
+    link_request = engineering_request()
+    link_request["family_id"] = "link-case"
+    link_leaf = host_leaf(link_request)
+    link_leaf.parent.mkdir(parents=True, exist_ok=True)
+    link_leaf.symlink_to(outside)
+    rc, out = eng_create(link_request)
+    check("T27u a symlinked leaf workspace fails closed without an outside write",
+          rc == 2 and "not a real directory" in out and not list(outside.iterdir()), out)
+
+    dangling = Path(tempfile.mkdtemp(prefix="transport-engineering-dangling-"))
+    (dangling / "results").mkdir()
+    (dangling / "results" / "production").mkdir()
+    (dangling / "results" / "production" / "engineering").symlink_to(dangling / "missing")
+    rc, out = eng_create(engineering_request(),
+                         env=eng_env(RESEARCH_HOST_RESULTS_SOURCE=str(dangling / "results")))
+    check("T27v a dangling engineering-root symlink fails closed",
+          rc == 2 and "not a real directory" in out and not (dangling / "missing").exists(), out)
+
+    rc, out = eng_create(good, env=eng_env(RESEARCH_HERMES_CLI=str(eng / "not-executable")))
+    check("T27w an unusable CLI override fails closed instead of using the live board",
+          rc == 2 and "Hermes CLI is not available" in out, out)
+
+    read_payload = {"request": "engineering-read-v1", "engineering": good,
+                    "task_id": created["task_id"]}
+    rc, out = eng_read(read_payload)
+    state = json.loads(out) if out.startswith("{") else {}
+    check("T27x a ready task reads as typed pending, never ready",
+          rc == 0 and state.get("ready") is False and state.get("status") == "pending"
+          and state.get("task_id") == created["task_id"]
+          and state.get("workspace") == str(good_leaf), out)
+
+    data = read_store()
+    data["tasks"][created["task_id"]]["status"] = "blocked"
+    data["tasks"][created["task_id"]]["last_failure_error"] = "worker stopped"
+    write_store(data)
+    rc, out = eng_read(read_payload)
+    state = json.loads(out) if out.startswith("{") else {}
+    check("T27y a blocked task reads as typed blocked",
+          rc == 0 and state.get("status") == "blocked" and state.get("ready") is False
+          and "worker stopped" in str(state.get("reason")), out)
+    data["tasks"][created["task_id"]]["status"] = "archived"
+    write_store(data)
+    rc, out = eng_read(read_payload)
+    state = json.loads(out) if out.startswith("{") else {}
+    check("T27y2 an archived task reads as typed failed",
+          rc == 0 and state.get("status") == "failed" and state.get("ready") is False, out)
+    data["tasks"][created["task_id"]]["status"] = "running"
+    data["runs"][created["task_id"]] = [{"id": 1, "status": "running",
+                                         "started_at": 1, "ended_at": None}]
+    write_store(data)
+    rc, out = eng_read(read_payload)
+    state = json.loads(out) if out.startswith("{") else {}
+    check("T27y3 a running task past its bounded runtime reads as typed timeout",
+          rc == 0 and state.get("status") == "timeout" and state.get("ready") is False, out)
+
+    data["tasks"][created["task_id"]]["status"] = "done"
+    data["tasks"][created["task_id"]]["workspace_path"] = str(outside)
+    write_store(data)
+    rc, out = eng_read(read_payload)
+    check("T27z a task whose workspace is not the derived one fails closed",
+          rc == 2 and "derived workspace" in out, out)
+    data["tasks"][created["task_id"]]["workspace_path"] = str(good_leaf)
+    data["tasks"][created["task_id"]]["created_by"] = "someone-else"
+    write_store(data)
+    rc, out = eng_read(read_payload)
+    check("T27z2 a task created by another author fails closed",
+          rc == 2 and "not created by this adapter" in out, out)
+    data["tasks"][created["task_id"]]["created_by"] = _t.ENGINEERING_CREATED_BY
+    write_store(data)
+    other = engineering_request()
+    other["family_id"] = "other-family"
+    rc, out = eng_read({"request": "engineering-read-v1", "engineering": other,
+                        "task_id": created["task_id"]})
+    check("T27z3 a task id from another request fails closed",
+          rc == 2 and "does not match" in out, out)
+
+    for label, payload in (
+        ("a foreign request kind", {"request": "engineering-task-v1", "engineering": good,
+                                    "task_id": created["task_id"]}),
+        ("a bad task id", {"request": "engineering-read-v1", "engineering": good,
+                           "task_id": "../../etc/passwd"}),
+        ("an extra field", {"request": "engineering-read-v1", "engineering": good,
+                            "task_id": created["task_id"], "board": "default"}),
+        ("a missing task id", {"request": "engineering-read-v1", "engineering": good}),
+    ):
+        rc, out = eng_read(payload)
+        check("T27aa read rejects " + label, rc == 2, out)
+
+    rc, out = eng_read(read_payload, env=eng_env(FAKE_KANBAN_STORE=str(eng / "empty-store.json")))
+    check("T27ab an unknown task id fails closed", rc == 2 and "Kanban call failed" in out, out)
+
+    rc, out = eng_read(read_payload)
+    check("T27ac a done task without engineering-result.json fails closed",
+          rc == 2 and "engineering-result.json" in out, out)
+
+    write_completion(good, created["task_id"], good_leaf)
+    rc, out = eng_read(read_payload)
+    ready = json.loads(out) if out.startswith("{") else {}
+    check("T27ad a valid isolated completion becomes ready with exact verified refs",
+          rc == 0 and ready.get("ready") is True and ready.get("status") == "done"
+          and ready.get("spec_ref") == guest_leaf(good) + "/" + _t.ENGINEERING_SPEC_NAME
+          and ready.get("spec_sha256") == sha(good_leaf / _t.ENGINEERING_SPEC_NAME)
+          and ready.get("strategy_artifact_ref")
+          == guest_leaf(good) + "/" + _t.ENGINEERING_ARTIFACT_NAME
+          and ready.get("strategy_artifact_sha256")
+          == sha(good_leaf / _t.ENGINEERING_ARTIFACT_NAME)
+          and ready.get("cells_root") == guest_leaf(good) + "/" + _t.ENGINEERING_FROZEN_NAME
+          and ready.get("results_root") == guest_root
+          and ready.get("request_hash") == _t.engineering_hash(good), out)
+    check("T27ae the verified refs are guest paths for research-materialize",
+          str(ready.get("spec_ref", "")).startswith("/results/")
+          and str(ready.get("strategy_artifact_ref", "")).startswith("/results/")
+          and str(ready.get("workspace", "")).startswith(str(host_root)), str(ready))
+
+    derived = _t.engineering_spec(good, _t.engineering_hash(good))
+    check("T27ae2 the derived cells root is a dedicated empty child, not the workspace",
+          derived["materialize"]["cells_dir"]
+          == guest_leaf(good) + "/" + _t.ENGINEERING_FROZEN_NAME
+          and derived["materialize"]["cells_dir"] != guest_leaf(good)
+          and derived["materialize"]["results_root"] == guest_root
+          and derived["strategy_artifact"]["source"]
+          == guest_leaf(good) + "/" + _t.ENGINEERING_ARTIFACT_NAME, str(derived["materialize"]))
+
+    spec_path = good_leaf / _t.ENGINEERING_SPEC_NAME
+    result_path = good_leaf / _t.ENGINEERING_RESULT_NAME
+
+    def spec_case(label, mutate, expect):
+        write_completion(good, created["task_id"], good_leaf)
+        spec = json.loads(spec_path.read_text())
+        mutate(spec)
+        spec_path.write_text(json.dumps(spec, indent=2, sort_keys=True) + "\n")
+        result = json.loads(result_path.read_text())
+        result["materialize_spec"]["sha256"] = sha(spec_path)
+        result_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+        rc, out = eng_read(read_payload)
+        check("T27af " + label, rc == 2 and expect in out, out)
+        write_completion(good, created["task_id"], good_leaf)
+
+    spec_case("a changed spec window fails closed",
+              lambda spec: spec["strategy"].__setitem__("window_end_utc_inclusive",
+                                                        "2024-12-31 00:00:00"),
+              "window")
+    spec_case("a changed house overlay fails closed",
+              lambda spec: spec["house_overlay"].__setitem__("trade_cost", 0.01234),
+              "frozen request")
+    spec_case("a changed spec candidate fails closed",
+              lambda spec: spec["candidate"].__setitem__("path", "other-candidate.md"),
+              "candidate.path does not match the request")
+    spec_case("a changed spec runtime fails closed",
+              lambda spec: spec["runtime"].__setitem__("commit", "d" * 40),
+              "runtime.commit does not match the request")
+    spec_case("a cells root that is the workspace fails closed",
+              lambda spec: spec["materialize"].__setitem__("cells_dir", guest_leaf(good)),
+              "not the derived cells directory")
+    spec_case("a results root outside production fails closed",
+              lambda spec: spec["materialize"].__setitem__("results_root", "/results/other"),
+              "results_root is not the approved results root")
+    spec_case("an artifact source outside the workspace fails closed",
+              lambda spec: spec["strategy_artifact"].__setitem__(
+                  "source", guest_leaf(good) + "/other-artifact.py"),
+              "does not resolve to the verified artifact")
+    spec_case("an OOS spec phase fails closed",
+              lambda spec: spec.__setitem__("phase", "OOS"),
+              "phase")
+
+    write_completion(good, created["task_id"], good_leaf)
+    (good_leaf / _t.ENGINEERING_ARTIFACT_NAME).write_text("def signal(**kwargs):\n    return [], 0\n")
+    rc, out = eng_read(read_payload)
+    check("T27ag tampered artifact bytes fail closed",
+          rc == 2 and "bytes do not match" in out, out)
+
+    write_completion(good, created["task_id"], good_leaf)
+    result = json.loads(result_path.read_text())
+    result["request_hash"] = "0" * 64
+    result_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    rc, out = eng_read(read_payload)
+    check("T27ah a result that names another request fails closed",
+          rc == 2 and "request hash" in out, out)
+
+    write_completion(good, created["task_id"], good_leaf)
+    copy_path = eng / "artifact-copy.py"
+    copy_path.write_bytes((good_leaf / _t.ENGINEERING_ARTIFACT_NAME).read_bytes())
+    (good_leaf / _t.ENGINEERING_ARTIFACT_NAME).unlink()
+    (good_leaf / _t.ENGINEERING_ARTIFACT_NAME).symlink_to(copy_path)
+    rc, out = eng_read(read_payload)
+    check("T27ai a symlinked strategy artifact fails closed",
+          rc == 2 and "not a regular file" in out, out)
+    write_completion(good, created["task_id"], good_leaf)
+
+    # Fresh Start: the host backing root exists and ``production`` does not.
+    # Read must never create it, and one valid create builds only the
+    # deterministic chain.
+    fresh_backing = eng / "fresh-results"
+    fresh_backing.mkdir()
+    fresh_host_root = Path(os.path.realpath(str(fresh_backing))) / "production"
+    fresh_request = engineering_request()
+    fresh_request["family_id"] = "fresh-case"
+    fresh_hash = _t.engineering_hash(fresh_request)
+    fresh_leaf = fresh_host_root / "engineering" / fresh_hash
+    fresh_store = eng / "fresh-store.json"
+    fresh_store.write_text(json.dumps({
+        "tasks": {"t_0000beef": {
+            "id": "t_0000beef",
+            "title": _t.engineering_title(fresh_request, fresh_hash),
+            "body": _t.engineering_task_body(fresh_request, fresh_hash, str(fresh_host_root)),
+            "assignee": "default", "status": "done", "workspace_kind": "dir",
+            "workspace_path": str(fresh_leaf), "created_by": _t.ENGINEERING_CREATED_BY,
+            "max_runtime_seconds": _t.ENGINEERING_MAX_RUNTIME,
+            "model_override": None, "provider_override": None,
+            "completion_contract": "local-only", "last_failure_error": None,
+        }},
+        "runs": {"t_0000beef": []}, "calls": [], "idem": {},
+    }))
+    fresh_env = eng_env(RESEARCH_HOST_RESULTS_SOURCE=str(fresh_backing),
+                        FAKE_KANBAN_STORE=str(fresh_store))
+    rc, out = eng_read({"request": "engineering-read-v1", "engineering": fresh_request,
+                        "task_id": "t_0000beef"}, env=fresh_env)
+    check("T27ak read never creates the production chain",
+          rc == 2 and "does not exist" in out and list(fresh_backing.iterdir()) == [], out)
+    rc, out = eng_create(fresh_request, env=fresh_env)
+    check("T27al create builds only production/engineering/<hash> under an existing backing root",
+          rc == 0
+          and sorted(path.relative_to(fresh_backing).as_posix()
+                     for path in fresh_backing.rglob("*"))
+          == ["production", "production/engineering", "production/engineering/" + fresh_hash],
+          "%s %s" % (out, sorted(path.as_posix() for path in fresh_backing.rglob("*"))))
+
+    sym_backing = eng / "sym-results"
+    sym_backing.mkdir()
+    sym_target = Path(tempfile.mkdtemp(prefix="transport-engineering-production-target-"))
+    (sym_backing / "production").symlink_to(sym_target)
+    rc, out = eng_create(engineering_request(),
+                         env=eng_env(RESEARCH_HOST_RESULTS_SOURCE=str(sym_backing),
+                                     FAKE_KANBAN_STORE=str(eng / "sym-store.json")))
+    check("T27am a symlinked production root fails closed without an outside write",
+          rc == 2 and "not a real directory" in out and not list(sym_target.iterdir()), out)
+
+    with patch.dict(os.environ, eng_env()), \
+         patch.object(_t.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "{}", "")) as child, \
+         contextlib.redirect_stdout(io.StringIO()):
+        _t.cmd_engineering_create(b64(good))
+        create_argv = child.call_args[0][0]
+        _t.cmd_engineering_read(b64(read_payload))
+        read_argv = child.call_args[0][0]
+    check("T27aj create and read start only the fixed Kanban verbs",
+          create_argv == [str(fake_cli), "kanban", "--board", "quant-strategy-research",
+                          "create"] + create_argv[5:]
+          and create_argv[5] == _t.engineering_title(good, _t.engineering_hash(good))
+          and read_argv == [str(fake_cli), "kanban", "--board", "quant-strategy-research",
+                            "show", created["task_id"], "--json"],
+          "%s %s" % (create_argv, read_argv))
 
     print("%d checks passed" % len(CHECKS))
     print("ALL THIN CHECKS PASSED")
