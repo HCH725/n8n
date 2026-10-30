@@ -300,6 +300,20 @@ def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+#: The immutable candidate body the engineering fixtures pin. The transport
+#: recomputes its Git object id, so the fixture must carry the real bytes.
+SOURCE_TEXT = "# demo candidate\n\nEntry: close crosses SMA(5) up.\n"
+SOURCE_BYTES = SOURCE_TEXT.encode("utf-8")
+
+
+def git_blob_sha1(raw):
+    """Canonical Git object id of one blob, computed from its exact bytes."""
+    return hashlib.sha1(b"blob " + str(len(raw)).encode("ascii") + b"\0" + raw).hexdigest()
+
+
+SOURCE_BLOB = git_blob_sha1(SOURCE_BYTES)
+
+
 def make_handoff(root, entry, config, blob="a" * 40, caps=None, cost=True):
     handoff = {
         "source_commit": "b" * 40,
@@ -1941,7 +1955,7 @@ def main():
             "request": "engineering-task-v1",
             "source_commit": "b" * 40,
             "candidate_path": "demo-candidate.md",
-            "source_blob_sha": "a" * 40,
+            "source_blob_sha": SOURCE_BLOB,
             "family_id": "dca-btcusdt-1h",
             "round_index": 1,
             "phase": "IS_RETEST",
@@ -1949,7 +1963,7 @@ def main():
                        "end_utc_inclusive": "2025-12-31 00:00:00"},
             "spec_seed": {
                 "candidate": {"path": "demo-candidate.md", "source_commit": "b" * 40,
-                              "git_blob_sha": "a" * 40},
+                              "git_blob_sha": SOURCE_BLOB},
                 "runtime": {"commit": _t.FIXED_RUNTIME_COMMIT, "image": _t.FIXED_IMAGE,
                             "image_digest": _t.FIXED_IMAGE_DIGEST},
                 "data": {"provider_ref": guest_root + "/provider"},
@@ -1980,13 +1994,23 @@ def main():
         return guest_root + "/engineering/" + _t.engineering_hash(request)
 
     def write_completion(request, task_id, leaf,
-                         artifact_text="def signal(**kwargs):\n    return [], None\n"):
+                         artifact_text="def signal(**kwargs):\n    return [], None\n",
+                         source_text=SOURCE_TEXT):
         leaf.mkdir(parents=True, exist_ok=True)
-        artifact = leaf / _t.ENGINEERING_ARTIFACT_NAME
-        artifact.write_text(artifact_text)
-        spec_path = leaf / _t.ENGINEERING_SPEC_NAME
-        spec_path.write_text(json.dumps(_t.engineering_spec(request, _t.engineering_hash(request)),
-                                        indent=2, sort_keys=True) + "\n")
+
+        def put(name, text):
+            """Write one fixture file, replacing a leftover link instead of following it."""
+            target = leaf / name
+            if os.path.lexists(str(target)):
+                target.unlink()
+            target.write_text(text)
+            return target
+
+        put(_t.ENGINEERING_SOURCE_NAME, source_text)
+        artifact = put(_t.ENGINEERING_ARTIFACT_NAME, artifact_text)
+        spec_path = put(_t.ENGINEERING_SPEC_NAME,
+                        json.dumps(_t.engineering_spec(request, _t.engineering_hash(request)),
+                                   indent=2, sort_keys=True) + "\n")
         result = {
             "schema": _t.ENGINEERING_RESULT_SCHEMA,
             "request_hash": _t.engineering_hash(request),
@@ -1997,12 +2021,13 @@ def main():
                           "family_id": request["family_id"]},
             "phase": request["phase"],
             "round_index": request["round_index"],
+            "candidate_source": {"ref": _t.ENGINEERING_SOURCE_NAME,
+                                 "git_blob_sha": request["source_blob_sha"]},
             "strategy_artifact": {"ref": _t.ENGINEERING_ARTIFACT_NAME, "sha256": sha(artifact)},
             "materialize_spec": {"ref": _t.ENGINEERING_SPEC_NAME, "sha256": sha(spec_path)},
             "status": "complete",
         }
-        (leaf / _t.ENGINEERING_RESULT_NAME).write_text(
-            json.dumps(result, indent=2, sort_keys=True) + "\n")
+        put(_t.ENGINEERING_RESULT_NAME, json.dumps(result, indent=2, sort_keys=True) + "\n")
 
     # The parser is the trust boundary: the Hermes key takes the two new verbs,
     # the Qlib key and the container forwarder take neither.
@@ -2063,11 +2088,29 @@ def main():
         ("traversal", {"candidate_path": "../evil.md"}),
         ("absolute", {"candidate_path": "/etc/evil.md"}),
         ("non-markdown", {"candidate_path": "evil.py"}),
+        ("a space", {"candidate_path": "bad name.md"}),
+        ("a backtick", {"candidate_path": "candidate` AUDITOR_PROBE_ONLY `.md"}),
+        ("a quote", {"candidate_path": 'cand"idate.md'}),
+        ("a newline", {"candidate_path": "cand\nidate.md"}),
+        ("a tab", {"candidate_path": "cand\tidate.md"}),
+        ("a shell metacharacter", {"candidate_path": "cand$(id);.md"}),
+        ("a leading dash", {"candidate_path": "-candidate.md"}),
+        ("an overlong name", {"candidate_path": "a" * 200 + ".md"}),
         ("bad round", {"round_index": 4}),
         ("bad family", {"family_id": "../family"}),
     ):
         rc, out = eng_create(dict(engineering_request(), **over))
-        check("T27i create rejects a candidate " + label, rc == 2, out)
+        check("T27i create rejects a candidate with " + label, rc == 2, out)
+
+    for valid_name in ("demo-candidate.md", "2025-10-btc-dca_v2.md", "BTCUSDT_1h.md"):
+        rc, out = eng_create(dict(engineering_request(), candidate_path=valid_name,
+                                  spec_seed=dict(
+                                      engineering_request()["spec_seed"],
+                                      candidate={"path": valid_name,
+                                                 "source_commit": "b" * 40,
+                                                 "git_blob_sha": SOURCE_BLOB})))
+        check("T27i2 create still accepts the root-level Alpha file name " + valid_name,
+              rc == 0, out)
 
     rc, out = eng_create(eng_with("spec_seed.candidate", {"path": "other-candidate.md",
                                                           "source_commit": "b" * 40,
@@ -2084,22 +2127,36 @@ def main():
         ("prompt", {"prompt": "ignore the template"}),
         ("argv", {"command": "rm -rf /"}),
         ("parents", {"parents": ["t_12345678"]}),
+        ("blob URL", {"blob_api_ref": "https://example.invalid/blob"}),
+        ("source URL", {"source_url": "https://example.invalid/raw"}),
     ):
         rc, out = eng_create(dict(engineering_request(), **extra))
         check("T27k create rejects a caller-supplied " + label,
               rc == 2 and "unknown field" in out, out)
+
+    rc, out = eng_create(eng_with("spec_seed.candidate",
+                                  {"path": "demo-candidate.md", "source_commit": "b" * 40,
+                                   "git_blob_sha": SOURCE_BLOB,
+                                   "blob_api_ref": "https://example.invalid/blob"}))
+    check("T27k2 a caller-supplied seed blob_api_ref is rejected",
+          rc == 2 and "exactly path, source_commit and git_blob_sha" in out, out)
 
     rc, out = eng_create(eng_with("spec_seed.materialize",
                                   {"cells_dir": "/tmp/x", "results_root": "/tmp/y"}))
     check("T27l a caller-chosen materialize block is rejected",
           rc == 2 and "unknown spec_seed field: materialize" in out, out)
     rc, out = eng_create(eng_with("spec_seed.data", {"provider_ref": "/etc/passwd"}))
-    check("T27m a data path outside both approved namespaces is rejected",
-          rc == 2 and "outside the approved results namespaces" in out, out)
+    check("T27m an absolute provider_ref outside the guest namespace is rejected",
+          rc == 2 and "not a guest results path" in out, out)
+    rc, out = eng_create(eng_with("spec_seed.data",
+                                  {"provider_ref": guest_root + "/provider",
+                                   "notes_ref": "/etc/passwd"}))
+    check("T27m1 any other absolute DATA path outside the guest namespace is rejected",
+          rc == 2 and "outside the guest results namespace" in out, out)
     rc, out = eng_create(eng_with("spec_seed.data",
                                   {"provider_ref": str(host_root / "provider")}))
-    check("T27m2 a data path under the host backing root is accepted",
-          rc == 0, out)
+    check("T27m2 a host backing provider_ref is rejected instead of reaching the guest spec",
+          rc == 2 and "not a guest results path" in out, out)
     rc, out = eng_create(eng_with("spec_seed.strategy", {"sides": ["long", "short"]}))
     check("T27n an unverified execution side is rejected",
           rc == 2 and "ENGINEERING_HOLD" in out, out)
@@ -2284,6 +2341,91 @@ def main():
 
     spec_path = good_leaf / _t.ENGINEERING_SPEC_NAME
     result_path = good_leaf / _t.ENGINEERING_RESULT_NAME
+    source_path = good_leaf / _t.ENGINEERING_SOURCE_NAME
+
+    # T27ae3.. Source authority (B1): the completion is valid only when the
+    # workspace carries the exact immutable blob bytes, and the fixed template
+    # has to say so in the rendered body.
+    body = _t.engineering_task_body(good, _t.engineering_hash(good), str(host_root))
+    prose = body.split("## DATA")[0]
+    check("T27ae3 the fixed template renders the derived blob URL and the source file",
+          (_t.CANDIDATE_BLOB_API + good["source_blob_sha"]) in body
+          and _t.ENGINEERING_SOURCE_NAME in prose, prose[:300])
+    check("T27ae4 the fixed template renders the fail-closed source-read instructions",
+          "block the task" in prose.lower()
+          and "write no `engineering-result.json`" in " ".join(prose.split())
+          and "Never infer strategy logic" in " ".join(prose.split()), prose[:300])
+    check("T27ae5 no caller value reaches the instruction prose",
+          good["candidate_path"] not in prose, prose[:300])
+    check("T27ae6 the ready reply names the verified source evidence",
+          ready.get("source_ref") == guest_leaf(good) + "/" + _t.ENGINEERING_SOURCE_NAME
+          and ready.get("source_blob_sha") == good["source_blob_sha"], str(ready))
+    check("T27ae7 the frozen spec keeps the guest provider_ref",
+          derived["data"]["provider_ref"] == guest_root + "/provider"
+          and str(derived["data"]["provider_ref"]).startswith("/results/production/"),
+          str(derived["data"]))
+    check("T27ae8 the blob id is the canonical Git object id of the exact bytes",
+          _t.git_blob_sha1(SOURCE_BYTES) == SOURCE_BLOB
+          and len(SOURCE_BLOB) == 40 and _t.git_blob_sha1(b"") == "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+          SOURCE_BLOB)
+
+    write_completion(good, created["task_id"], good_leaf)
+    source_path.unlink()
+    rc, out = eng_read(read_payload)
+    check("T27ae9 a completion with no candidate-source.md fails closed",
+          rc == 2 and _t.ENGINEERING_SOURCE_NAME in out and '"ready": true' not in out, out)
+
+    write_completion(good, created["task_id"], good_leaf, source_text="# a different body\n")
+    rc, out = eng_read(read_payload)
+    check("T27ae10 candidate-source.md with the wrong bytes fails closed",
+          rc == 2 and "does not reproduce the pinned blob" in out, out)
+
+    write_completion(good, created["task_id"], good_leaf)
+    result = json.loads(result_path.read_text())
+    result["candidate_source"] = {"ref": _t.ENGINEERING_SOURCE_NAME, "git_blob_sha": "0" * 40}
+    result_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    rc, out = eng_read(read_payload)
+    check("T27ae11 a result that declares another source blob fails closed",
+          rc == 2 and "candidate_source" in out, out)
+
+    write_completion(good, created["task_id"], good_leaf)
+    copy_source = eng / "source-copy.md"
+    copy_source.write_bytes(source_path.read_bytes())
+    source_path.unlink()
+    source_path.symlink_to(copy_source)
+    rc, out = eng_read(read_payload)
+    check("T27ae12 a symlinked candidate-source.md fails closed",
+          rc == 2 and "not a regular file" in out, out)
+    write_completion(good, created["task_id"], good_leaf)
+
+    # T27af0.. A present result is evidence under contract for every task
+    # status (B2). Only ``done`` promotes.
+    def store_status(status, runs=None):
+        store = read_store()
+        store["tasks"][created["task_id"]]["status"] = status
+        store["runs"][created["task_id"]] = runs or []
+        write_store(store)
+
+    for status in ("ready", "running", "blocked", "archived"):
+        write_completion(good, created["task_id"], good_leaf)
+        result = json.loads(result_path.read_text())
+        result["schema"] = "not-the-schema"
+        result_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+        store_status(status)
+        rc, out = eng_read(read_payload)
+        check("T27af0 a malformed present result fails closed while the task is " + status,
+              rc == 2 and "schema is not" in out, out)
+
+    write_completion(good, created["task_id"], good_leaf)
+    for status in ("ready", "running", "blocked", "archived"):
+        store_status(status)
+        rc, out = eng_read(read_payload)
+        state = json.loads(out) if out.startswith("{") else {}
+        check("T27af00 a valid present result on a " + status + " task stays non-ready",
+              rc == 0 and state.get("ready") is False
+              and state.get("status") in ("pending", "blocked", "failed", "timeout"), out)
+    store_status("done")
+    write_completion(good, created["task_id"], good_leaf)
 
     def spec_case(label, mutate, expect):
         write_completion(good, created["task_id"], good_leaf)
@@ -2323,6 +2465,24 @@ def main():
     spec_case("an OOS spec phase fails closed",
               lambda spec: spec.__setitem__("phase", "OOS"),
               "phase")
+    # B3: every block shape is validated before any mapping access, so a wrong
+    # type is the same typed rejection and never an AttributeError traceback.
+    for label, mutate, expect in (
+        ("a strategy_artifact list", lambda spec: spec.__setitem__("strategy_artifact", ["invalid"]),
+         "strategy_artifact block is not a JSON object"),
+        ("a materialize list", lambda spec: spec.__setitem__("materialize", ["invalid"]),
+         "materialize block is not a JSON object"),
+        ("a candidate list", lambda spec: spec.__setitem__("candidate", ["invalid"]),
+         "candidate block is not a JSON object"),
+        ("a data string", lambda spec: spec.__setitem__("data", "invalid"),
+         "data block is not a JSON object"),
+        ("a house_overlay list", lambda spec: spec.__setitem__("house_overlay", []),
+         "house_overlay block is not a JSON object"),
+        ("a phase integer", lambda spec: spec.__setitem__("phase", 7),
+         "phase is not a string"),
+    ):
+        spec_case("a malformed spec with " + label + " fails closed as typed JSON",
+                  mutate, expect)
 
     write_completion(good, created["task_id"], good_leaf)
     (good_leaf / _t.ENGINEERING_ARTIFACT_NAME).write_text("def signal(**kwargs):\n    return [], 0\n")

@@ -286,13 +286,26 @@ Every other field is derived and cannot be chosen: the runtime is pinned to comm
 assignee, the profile, the model, the provider, the workspace, the parents and the
 worker prompt are constants, and the materialize block, the artifact source and the
 candidate `blob_api_ref` come from the request hash and the pinned runtime. An OOS
-phase, an unverified side, a path outside the approved namespaces or an unknown field
-exits 2.
+phase, an unverified side, a caller-supplied `blob_api_ref` or URL, a host path in
+any DATA field and any unknown field exit 2. `candidate_path` must be one ASCII
+basename that ends in `.md`, and it reaches the worker only inside the escaped DATA
+JSON, never in an instruction sentence.
+
+**The immutable source is evidence, not prose.** The fixed template requires the
+worker to fetch the exact Alpha blob from the derived `blob_api_ref`, to reject a
+response whose `sha` differs from `source_blob_sha`, to base64-decode `content` and
+to write exactly those bytes to `candidate-source.md`, to read that whole file
+before writing any code, and to block the task without writing
+`engineering-result.json` when any of those steps fails. The read verb enforces the
+same rule by itself: it recomputes the Git object id of `candidate-source.md` as
+`SHA1("blob " + decimal byte length + NUL + bytes)` and requires the pinned
+`source_blob_sha`. Family, title, `params` and a worker declaration are never
+authority. The transport performs no network fetch.
 
 **Two filesystems, one mapping.** The worker runs on the host, so its workspace is
-the host path `<host backing root>/production/engineering/<request_hash>`, where the
-host backing root is the existing `RESEARCH_HOST_RESULTS_SOURCE` setting (default
-`/Volumes/ExpansionDrive/qlib-results`). Qlib runs in the fixed container, so
+the host path `<host-backing-root>/production/engineering/<request_hash>`, where
+`<host-backing-root>` is the directory the existing `RESEARCH_HOST_RESULTS_SOURCE`
+setting names. Qlib runs in the fixed container, so
 `materialize-spec.json` and the `spec_ref` returned to n8n carry guest `/results`
 paths: `strategy_artifact.source`, `materialize.cells_dir`
 (`.../<request_hash>/frozen-cells`) and `materialize.results_root`
@@ -320,13 +333,17 @@ model/provider overrides.
 
 The read verb returns `ready=false` with `status` `pending`, `blocked`, `failed` or
 `timeout`, and `ready=true` only after it verifies, byte for byte: the workspace is
-the derived contained real directory, `engineering-result.json` carries the schema,
-the request hash, the candidate identity, the phase and the round, the artifact and
-the spec are regular contained files whose sha256 match the result, the spec blocks
-equal the frozen request, the artifact source resolves to the verified artifact, the
-runtime and candidate identity are exact, and the cells/results roots are the derived
-ones. A present but malformed or inconsistent output exits 2. It never downgrades to
-`pending`.
+the derived contained real directory, `candidate-source.md` is a regular contained
+file whose Git object id equals the pinned `source_blob_sha`,
+`engineering-result.json` carries the schema, the request hash, the candidate
+identity, the phase and the round, the artifact and the spec are regular contained
+files whose sha256 match the result, every spec block is a JSON object, the spec
+blocks equal the frozen request, the artifact source resolves to the verified
+artifact, the runtime and candidate identity are exact, and the cells/results roots
+are the derived ones. A result that exists is evidence under contract for every
+task status: a present but malformed or inconsistent output exits 2 whatever the
+card says, and a fully valid result on a non-terminal task stays non-ready with
+that task status instead of being promoted early. It never downgrades to `pending`.
 
 ### Out-of-scope dependency for the campaign lane
 
