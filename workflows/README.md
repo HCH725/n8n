@@ -103,11 +103,12 @@ shape. Replace the placeholders with trusted absolute paths and the public key:
 
     restrict,command="<PYTHON> <TRANSPORT>/research-transport.py hermes-forced" ssh-ed25519 <PUBLIC_KEY>
 
-The fixed command accepts only `research-hermes <base64 UTF-8 task>` and
-`research-handoff <base64 JSON request>`, with the native SSH node's optional
-`cd / ;` prefix. The encoded argument limit is 65,536 characters. The host must
-resolve `hermes` through a trusted PATH. Do not permit client environment overrides.
-The handler sends the decoded task through stdin to this fixed argv, with a
+The fixed command accepts only `research-hermes <base64 UTF-8 task>`,
+`research-handoff <base64 JSON request>`, `research-engineering-create <base64 JSON
+request>` and `research-engineering-read <base64 JSON request>`, with the native SSH
+node's optional `cd / ;` prefix. The encoded argument limit is 65,536 characters. The
+host must resolve `hermes` through a trusted PATH. Do not permit client environment
+overrides. The handler sends the decoded task through stdin to this fixed argv, with a
 1,800-second process timeout:
 
     hermes chat --query-file - --oneshot -Q --format stream-json -t wiki_brain
@@ -253,10 +254,96 @@ not a transport failure: the verb prints `{"ok": true, "status":
 exactly like `research-handoff`, but only when the absent path is a regular-file path
 in a real directory inside the results root and every other request constraint is
 valid. A malformed spec, a mismatched identity, an unsafe path or a runtime mismatch
-still exits 2. **Residual capability boundary:** this PR adds no engineering verb, no
-Markdown-to-Qlib compiler and no agent shell, so a candidate whose approved
-spec/artifact does not exist yet cannot materialize itself; that still requires the
-existing Hermes/Kanban engineering flow to produce the spec and the artifact.
+still exits 2. **Residual capability boundary:** this transport writes no strategy
+artifact and no materialize spec. A candidate whose approved spec/artifact does not
+exist yet is handed to the existing Hermes Kanban `default` worker by
+`research-engineering-create`, and only its verified output is read back by
+`research-engineering-read`. The transport itself still generates nothing.
+
+### Bounded Kanban engineering adapter (two host verbs)
+
+`research-engineering-create <base64 JSON>` submits one fixed-template task to the
+EXISTING Hermes Kanban board `quant-strategy-research` for the existing `default`
+worker. `research-engineering-read <base64 JSON>` reads that exact task back and
+returns a typed state. Both verbs are Hermes-key only: the Qlib key, the container
+forwarder and the CLI dispatch accept neither.
+
+The request is `engineering-task-v1`. It carries only frozen inputs:
+
+```json
+{"request": "engineering-task-v1", "source_commit": "<40 hex>",
+ "candidate_path": "<file>.md", "source_blob_sha": "<40 hex>",
+ "family_id": "<strict id>", "round_index": 0, "phase": "IS_BASELINE|IS_RETEST",
+ "window": {"start_utc": "...", "end_utc_inclusive": "..."},
+ "spec_seed": {"candidate": {...}, "runtime": {...}, "data": {...},
+               "strategy": {...}, "house_overlay": {...},
+               "research_cost_model": {...}},
+ "change_set": {"optional": "data only"}}
+```
+
+Every other field is derived and cannot be chosen: the runtime is pinned to commit
+`f92320c1`, image `qlib:main-f92320c1-arm64` and digest `6081534f`, the board, the
+assignee, the profile, the model, the provider, the workspace, the parents and the
+worker prompt are constants, and the materialize block, the artifact source and the
+candidate `blob_api_ref` come from the request hash and the pinned runtime. An OOS
+phase, an unverified side, a caller-supplied `blob_api_ref` or URL, a host path in
+any DATA field and any unknown field exit 2. `candidate_path` must be one ASCII
+basename that ends in `.md`, and it reaches the worker only inside the escaped DATA
+JSON, never in an instruction sentence.
+
+**The immutable source is evidence, not prose.** The fixed template requires the
+worker to fetch the exact Alpha blob from the derived `blob_api_ref`, to reject a
+response whose `sha` differs from `source_blob_sha`, to base64-decode `content` and
+to write exactly those bytes to `candidate-source.md`, to read that whole file
+before writing any code, and to block the task without writing
+`engineering-result.json` when any of those steps fails. The read verb enforces the
+same rule by itself: it recomputes the Git object id of `candidate-source.md` as
+`SHA1("blob " + decimal byte length + NUL + bytes)` and requires the pinned
+`source_blob_sha`. Family, title, `params` and a worker declaration are never
+authority. The transport performs no network fetch.
+
+**Two filesystems, one mapping.** The worker runs on the host, so its workspace is
+the host path `<host-backing-root>/production/engineering/<request_hash>`, where
+`<host-backing-root>` is the directory the existing `RESEARCH_HOST_RESULTS_SOURCE`
+setting names. Qlib runs in the fixed container, so
+`materialize-spec.json` and the `spec_ref` returned to n8n carry guest `/results`
+paths: `strategy_artifact.source`, `materialize.cells_dir`
+(`.../<request_hash>/frozen-cells`) and `materialize.results_root`
+(`/results/production`). One fixed helper maps guest to host, so a spec cannot name a
+host location of its own. `cells_dir` is always a dedicated child, never the
+workspace, because `research-materialize` refuses a non-empty cells root.
+
+The create verb checks the fixed existing backing root, then builds only
+`production` -> `engineering` -> `<request_hash>` with an `lstat` walk that refuses a
+symlink, a dangling symlink or a plain file at every component. It creates nothing at
+import, resolve or read time. It calls exactly one fixed argv, with no shell and with
+every inherited `HERMES_KANBAN_*` identity removed:
+
+    hermes kanban --board quant-strategy-research create <title> --body-file - \
+      --assignee default --workspace dir:<leaf> --idempotency-key <derived> \
+      --max-runtime 5400 --created-by n8n-research-engineering \
+      --completion-contract local-only --json
+
+The task body is a constant template plus one JSON DATA block, so a worker never
+receives a free-form prompt. The read verb re-renders that body and requires an exact
+match, which is how it proves the task came from this adapter for this exact request.
+`show --json` does not expose the idempotency key, so provenance is the rendered body
+plus the derived workspace, the fixed author, the fixed runtime cap and the absent
+model/provider overrides.
+
+The read verb returns `ready=false` with `status` `pending`, `blocked`, `failed` or
+`timeout`, and `ready=true` only after it verifies, byte for byte: the workspace is
+the derived contained real directory, `candidate-source.md` is a regular contained
+file whose Git object id equals the pinned `source_blob_sha`,
+`engineering-result.json` carries the schema, the request hash, the candidate
+identity, the phase and the round, the artifact and the spec are regular contained
+files whose sha256 match the result, every spec block is a JSON object, the spec
+blocks equal the frozen request, the artifact source resolves to the verified
+artifact, the runtime and candidate identity are exact, and the cells/results roots
+are the derived ones. A result that exists is evidence under contract for every
+task status: a present but malformed or inconsistent output exits 2 whatever the
+card says, and a fully valid result on a non-terminal task stays non-ready with
+that task status instead of being promoted early. It never downgrades to `pending`.
 
 ### Out-of-scope dependency for the campaign lane
 
